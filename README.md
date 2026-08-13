@@ -135,6 +135,9 @@ project-brain reconcile --base HEAD --envelope .project-brain/envelope.json
 - 超出 `allowed_paths`：`escalate`；
 - 完全处于声明范围：`allow`。
 
+路径按项目相对前缀匹配，`.` 明确表示整个项目。`init` 生成的初始 Envelope 使用 `.`，不会
+夹带 Project Brain 自身仓库的目录假设；开始具体任务后应把它收窄为该任务实际允许的文件或目录。
+
 Envelope 文件必须位于项目根目录内；绝对路径、`..` 或符号链接解析后若越出仓库，
 Runtime 会拒绝读取。
 
@@ -242,6 +245,8 @@ project-brain index-scip --provider rust-main --input index.scip
 一个 `.scip` 可以逐文档映射多种语言，例如同一 scip-dotnet 索引内的 C# 与 Visual Basic。
 Python 的空 `Document.language` 只有在 profile 显式声明 `raw_language: null` 和
 `allow_missing_language: true` 时才接受。Producer 版本只记录来源，不参与 Brain contract 版本。
+`language_profiles[].roots` 为空数组或只包含 `.` 时都表示项目根；空字符串、绝对路径和 `..`
+仍会被拒绝。
 
 ## Semantic lineage ledger
 

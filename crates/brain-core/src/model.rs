@@ -123,7 +123,8 @@ fn validate_language_profiles(profiles: &[ProjectLanguageProfile]) -> Result<(),
         let mut roots = std::collections::BTreeSet::new();
         for root in &profile.roots {
             let normalized = crate::normalize_project_path(root);
-            if normalized.is_empty()
+            let project_root_alias = matches!(root.trim(), "." | "./" | ".\\");
+            if (normalized.is_empty() && !project_root_alias)
                 || normalized.starts_with('/')
                 || normalized.contains(':')
                 || normalized.split('/').any(|part| part == "..")
@@ -491,6 +492,20 @@ mod tests {
             config.validate(),
             Err(CoreError::InvalidLanguageProfile(_))
         ));
+
+        config.language_profiles = vec![ProjectLanguageProfile {
+            language: "csharp".to_owned(),
+            roots: vec![".".to_owned()],
+        }];
+        assert!(config.validate().is_ok());
+
+        for invalid_root in ["", "/", "C:/repo"] {
+            config.language_profiles[0].roots = vec![invalid_root.to_owned()];
+            assert!(matches!(
+                config.validate(),
+                Err(CoreError::InvalidLanguageProfile(_))
+            ));
+        }
     }
 
     #[test]

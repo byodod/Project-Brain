@@ -453,6 +453,11 @@ mod tests {
         assert!(root.join(".project-brain/config.json").is_file());
         assert!(root.join(".project-brain/envelope.json").is_file());
         assert!(root.join(".project-brain/brain.db").is_file());
+        let envelope: crate::reconcile::ChangeEnvelope =
+            serde_json::from_slice(&fs::read(root.join(".project-brain/envelope.json")).unwrap())
+                .unwrap();
+        assert_eq!(envelope.allowed_paths, ["."]);
+        assert_eq!(envelope.forbidden_paths, [".git"]);
         let ignore = fs::read_to_string(root.join(".project-brain/.gitignore")).unwrap();
         assert!(ignore.lines().any(|line| line == "brain.db"));
         let app = App::open(Some(root.clone())).unwrap();

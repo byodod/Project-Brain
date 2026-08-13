@@ -6,7 +6,12 @@ pub fn normalize_project_path(path: &str) -> String {
     while normalized.contains("//") {
         normalized = normalized.replace("//", "/");
     }
-    normalized.trim_end_matches('/').to_owned()
+    let normalized = normalized.trim_end_matches('/');
+    if normalized == "." {
+        String::new()
+    } else {
+        normalized.to_owned()
+    }
 }
 
 pub fn path_has_prefix(path: &str, prefix: &str) -> bool {
@@ -22,6 +27,9 @@ mod tests {
     #[test]
     fn normalizes_windows_and_relative_paths() {
         assert_eq!(normalize_project_path(r".\src\\core\"), "src/core");
+        assert_eq!(normalize_project_path("."), "");
+        assert_eq!(normalize_project_path("./"), "");
+        assert_eq!(normalize_project_path(r".\"), "");
     }
 
     #[test]
@@ -29,5 +37,7 @@ mod tests {
         assert!(path_has_prefix("src/core/mod.rs", "src/core"));
         assert!(path_has_prefix("src/core", "src/core"));
         assert!(!path_has_prefix("src/core-old/mod.rs", "src/core"));
+        assert!(path_has_prefix("src/core/mod.rs", "."));
+        assert!(path_has_prefix("README.md", "./"));
     }
 }

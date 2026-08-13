@@ -23,7 +23,7 @@ impl ChangeEnvelope {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
             intent: "描述当前任务允许产生的项目变更".to_owned(),
-            allowed_paths: vec!["crates".to_owned(), "README.md".to_owned()],
+            allowed_paths: vec![".".to_owned()],
             forbidden_paths: vec![".git".to_owned()],
         }
     }

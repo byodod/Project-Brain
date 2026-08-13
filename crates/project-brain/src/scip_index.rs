@@ -172,6 +172,11 @@ mod tests {
             roots: vec!["src/App".to_owned()],
         }];
         assert!(validate_project_roots(&csharp, &allowed).is_ok());
+        let project_root = vec![ProjectLanguageProfile {
+            language: "csharp".to_owned(),
+            roots: vec![".".to_owned()],
+        }];
+        assert!(validate_project_roots(&csharp, &project_root).is_ok());
         assert!(validate_project_roots(&csharp, &[]).is_err());
 
         let outside = snapshot(SourceLanguage::csharp(), "tests/AppTests.cs");
