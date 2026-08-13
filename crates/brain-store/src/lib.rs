@@ -932,7 +932,7 @@ mod tests {
             project_key,
             &provider(),
             SymbolNodeInput {
-                language: SourceLanguage::Rust,
+                language: SourceLanguage::rust(),
                 kind: "function_item",
                 provider_key: &provider_key,
                 display_name: name,
@@ -951,7 +951,7 @@ mod tests {
     fn snapshot_for(project_key: &str, revision: &str, symbols: Vec<SymbolNode>) -> SymbolSnapshot {
         let sources = symbols
             .iter()
-            .map(|symbol| (symbol.path.clone(), symbol.language))
+            .map(|symbol| (symbol.path.clone(), symbol.language.clone()))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .map(|(path, language)| {

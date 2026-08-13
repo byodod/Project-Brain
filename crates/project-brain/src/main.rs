@@ -6,6 +6,7 @@ mod git;
 mod index;
 mod protocol;
 mod reconcile;
+mod scip_index;
 
 use std::{path::PathBuf, process::ExitCode};
 
@@ -56,6 +57,16 @@ enum Command {
     /// 为当前工作区建立完整的 Provider-neutral 符号图快照
     Index,
 
+    /// 从已有 .scip 文件按项目 provider profile 离线建立 semantic 快照
+    IndexScip {
+        /// `.project-brain/config.json` 中的 semantic provider profile ID
+        #[arg(long)]
+        provider: String,
+
+        #[arg(long)]
+        input: PathBuf,
+    },
+
     /// 查询本地符号图
     Symbols {
         #[arg(long)]
@@ -87,6 +98,9 @@ fn main() -> ExitCode {
         }
         Command::Analyze { base } => App::open(cli.project_root).and_then(|app| app.analyze(&base)),
         Command::Index => App::open(cli.project_root).and_then(|app| app.index()),
+        Command::IndexScip { provider, input } => {
+            App::open(cli.project_root).and_then(|app| app.index_scip(&provider, &input))
+        }
         Command::Symbols {
             path,
             include_removed,

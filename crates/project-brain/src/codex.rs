@@ -533,6 +533,8 @@ mod tests {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_key: project_key.to_owned(),
             project_name: "test".to_owned(),
+            language_profiles: Vec::new(),
+            semantic_providers: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![Rule {
                 id: "PROTECT".to_owned(),

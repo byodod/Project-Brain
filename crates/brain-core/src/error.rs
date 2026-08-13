@@ -14,6 +14,12 @@ pub enum CoreError {
     #[error("project_key 无效：{0:?}")]
     InvalidProjectKey(String),
 
+    #[error("项目语言 profile 无效：{0}")]
+    InvalidLanguageProfile(String),
+
+    #[error("语义 provider profile 无效：{0}")]
+    InvalidSemanticProviderProfile(String),
+
     #[error("规则 {rule_id} 无效：{reason}")]
     InvalidRule { rule_id: String, reason: String },
 

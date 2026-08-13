@@ -2,6 +2,27 @@
   "schema_version": 1,
   "project_key": "pb_79b8364c257bf54c87eb7ad172df54b6",
   "project_name": "Project Brain",
+  "language_profiles": [
+    {
+      "language": "rust",
+      "roots": []
+    }
+  ],
+  "semantic_providers": [
+    {
+      "id": "rust-main",
+      "format": "scip",
+      "producer": "rust-analyzer",
+      "contract_version": 1,
+      "language_mappings": [
+        {
+          "raw_language": "rust",
+          "language": "rust",
+          "allow_missing_language": false
+        }
+      ]
+    }
+  ],
   "rules": [
     {
       "id": "PB-CORE-001",

@@ -178,6 +178,8 @@ mod tests {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_key: "project_test".to_owned(),
             project_name: "test".to_owned(),
+            language_profiles: Vec::new(),
+            semantic_providers: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![
                 rule("context", RuleEffect::InjectContext, RuleStrength::Soft),
@@ -199,6 +201,8 @@ mod tests {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_key: "project_test".to_owned(),
             project_name: "test".to_owned(),
+            language_profiles: Vec::new(),
+            semantic_providers: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![rule("block", RuleEffect::Block, RuleStrength::Hard)],
         };
@@ -218,6 +222,8 @@ mod tests {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_key: "project_test".to_owned(),
             project_name: "test".to_owned(),
+            language_profiles: Vec::new(),
+            semantic_providers: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![invalid],
         };
@@ -236,6 +242,8 @@ mod tests {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_key: "project_test".to_owned(),
             project_name: "test".to_owned(),
+            language_profiles: Vec::new(),
+            semantic_providers: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![inactive],
         };
@@ -255,6 +263,8 @@ mod tests {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_key: "project_test".to_owned(),
             project_name: "test".to_owned(),
+            language_profiles: Vec::new(),
+            semantic_providers: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![bash_only],
         };

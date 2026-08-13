@@ -13,6 +13,8 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - Codex `Stop` 自动 Change Envelope 对账与防循环保护；
 - 基于 Tree-sitter 的 Rust changed-symbol 与纯删除符号提取；
 - Project-scoped Provider-neutral 符号身份协议、完整工作区快照与本地派生符号图；
+- 按项目显式配置的离线 SCIP 导入，首批契约覆盖 rust-analyzer、scip-dotnet 与 scip-python；
+- 开放 language ID、逐文档语言映射和四态语义能力声明；
 - SQLite schema v1→v4 迁移、按项目隔离的符号 removed 历史与幂等增量更新；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
@@ -181,8 +183,64 @@ project-brain symbols --path crates/brain-core --limit 50
 会产生新 ID，Runtime 不会自动声称其 lineage 相同。快照 revision 还覆盖所有受支持源文件
 的内容摘要和语法错误状态，因此无符号文件的变化也可检测；没有首个 commit 的仓库使用显式
 unborn HEAD 标记。符号 ID、快照、查询和 tombstone 都显式绑定配置中的 `project_key`；相同代码
-在不同项目中生成不同身份，即使未来共用一个数据库也不会串图。未来 SCIP 等语义 Provider 可接入
-同一协议，跨快照 lineage 由 Brain 自己维护。
+在不同项目中生成不同身份，即使未来共用一个数据库也不会串图。跨快照 lineage 由 Brain
+自己维护，目前只生成 `proposed`/`ambiguous` 候选，不会自动复用 ID 或改写历史。
+
+### 离线 SCIP 语义索引
+
+Project Brain 不自动根据扩展名、`Cargo.toml`、solution 或 `pyproject.toml` 猜测项目语言。
+每个项目需要在 `.project-brain/config.json` 中显式声明语言和 provider：
+
+```json
+{
+  "language_profiles": [
+    { "language": "rust", "roots": [] },
+    { "language": "csharp", "roots": ["src"] },
+    { "language": "visual-basic", "roots": ["src"] },
+    { "language": "python", "roots": ["python"] }
+  ],
+  "semantic_providers": [
+    {
+      "id": "rust-main",
+      "format": "scip",
+      "producer": "rust-analyzer",
+      "contract_version": 1,
+      "language_mappings": [
+        { "raw_language": "rust", "language": "rust", "allow_missing_language": false }
+      ]
+    },
+    {
+      "id": "dotnet-main",
+      "format": "scip",
+      "producer": "scip-dotnet",
+      "contract_version": 1,
+      "language_mappings": [
+        { "raw_language": "C#", "language": "csharp", "allow_missing_language": false },
+        { "raw_language": "Visual Basic", "language": "visual-basic", "allow_missing_language": false }
+      ]
+    },
+    {
+      "id": "python-main",
+      "format": "scip",
+      "producer": "scip-python",
+      "contract_version": 1,
+      "language_mappings": [
+        { "raw_language": null, "language": "python", "allow_missing_language": true }
+      ]
+    }
+  ]
+}
+```
+
+生成 `.scip` 后按项目内稳定 profile ID 导入：
+
+```text
+project-brain index-scip --provider rust-main --input index.scip
+```
+
+一个 `.scip` 可以逐文档映射多种语言，例如同一 scip-dotnet 索引内的 C# 与 Visual Basic。
+Python 的空 `Document.language` 只有在 profile 显式声明 `raw_language: null` 和
+`allow_missing_language: true` 时才接受。Producer 版本只记录来源，不参与 Brain contract 版本。
 
 ## Workspace
 
@@ -190,6 +248,7 @@ unborn HEAD 标记。符号 ID、快照、查询和 tombstone 都显式绑定配
 crates/
 ├── brain-analyzer/   # Tree-sitter changed-symbol 提取
 ├── brain-core/       # 协议、规则验证、确定性决策
+├── brain-scip/       # 离线 SCIP protobuf、项目 profile 与语义快照
 ├── brain-store/      # SQLite schema 与审计
 ├── brain-symbols/    # Provider-neutral 符号、边、快照与身份协议
 └── project-brain/    # CLI、Git、Codex Hook 适配
@@ -204,8 +263,11 @@ crates/
 
 - 当前只提供 Codex 适配器；Claude Code 和 Prime Agent 尚未实现。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
-- changed-symbol 与图 Provider 当前只支持 Rust；LSP/SCIP 和跨文件语义引用尚未接入。
-- 当前图只有 Tree-sitter 可确定的词法 `contains` 边；调用、引用、实现关系需要语义 Provider。
+- changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
+  离线 SCIP semantic Provider 接入。
+- SCIP 当前可靠导入 definition、reference、contains，以及 producer 明确提供的 implementation/
+  type-definition 关系；不会从 occurrence 猜测 call/import/implementation。
+- scip-dotnet 与 scip-python 使用合成契约 fixture；本阶段不捆绑或自动运行外部 producer。
 - syntax fallback 不自动关联 rename/move lineage；这必须由语义证据或显式确认完成。
 - `Stop` 自动对账只核对文件范围；符号级 Change Envelope 约束尚未加入。
 - Semantic Sentinel / Architecture Judge 尚未加入；这是有意的 V0 边界。

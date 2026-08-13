@@ -15,6 +15,7 @@ pub use hook::{
 };
 pub use model::{
     ActionDescriptor, ActionKind, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, Decision,
-    DecisionKind, Evidence, MemoryStatus, Rule, RuleEffect, RuleStrength, StopReconcileConfig,
+    DecisionKind, Evidence, MemoryStatus, ProjectLanguageProfile, Rule, RuleEffect, RuleStrength,
+    SemanticLanguageMapping, SemanticProviderFormat, SemanticProviderProfile, StopReconcileConfig,
 };
 pub use path::{normalize_project_path, path_has_prefix};

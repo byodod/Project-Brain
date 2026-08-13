@@ -14,6 +14,10 @@ pub struct BrainConfig {
     #[serde(default)]
     pub project_name: String,
     #[serde(default)]
+    pub language_profiles: Vec<ProjectLanguageProfile>,
+    #[serde(default)]
+    pub semantic_providers: Vec<SemanticProviderProfile>,
+    #[serde(default)]
     pub rules: Vec<Rule>,
     #[serde(default)]
     pub stop_reconcile: StopReconcileConfig,
@@ -41,6 +45,8 @@ impl BrainConfig {
         {
             return Err(CoreError::InvalidProjectKey(self.project_key.clone()));
         }
+        validate_language_profiles(&self.language_profiles)?;
+        validate_semantic_provider_profiles(&self.language_profiles, &self.semantic_providers)?;
 
         for rule in &self.rules {
             rule.validate()?;
@@ -57,6 +63,159 @@ impl BrainConfig {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectLanguageProfile {
+    /// 开放的 SCIP/LSP language ID，例如 rust、csharp、python。
+    pub language: String,
+    /// 项目相对根；空数组表示整个项目。一个项目可声明多种语言。
+    #[serde(default)]
+    pub roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticProviderFormat {
+    Scip,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SemanticLanguageMapping {
+    /// Producer 写入 `Document.language` 的原始值；`null` 只匹配缺失/空值。
+    pub raw_language: Option<String>,
+    /// 映射到项目声明的开放 language ID。
+    pub language: String,
+    #[serde(default)]
+    pub allow_missing_language: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SemanticProviderProfile {
+    /// 项目内稳定且唯一的 provider 配置 ID，也是符号身份命名空间的一部分。
+    pub id: String,
+    pub format: SemanticProviderFormat,
+    /// 允许导入的 SCIP `tool_info.name`。匹配时忽略 ASCII 大小写。
+    pub producer: String,
+    /// Project Brain 与该 producer 的解释契约版本，不等同于 producer 自身版本。
+    pub contract_version: u16,
+    pub language_mappings: Vec<SemanticLanguageMapping>,
+}
+
+fn validate_language_profiles(profiles: &[ProjectLanguageProfile]) -> Result<(), CoreError> {
+    let mut languages = std::collections::BTreeSet::new();
+    for profile in profiles {
+        let language = profile.language.trim().to_ascii_lowercase();
+        if language.is_empty()
+            || language.len() > 64
+            || !language.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'_' | b'+' | b'#')
+            })
+            || !languages.insert(language.clone())
+        {
+            return Err(CoreError::InvalidLanguageProfile(format!(
+                "language={:?} 为空、重复或格式非法",
+                profile.language
+            )));
+        }
+        let mut roots = std::collections::BTreeSet::new();
+        for root in &profile.roots {
+            let normalized = crate::normalize_project_path(root);
+            if normalized.is_empty()
+                || normalized.starts_with('/')
+                || normalized.contains(':')
+                || normalized.split('/').any(|part| part == "..")
+                || !roots.insert(normalized)
+            {
+                return Err(CoreError::InvalidLanguageProfile(format!(
+                    "language={language} 的 root={root:?} 非法或重复"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_semantic_provider_profiles(
+    languages: &[ProjectLanguageProfile],
+    profiles: &[SemanticProviderProfile],
+) -> Result<(), CoreError> {
+    let language_ids = languages
+        .iter()
+        .map(|profile| profile.language.trim().to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut profile_ids = std::collections::BTreeSet::new();
+    for profile in profiles {
+        let id = profile.id.trim().to_ascii_lowercase();
+        if id.is_empty()
+            || id.len() > 64
+            || !id.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'_' | b'.')
+            })
+            || !profile_ids.insert(id.clone())
+        {
+            return Err(CoreError::InvalidSemanticProviderProfile(format!(
+                "id={:?} 为空、重复或格式非法",
+                profile.id
+            )));
+        }
+        if profile.producer.trim().is_empty() || profile.producer.len() > 128 {
+            return Err(CoreError::InvalidSemanticProviderProfile(format!(
+                "id={id} 的 producer 无效"
+            )));
+        }
+        if profile.contract_version != 1 {
+            return Err(CoreError::InvalidSemanticProviderProfile(format!(
+                "id={id} 的 contract_version={} 不受支持",
+                profile.contract_version
+            )));
+        }
+        if profile.language_mappings.is_empty() {
+            return Err(CoreError::InvalidSemanticProviderProfile(format!(
+                "id={id} 缺少 language_mappings"
+            )));
+        }
+        let mut raw_languages = std::collections::BTreeSet::new();
+        for mapping in &profile.language_mappings {
+            let language = mapping.language.trim().to_ascii_lowercase();
+            if !language_ids.contains(&language) {
+                return Err(CoreError::InvalidSemanticProviderProfile(format!(
+                    "id={id} 映射到未声明 language={:?}",
+                    mapping.language
+                )));
+            }
+            let raw = mapping
+                .raw_language
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if mapping
+                .raw_language
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty() || value.len() > 128)
+            {
+                return Err(CoreError::InvalidSemanticProviderProfile(format!(
+                    "id={id} 的 raw language 无效"
+                )));
+            }
+            if raw.is_none() != mapping.allow_missing_language {
+                return Err(CoreError::InvalidSemanticProviderProfile(format!(
+                    "id={id} 的缺失 language 映射必须且只能设置 allow_missing_language=true"
+                )));
+            }
+            let raw_key = raw.map_or_else(|| "<missing>".to_owned(), ToOwned::to_owned);
+            if !raw_languages.insert(raw_key.clone()) {
+                return Err(CoreError::InvalidSemanticProviderProfile(format!(
+                    "id={id} 的 raw language={raw_key:?} 重复"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -271,7 +430,10 @@ pub struct Decision {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrainConfig, CURRENT_SCHEMA_VERSION, StopReconcileConfig};
+    use super::{
+        BrainConfig, CURRENT_SCHEMA_VERSION, ProjectLanguageProfile, SemanticLanguageMapping,
+        SemanticProviderFormat, SemanticProviderProfile, StopReconcileConfig,
+    };
     use crate::CoreError;
 
     #[test]
@@ -280,6 +442,8 @@ mod tests {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_key: "project_test".to_owned(),
             project_name: "test".to_owned(),
+            language_profiles: Vec::new(),
+            semantic_providers: Vec::new(),
             rules: Vec::new(),
             stop_reconcile: StopReconcileConfig {
                 enabled: true,
@@ -291,5 +455,68 @@ mod tests {
             config.validate(),
             Err(CoreError::InvalidStopReconcile(_))
         ));
+    }
+
+    #[test]
+    fn language_profiles_are_open_but_unique_and_project_relative() {
+        let mut config = BrainConfig {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: "project_test".to_owned(),
+            project_name: "test".to_owned(),
+            language_profiles: vec![ProjectLanguageProfile {
+                language: "csharp".to_owned(),
+                roots: vec!["src/App".to_owned()],
+            }],
+            semantic_providers: vec![SemanticProviderProfile {
+                id: "dotnet-main".to_owned(),
+                format: SemanticProviderFormat::Scip,
+                producer: "scip-dotnet".to_owned(),
+                contract_version: 1,
+                language_mappings: vec![SemanticLanguageMapping {
+                    raw_language: Some("C#".to_owned()),
+                    language: "csharp".to_owned(),
+                    allow_missing_language: false,
+                }],
+            }],
+            rules: Vec::new(),
+            stop_reconcile: StopReconcileConfig::default(),
+        };
+        assert!(config.validate().is_ok());
+
+        config.language_profiles.push(ProjectLanguageProfile {
+            language: "CSharp".to_owned(),
+            roots: Vec::new(),
+        });
+        assert!(matches!(
+            config.validate(),
+            Err(CoreError::InvalidLanguageProfile(_))
+        ));
+    }
+
+    #[test]
+    fn missing_language_requires_an_explicit_mapping() {
+        let config = BrainConfig {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: "project_test".to_owned(),
+            project_name: "test".to_owned(),
+            language_profiles: vec![ProjectLanguageProfile {
+                language: "python".to_owned(),
+                roots: Vec::new(),
+            }],
+            semantic_providers: vec![SemanticProviderProfile {
+                id: "python-main".to_owned(),
+                format: SemanticProviderFormat::Scip,
+                producer: "scip-python".to_owned(),
+                contract_version: 1,
+                language_mappings: vec![SemanticLanguageMapping {
+                    raw_language: None,
+                    language: "python".to_owned(),
+                    allow_missing_language: true,
+                }],
+            }],
+            rules: Vec::new(),
+            stop_reconcile: StopReconcileConfig::default(),
+        };
+        assert!(config.validate().is_ok());
     }
 }

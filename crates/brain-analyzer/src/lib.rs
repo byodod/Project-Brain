@@ -11,6 +11,9 @@ use tree_sitter::{Node, Parser};
 
 #[derive(Debug, Error)]
 pub enum AnalyzerError {
+    #[error("Tree-sitter Provider 尚不支持语言 {0:?}")]
+    UnsupportedLanguage(SourceLanguage),
+
     #[error("无法加载 {language:?} Tree-sitter grammar：{message}")]
     Grammar {
         language: SourceLanguage,
@@ -75,7 +78,7 @@ pub fn detect_language(path: &Path) -> Option<SourceLanguage> {
     path.extension()
         .and_then(|extension| extension.to_str())
         .filter(|extension| extension.eq_ignore_ascii_case("rs"))
-        .map(|_| SourceLanguage::Rust)
+        .map(|_| SourceLanguage::rust())
 }
 
 /// 分析给定源码中与变更行相交的语义符号。
@@ -92,14 +95,15 @@ pub fn analyze_changed_symbols(
     changed_ranges: &[LineRange],
 ) -> Result<FileAnalysis, AnalyzerError> {
     let mut parser = Parser::new();
-    match language {
-        SourceLanguage::Rust => parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .map_err(|error| AnalyzerError::Grammar {
-                language,
-                message: error.to_string(),
-            })?,
+    if language != SourceLanguage::rust() {
+        return Err(AnalyzerError::UnsupportedLanguage(language));
     }
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|error| AnalyzerError::Grammar {
+            language: SourceLanguage::rust(),
+            message: error.to_string(),
+        })?;
     let tree = parser
         .parse(source, None)
         .ok_or(AnalyzerError::ParseFailed)?;
@@ -135,7 +139,7 @@ pub fn index_file_symbols(
     language: SourceLanguage,
     source: &str,
 ) -> Result<FileSymbolIndex, AnalyzerError> {
-    let mut parser = configured_parser(language)?;
+    let mut parser = configured_parser(&language)?;
     let tree = parser
         .parse(source, None)
         .ok_or(AnalyzerError::ParseFailed)?;
@@ -148,7 +152,7 @@ pub fn index_file_symbols(
         source,
         project_key,
         path,
-        language,
+        &language,
         &provider,
         &mut Vec::new(),
         &mut Vec::new(),
@@ -173,16 +177,17 @@ pub fn index_file_symbols(
     })
 }
 
-fn configured_parser(language: SourceLanguage) -> Result<Parser, AnalyzerError> {
+fn configured_parser(language: &SourceLanguage) -> Result<Parser, AnalyzerError> {
     let mut parser = Parser::new();
-    match language {
-        SourceLanguage::Rust => parser
-            .set_language(&tree_sitter_rust::LANGUAGE.into())
-            .map_err(|error| AnalyzerError::Grammar {
-                language,
-                message: error.to_string(),
-            })?,
+    if language != &SourceLanguage::rust() {
+        return Err(AnalyzerError::UnsupportedLanguage(language.clone()));
     }
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .map_err(|error| AnalyzerError::Grammar {
+            language: language.clone(),
+            message: error.to_string(),
+        })?;
     Ok(parser)
 }
 
@@ -192,7 +197,7 @@ fn collect_index_symbols(
     source: &str,
     project_key: &str,
     path: &str,
-    language: SourceLanguage,
+    language: &SourceLanguage,
     provider: &ProviderDescriptor,
     owner_names: &mut Vec<String>,
     owner_ids: &mut Vec<String>,
@@ -219,7 +224,7 @@ fn collect_index_symbols(
             project_key,
             provider,
             SymbolNodeInput {
-                language,
+                language: language.clone(),
                 kind,
                 provider_key: &provider_key,
                 display_name: &display_name,
@@ -361,7 +366,7 @@ mod tests {
     fn detects_rust_by_extension() {
         assert_eq!(
             detect_language(Path::new("src/lib.rs")),
-            Some(SourceLanguage::Rust)
+            Some(SourceLanguage::rust())
         );
         assert_eq!(detect_language(Path::new("README.md")), None);
     }
@@ -370,7 +375,8 @@ mod tests {
     fn reports_method_and_lexical_owner_for_changed_body() {
         let source = "struct Worker;\n\nimpl Worker {\n    fn run(&self) {\n        let ready = true;\n    }\n}\n";
         let analysis =
-            analyze_changed_symbols(SourceLanguage::Rust, source, &[LineRange::new(5, 5)]).unwrap();
+            analyze_changed_symbols(SourceLanguage::rust(), source, &[LineRange::new(5, 5)])
+                .unwrap();
         assert!(
             analysis
                 .symbols
@@ -390,7 +396,8 @@ mod tests {
     fn ignores_symbols_outside_changed_range() {
         let source = "fn first() {}\n\nfn second() {}\n";
         let analysis =
-            analyze_changed_symbols(SourceLanguage::Rust, source, &[LineRange::new(1, 1)]).unwrap();
+            analyze_changed_symbols(SourceLanguage::rust(), source, &[LineRange::new(1, 1)])
+                .unwrap();
         assert_eq!(analysis.symbols.len(), 1);
         assert_eq!(analysis.symbols[0].name, "first");
     }
@@ -398,7 +405,7 @@ mod tests {
     #[test]
     fn exposes_recoverable_syntax_errors() {
         let analysis = analyze_changed_symbols(
-            SourceLanguage::Rust,
+            SourceLanguage::rust(),
             "fn broken( {\n",
             &[LineRange::new(1, 1)],
         )
@@ -410,7 +417,8 @@ mod tests {
     fn index_marks_syntax_identity_and_emits_contains_edges() {
         let source = "struct Worker;\nimpl Worker { fn run(&self) {} }\n";
         let index =
-            index_file_symbols("project_test", "src/lib.rs", SourceLanguage::Rust, source).unwrap();
+            index_file_symbols("project_test", "src/lib.rs", SourceLanguage::rust(), source)
+                .unwrap();
         assert_eq!(
             index.provider.identity_quality,
             IdentityQuality::SyntaxFallback
@@ -433,7 +441,8 @@ mod tests {
     fn trait_impls_have_distinct_fallback_owners() {
         let source = "trait A { fn run(&self); }\ntrait B { fn run(&self); }\nstruct Worker;\nimpl A for Worker { fn run(&self) {} }\nimpl B for Worker { fn run(&self) {} }\n";
         let index =
-            index_file_symbols("project_test", "src/lib.rs", SourceLanguage::Rust, source).unwrap();
+            index_file_symbols("project_test", "src/lib.rs", SourceLanguage::rust(), source)
+                .unwrap();
         assert!(
             index
                 .symbols
@@ -452,7 +461,8 @@ mod tests {
     fn multiple_inherent_impl_blocks_receive_distinct_fallback_ids() {
         let source = "struct Worker;\nimpl Worker { fn first(&self) {} }\nimpl Worker { fn second(&self) {} }\n";
         let index =
-            index_file_symbols("project_test", "src/lib.rs", SourceLanguage::Rust, source).unwrap();
+            index_file_symbols("project_test", "src/lib.rs", SourceLanguage::rust(), source)
+                .unwrap();
         let impls = index
             .symbols
             .iter()

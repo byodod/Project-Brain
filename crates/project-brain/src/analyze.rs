@@ -57,7 +57,7 @@ pub fn evaluate(root: &Path, base: &str) -> Result<AnalysisReport, AppError> {
             hunks.iter().filter_map(|hunk| hunk.new).collect()
         };
         let (changed_symbols, current_errors) = if let Some(source) = current_source {
-            let analysis = analyze_changed_symbols(language, &source, &changed_ranges)?;
+            let analysis = analyze_changed_symbols(language.clone(), &source, &changed_ranges)?;
             (analysis.symbols, analysis.has_syntax_errors)
         } else {
             (Vec::new(), false)
@@ -71,7 +71,7 @@ pub fn evaluate(root: &Path, base: &str) -> Result<AnalysisReport, AppError> {
         let (removed_symbols, old_errors) = if removed_ranges.is_empty() {
             (Vec::new(), false)
         } else if let Some(source) = git::file_at_revision(root, base, &path)? {
-            let analysis = analyze_changed_symbols(language, &source, &removed_ranges)?;
+            let analysis = analyze_changed_symbols(language.clone(), &source, &removed_ranges)?;
             (analysis.symbols, analysis.has_syntax_errors)
         } else {
             (Vec::new(), false)

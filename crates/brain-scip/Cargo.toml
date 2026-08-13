@@ -1,5 +1,5 @@
 [package]
-name = "project-brain"
+name = "brain-scip"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,14 +7,10 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-brain-analyzer = { path = "../brain-analyzer" }
-brain-core = { path = "../brain-core" }
-brain-scip = { path = "../brain-scip" }
-brain-store = { path = "../brain-store" }
 brain-symbols = { path = "../brain-symbols" }
-clap.workspace = true
+protobuf.workspace = true
+scip.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 

@@ -16,7 +16,7 @@ use crate::{
     analyze,
     codex::{self, CodexHookInput},
     error::AppError,
-    index, reconcile,
+    index, reconcile, scip_index,
 };
 
 const BRAIN_DIRECTORY: &str = ".project-brain";
@@ -177,6 +177,22 @@ impl App {
         Ok(())
     }
 
+    pub fn index_scip(&self, provider: &str, input: &Path) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&scip_index::evaluate(
+                &self.root,
+                &self.config.project_key,
+                &self.config.language_profiles,
+                &self.config.semantic_providers,
+                &self.store,
+                provider,
+                input,
+            )?)?
+        );
+        Ok(())
+    }
+
     pub fn symbols(
         &self,
         path: Option<&str>,
@@ -216,6 +232,8 @@ fn initial_config(project_name: String, project_key: String) -> BrainConfig {
         schema_version: CURRENT_SCHEMA_VERSION,
         project_key,
         project_name,
+        language_profiles: Vec::new(),
+        semantic_providers: Vec::new(),
         stop_reconcile: StopReconcileConfig {
             enabled: true,
             base: "HEAD".to_owned(),

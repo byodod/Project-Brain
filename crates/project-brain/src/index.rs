@@ -45,7 +45,7 @@ pub fn evaluate(
         let Some(source) = read_repository_source(root, &path)? else {
             continue;
         };
-        let file_index = index_file_symbols(project_key, &path, language, &source)?;
+        let file_index = index_file_symbols(project_key, &path, language.clone(), &source)?;
         if file_index.provider.id != provider.id
             || file_index.provider.version != provider.version
             || file_index.provider.identity_quality != provider.identity_quality

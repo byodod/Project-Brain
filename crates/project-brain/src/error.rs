@@ -22,6 +22,9 @@ pub enum AppError {
     #[error(transparent)]
     Analyzer(#[from] brain_analyzer::AnalyzerError),
 
+    #[error(transparent)]
+    Scip(#[from] brain_scip::ScipError),
+
     #[error("找不到 Project Brain 配置；请先在项目根目录执行 project-brain init")]
     ProjectNotInitialized,
 
@@ -39,6 +42,9 @@ pub enum AppError {
 
     #[error("源码不是有效 UTF-8：{0}")]
     NonUtf8Source(String),
+
+    #[error("SCIP 导入不符合当前项目 language profile：{0}")]
+    ScipProfileMismatch(String),
 
     #[error("Git 命令失败：{0}")]
     Git(String),

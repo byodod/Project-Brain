@@ -244,3 +244,27 @@ Adapter 不得自行重新解释某条项目规则。
 7. 相同快照重复应用必须得到全量 `unchanged`；
 8. 任何 rename/move lineage 都不能仅由 `syntax_fallback` 自动批准。
 9. 查询、墓碑失效和边更新必须显式限定 `project_key`，不得依赖数据库文件路径作为唯一隔离。
+
+## Project language 与 SCIP provider profile
+
+`language_profiles` 声明开放的规范 language ID 及其项目相对根；`semantic_providers` 独立声明
+数据格式、稳定 profile ID、实际 producer、Brain contract 版本和原始语言映射。两者分离，避免
+把 producer 名称误当语言，也允许一个 provider profile 逐 Document 输出多种语言。
+
+SCIP 导入遵循以下 fail-closed 规则：
+
+1. CLI 必须通过 `--provider` 指定项目中已声明的 profile；
+2. `tool_info.name` 必须与 profile producer 匹配；Rust 的实际 producer 是 `rust-analyzer`，
+   `scip-rust` wrapper 不进入白名单；
+3. `Document.language` 必须精确匹配显式 raw mapping；空值只匹配
+   `raw_language=null + allow_missing_language=true`；
+4. 映射后的 language 必须存在于 `language_profiles`，源码路径必须位于对应 roots；
+5. Provider contract version 与 producer version 分离；后者仅作 provenance；
+6. Provider 不从扩展名、项目文件、cwd、shebang 或观察到的单条关系猜测语言/能力；
+7. global provider key 包含规范 language、原始 SCIP symbol、文档和 range；local symbol 额外包含
+   index digest，禁止跨快照 lineage；
+8. reference 只在唯一目标且有最小 enclosing definition 时建边；不推断 calls/imports/implements。
+9. Provider ID 的可读规范名后附原始 profile contract 摘要，避免 `a-b`、`a_b`、`a.b` 等名称
+   归一化后发生身份碰撞。
+10. lineage 候选只在同一 project、provider 与 language 内比较；Git rename similarity 必须位于
+    0..10000，且达到 5000 才能单独把候选提升为 high confidence。
