@@ -19,8 +19,8 @@ rust-analyzer、SCIP 或其他语言原生索引，核心和存储不能绑定�
 6. 后续语义 Provider 通过相同快照协议接入；是否采用 rust-analyzer/SCIP 由真实实验决定。
 7. Provider ID 定义 provider key 的语义契约；破坏性 key 变更必须使用新 Provider ID，
    兼容的实现或工具链升级只更新 version。
-8. Provider key 只表示单个快照来源的身份；跨快照 lineage 由 Brain-owned
-   `IdentityTransition` 单独表达，不能把 SCIP key 或启发式匹配直接当成稳定全局身份。
+8. Provider key 只表示对应 Provider 的身份声明；跨快照 rename/move 关系必须保存为
+   可审计、版本化的 lineage 记录，不能把 SCIP key 或启发式匹配直接当成稳定全局身份。
 
 ## 结果
 

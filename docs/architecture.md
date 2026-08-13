@@ -98,13 +98,13 @@ external diff，避免分析动作执行仓库配置中的外部程序。
 
 ## 下一阶段
 
-1. 先拆分 runtime-neutral 的 event phase、verdict、effect 与 adapter receipt，并补齐幂等、
-   恢复、Stop continuation cap 和 sidecar 最小权限边界。
-2. 在公共 capability negotiation 之上增加 Claude Code 和 Prime Agent 适配器；Goal 与
-   Heartbeat 分别建模为 WorkIntent、WakeupSchedule，不伪装成 Hook。
-3. 消费 rust-analyzer SCIP 作为 Rust semantic Provider，并由 Brain 维护独立的
-   IdentityTransition/lineage；不自建解析器或类型检查器。
-4. 把符号图纳入符号级 Change Envelope 与规则 scope，再试点 C#/TypeScript/Python。
-5. 最后才加入只读、可拔插且首发仅 inject 的 Semantic Sentinel；LLM-only 结论永不 hard block。
+1. 先用真实 Rust 仓库实验 rust-analyzer 与 SCIP，验证 definition/reference、rename/move、
+   trait、macro 和跨文件调用关系；Project Brain 消费外部语义索引，不重写编译器或类型检查器。
+2. 在实验结果上实现版本化 semantic lineage，并把 symbol graph 纳入规则 scope 与
+   Change Envelope；当前 `syntax_fallback` 继续保留为快速层，但不能证明 rename/move 身份。
+3. Semantic Foundation 验收后再抽象公共 Internal Hook Protocol，并分别实现 Codex、
+   Claude Code adapter；Prime Agent 作为独立 runtime 通过专用 adapter/RPC 实验接入。
+4. 后续再试点 C#/TypeScript/Python 的语言原生索引。
+5. 最后才加入只读、可拔插的 Semantic Sentinel；LLM 只提供证据化建议，不能直接 hard block。
 
 相关决策见 [ADR-0001](adr/0001-provider-neutral-symbol-identity.md)。
