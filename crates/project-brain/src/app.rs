@@ -168,7 +168,11 @@ impl App {
     pub fn index(&self) -> Result<(), AppError> {
         println!(
             "{}",
-            pretty_json(&index::evaluate(&self.root, &self.store)?)?
+            pretty_json(&index::evaluate(
+                &self.root,
+                &self.config.project_key,
+                &self.store,
+            )?)?
         );
         Ok(())
     }
@@ -183,6 +187,7 @@ impl App {
         println!(
             "{}",
             pretty_json(&self.store.list_symbols(
+                &self.config.project_key,
                 normalized_path.as_deref(),
                 include_removed,
                 limit,

@@ -1,11 +1,7 @@
 {
   "schema_version": 1,
+  "project_key": "pb_79b8364c257bf54c87eb7ad172df54b6",
   "project_name": "Project Brain",
-  "stop_reconcile": {
-    "enabled": true,
-    "base": "HEAD",
-    "envelope": ".project-brain/envelope.json"
-  },
   "rules": [
     {
       "id": "PB-CORE-001",
@@ -67,5 +63,10 @@
       "message": "禁止通过 shell 删除 Project Brain 的项目规则配置",
       "rationale": "无结构化路径参数的 shell 删除需要单独匹配命令载荷"
     }
-  ]
+  ],
+  "stop_reconcile": {
+    "enabled": true,
+    "base": "HEAD",
+    "envelope": ".project-brain/envelope.json"
+  }
 }

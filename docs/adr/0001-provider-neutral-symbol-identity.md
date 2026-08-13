@@ -21,6 +21,8 @@ rust-analyzer、SCIP 或其他语言原生索引，核心和存储不能绑定�
    兼容的实现或工具链升级只更新 version。
 8. Provider key 只表示对应 Provider 的身份声明；跨快照 rename/move 关系必须保存为
    可审计、版本化的 lineage 记录，不能把 SCIP key 或启发式匹配直接当成稳定全局身份。
+9. 符号身份必须先由 `project_key` 分区；同形代码不能跨项目共享节点身份。具体决策见
+   ADR-0004。
 
 ## 结果
 
@@ -30,7 +32,7 @@ rust-analyzer、SCIP 或其他语言原生索引，核心和存储不能绑定�
 
 ## 验收不变量
 
-- 相同 Provider key 重复生成相同 ID。
+- 同一项目中的相同 Provider key 重复生成相同 ID；不同项目生成不同 ID。
 - syntax fallback rename 生成不同 ID。
 - 相同完整快照重复应用不产生 inserted、updated 或 removed。
 - 快照消失节点标记为 removed，不能物理丢失。

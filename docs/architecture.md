@@ -52,7 +52,7 @@ Tracked + unignored files
   Symbol Provider
   ├── Tree-sitter Rust: syntax_fallback
   └── future semantic provider
-          │ SymbolSnapshot
+          │ project-scoped SymbolSnapshot
           ▼
   SQLite derived graph
   ├── active nodes
@@ -78,11 +78,14 @@ Git 或 SQLite。`brain-analyzer` 是 Provider，`brain-store` 只消费完整�
         │
         ├── audit_events 本地派生记录、不进入版本控制
         ├── adapter_audit_events 按项目/适配器隔离的事件、结果、延迟与失败
-        └── symbol graph 可从工作区完整重建的派生索引
+        └── symbol graph 按 project_key 隔离、可从工作区完整重建的派生索引
 ```
 
 SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照以事务应用；快照中消失的节点
 进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
+符号 ID、快照 revision、节点/边主键、查询和墓碑更新都包含 `project_key`。数据库 schema v4
+迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与 adapter 审计，避免把旧节点错误归入
+某个项目。
 数据库迁移拒绝缺失或非整数的已有 `schema_version`，不会把损坏元数据静默当作 v1。
 Adapter 审计依赖 SQLite 唯一约束和 busy timeout，使并发连接对同一项目事件收敛到首次 outcome；
 失败记录可在重开数据库后由成功重试升级，后续重复成功不能覆盖首次成功。
@@ -126,5 +129,6 @@ Prime Agent 是独立 runtime，当前已确认的 Extension `agent_end` 不具�
    直接 hard block。
 
 相关决策见 [ADR-0001](adr/0001-provider-neutral-symbol-identity.md)、
-[ADR-0002](adr/0002-internal-hook-protocol.md) 与
-[ADR-0003](adr/0003-project-identity-and-adapter-audit.md)。
+[ADR-0002](adr/0002-internal-hook-protocol.md)、
+[ADR-0003](adr/0003-project-identity-and-adapter-audit.md) 与
+[ADR-0004](adr/0004-project-scoped-symbol-graph.md)。

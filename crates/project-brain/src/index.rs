@@ -14,6 +14,7 @@ use crate::{error::AppError, git};
 #[derive(Debug, Serialize)]
 pub struct IndexReport {
     pub schema_version: u32,
+    pub project_key: String,
     pub provider: ProviderDescriptor,
     pub source_revision: String,
     pub indexed_files: u64,
@@ -24,7 +25,11 @@ pub struct IndexReport {
     pub delta: GraphDelta,
 }
 
-pub fn evaluate(root: &Path, store: &BrainStore) -> Result<IndexReport, AppError> {
+pub fn evaluate(
+    root: &Path,
+    project_key: &str,
+    store: &BrainStore,
+) -> Result<IndexReport, AppError> {
     let provider = rust_syntax_provider();
     let head_revision = git::head_revision(root)?;
     let mut sources = Vec::new();
@@ -40,7 +45,7 @@ pub fn evaluate(root: &Path, store: &BrainStore) -> Result<IndexReport, AppError
         let Some(source) = read_repository_source(root, &path)? else {
             continue;
         };
-        let file_index = index_file_symbols(&path, language, &source)?;
+        let file_index = index_file_symbols(project_key, &path, language, &source)?;
         if file_index.provider.id != provider.id
             || file_index.provider.version != provider.version
             || file_index.provider.identity_quality != provider.identity_quality
@@ -63,14 +68,21 @@ pub fn evaluate(root: &Path, store: &BrainStore) -> Result<IndexReport, AppError
         edges.extend(file_index.edges);
     }
 
-    let snapshot =
-        SymbolSnapshot::for_worktree(provider.clone(), &head_revision, sources, symbols, edges);
+    let snapshot = SymbolSnapshot::for_worktree(
+        project_key,
+        provider.clone(),
+        &head_revision,
+        sources,
+        symbols,
+        edges,
+    );
     let indexed_symbols = u64::try_from(snapshot.symbols.len()).unwrap_or(u64::MAX);
     let indexed_edges = u64::try_from(snapshot.edges.len()).unwrap_or(u64::MAX);
     let source_revision = snapshot.source_revision.clone();
     let delta = store.apply_symbol_snapshot(&snapshot)?;
     Ok(IndexReport {
         schema_version: CURRENT_SCHEMA_VERSION,
+        project_key: project_key.to_owned(),
         provider,
         source_revision,
         indexed_files,

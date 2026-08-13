@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const DATABASE_SCHEMA_VERSION: i64 = 3;
+const DATABASE_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -140,9 +140,18 @@ impl BrainStore {
                 expected: DATABASE_SCHEMA_VERSION,
             });
         }
+        if schema_version < 4 {
+            // V1-V3 的符号图没有项目维度，无法在多项目存储中安全归属。
+            // 图是可重建缓存，因此迁移时只清除此缓存，保留动作与 adapter 审计。
+            self.connection.execute_batch(
+                "DROP TABLE IF EXISTS symbol_edges;
+                 DROP TABLE IF EXISTS symbol_nodes;",
+            )?;
+        }
         self.connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS symbol_nodes (
-                 id TEXT PRIMARY KEY,
+                 project_key TEXT NOT NULL,
+                 id TEXT NOT NULL,
                  provider_id TEXT NOT NULL,
                  identity_quality TEXT NOT NULL,
                  language TEXT NOT NULL,
@@ -155,13 +164,15 @@ impl BrainStore {
                  content_fingerprint TEXT NOT NULL,
                  status TEXT NOT NULL CHECK(status IN ('active', 'removed')),
                  first_seen_revision TEXT NOT NULL,
-                 last_seen_revision TEXT NOT NULL
+                 last_seen_revision TEXT NOT NULL,
+                 PRIMARY KEY(project_key, id)
              );
              CREATE UNIQUE INDEX IF NOT EXISTS idx_symbol_provider_key
-                 ON symbol_nodes(provider_id, provider_key);
+                 ON symbol_nodes(project_key, provider_id, provider_key);
              CREATE INDEX IF NOT EXISTS idx_symbol_path_status
-                 ON symbol_nodes(path, status, start_line);
+                 ON symbol_nodes(project_key, path, status, start_line);
              CREATE TABLE IF NOT EXISTS symbol_edges (
+                 project_key TEXT NOT NULL,
                  provider_id TEXT NOT NULL,
                  source_id TEXT NOT NULL,
                  target_id TEXT NOT NULL,
@@ -169,14 +180,14 @@ impl BrainStore {
                  status TEXT NOT NULL CHECK(status IN ('active', 'removed')),
                  first_seen_revision TEXT NOT NULL,
                  last_seen_revision TEXT NOT NULL,
-                 PRIMARY KEY(provider_id, source_id, target_id, kind),
-                 FOREIGN KEY(source_id) REFERENCES symbol_nodes(id),
-                 FOREIGN KEY(target_id) REFERENCES symbol_nodes(id)
+                 PRIMARY KEY(project_key, provider_id, source_id, target_id, kind),
+                 FOREIGN KEY(project_key, source_id) REFERENCES symbol_nodes(project_key, id),
+                 FOREIGN KEY(project_key, target_id) REFERENCES symbol_nodes(project_key, id)
              );
              CREATE INDEX IF NOT EXISTS idx_symbol_edges_source
-                 ON symbol_edges(source_id, status, kind);
+                 ON symbol_edges(project_key, source_id, status, kind);
              CREATE INDEX IF NOT EXISTS idx_symbol_edges_target
-                 ON symbol_edges(target_id, status, kind);",
+                 ON symbol_edges(project_key, target_id, status, kind);",
         )?;
         self.initialize_adapter_audit_schema()?;
         self.connection.execute(
@@ -259,6 +270,7 @@ impl BrainStore {
     /// `SQLite` 查询失败或持久化枚举字段无效时返回错误。
     pub fn list_symbols(
         &self,
+        project_key: &str,
         path: Option<&str>,
         include_removed: bool,
         limit: u32,
@@ -266,17 +278,18 @@ impl BrainStore {
         let path = path.unwrap_or_default();
         let path_pattern = escape_like_pattern(path);
         let mut statement = self.connection.prepare(
-            "SELECT id, provider_id, identity_quality, language, kind, provider_key,
+            "SELECT project_key, id, provider_id, identity_quality, language, kind, provider_key,
                     display_name, path, start_line, end_line, content_fingerprint, status
              FROM symbol_nodes
-             WHERE (?1 = 1 OR status = 'active')
-               AND (?2 = '' OR path = ?2 OR path LIKE ?3 || '/%' ESCAPE '!')
+             WHERE project_key = ?1
+               AND (?2 = 1 OR status = 'active')
+               AND (?3 = '' OR path = ?3 OR path LIKE ?4 || '/%' ESCAPE '!')
              ORDER BY path, start_line, end_line, id
-             LIMIT ?4",
+             LIMIT ?5",
         )?;
         statement
             .query_map(
-                params![include_removed, path, path_pattern, limit],
+                params![project_key, include_removed, path, path_pattern, limit],
                 decode_symbol_row,
             )?
             .collect::<Result<Vec<_>, _>>()
@@ -570,12 +583,14 @@ fn validate_snapshot(snapshot: &SymbolSnapshot) -> Result<(), StoreError> {
             snapshot.protocol_version, SYMBOL_PROTOCOL_VERSION
         )));
     }
-    if snapshot.provider.id.trim().is_empty()
+    if !is_valid_project_key(&snapshot.project_key)
+        || snapshot.provider.id.trim().is_empty()
         || snapshot.provider.version.trim().is_empty()
         || snapshot.source_revision.trim().is_empty()
     {
         return Err(StoreError::InvalidSnapshot(
-            "provider.id、provider.version 与 source_revision 不能为空".to_owned(),
+            "project_key 必须有效，provider.id、provider.version 与 source_revision 不能为空"
+                .to_owned(),
         ));
     }
     let ids = snapshot
@@ -602,10 +617,16 @@ fn validate_snapshot(snapshot: &SymbolSnapshot) -> Result<(), StoreError> {
         ));
     }
     for symbol in &snapshot.symbols {
-        if symbol.provider_id != snapshot.provider.id
+        if symbol.project_key != snapshot.project_key
+            || symbol.provider_id != snapshot.provider.id
             || symbol.identity_quality != snapshot.provider.identity_quality
             || symbol.status != SymbolStatus::Active
-            || symbol.id != symbol_id(&symbol.provider_id, &symbol.provider_key)
+            || symbol.id
+                != symbol_id(
+                    &symbol.project_key,
+                    &symbol.provider_id,
+                    &symbol.provider_key,
+                )
             || symbol.provider_key.contains('\0')
             || !is_normalized_symbol_path(&symbol.path)
             || !source_paths.contains(symbol.path.as_str())
@@ -621,7 +642,8 @@ fn validate_snapshot(snapshot: &SymbolSnapshot) -> Result<(), StoreError> {
     }
     let mut edge_keys = std::collections::BTreeSet::new();
     for edge in &snapshot.edges {
-        if edge.provider_id != snapshot.provider.id
+        if edge.project_key != snapshot.project_key
+            || edge.provider_id != snapshot.provider.id
             || !ids.contains(edge.source_id.as_str())
             || !ids.contains(edge.target_id.as_str())
             || !edge_keys.insert((
@@ -637,6 +659,14 @@ fn validate_snapshot(snapshot: &SymbolSnapshot) -> Result<(), StoreError> {
         }
     }
     Ok(())
+}
+
+fn is_valid_project_key(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn is_sha256_fingerprint(value: &str) -> bool {
@@ -661,12 +691,25 @@ fn apply_snapshot_transaction(
     transaction: &Transaction<'_>,
     snapshot: &SymbolSnapshot,
 ) -> Result<GraphDelta, StoreError> {
+    let delta = apply_symbol_nodes(transaction, snapshot)?;
+    apply_symbol_edges(transaction, snapshot)?;
+    Ok(delta)
+}
+
+fn apply_symbol_nodes(
+    transaction: &Transaction<'_>,
+    snapshot: &SymbolSnapshot,
+) -> Result<GraphDelta, StoreError> {
     let mut delta = GraphDelta::default();
     let existing_active = {
-        let mut statement = transaction
-            .prepare("SELECT id FROM symbol_nodes WHERE provider_id = ?1 AND status = 'active'")?;
+        let mut statement = transaction.prepare(
+            "SELECT id FROM symbol_nodes
+             WHERE project_key = ?1 AND provider_id = ?2 AND status = 'active'",
+        )?;
         statement
-            .query_map([&snapshot.provider.id], |row| row.get::<_, String>(0))?
+            .query_map(params![snapshot.project_key, snapshot.provider.id], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<Result<std::collections::BTreeSet<_>, _>>()?
     };
     let incoming = snapshot
@@ -678,10 +721,10 @@ fn apply_snapshot_transaction(
     for symbol in &snapshot.symbols {
         let previous = transaction
             .query_row(
-                "SELECT id, provider_id, identity_quality, language, kind, provider_key,
+                "SELECT project_key, id, provider_id, identity_quality, language, kind, provider_key,
                         display_name, path, start_line, end_line, content_fingerprint, status
-                 FROM symbol_nodes WHERE id = ?1",
-                [&symbol.id],
+                 FROM symbol_nodes WHERE project_key = ?1 AND id = ?2",
+                params![snapshot.project_key, symbol.id],
                 decode_symbol_row,
             )
             .optional()?;
@@ -692,11 +735,11 @@ fn apply_snapshot_transaction(
         }
         transaction.execute(
             "INSERT INTO symbol_nodes(
-                 id, provider_id, identity_quality, language, kind, provider_key,
+                 project_key, id, provider_id, identity_quality, language, kind, provider_key,
                  display_name, path, start_line, end_line, content_fingerprint, status,
                  first_seen_revision, last_seen_revision
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'active', ?12, ?12)
-             ON CONFLICT(id) DO UPDATE SET
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'active', ?13, ?13)
+             ON CONFLICT(project_key, id) DO UPDATE SET
                  provider_id = excluded.provider_id,
                  identity_quality = excluded.identity_quality,
                  language = excluded.language,
@@ -710,6 +753,7 @@ fn apply_snapshot_transaction(
                  status = 'active',
                  last_seen_revision = excluded.last_seen_revision",
             params![
+                snapshot.project_key,
                 symbol.id,
                 symbol.provider_id,
                 symbol.identity_quality.as_str(),
@@ -728,27 +772,39 @@ fn apply_snapshot_transaction(
 
     for removed_id in existing_active.difference(&incoming) {
         transaction.execute(
-            "UPDATE symbol_nodes SET status = 'removed', last_seen_revision = ?2
-             WHERE id = ?1",
-            params![removed_id, snapshot.source_revision],
+            "UPDATE symbol_nodes SET status = 'removed', last_seen_revision = ?3
+             WHERE project_key = ?1 AND id = ?2",
+            params![snapshot.project_key, removed_id, snapshot.source_revision],
         )?;
         delta.removed += 1;
     }
 
+    Ok(delta)
+}
+
+fn apply_symbol_edges(
+    transaction: &Transaction<'_>,
+    snapshot: &SymbolSnapshot,
+) -> Result<(), StoreError> {
     transaction.execute(
-        "UPDATE symbol_edges SET status = 'removed', last_seen_revision = ?2
-         WHERE provider_id = ?1 AND status = 'active'",
-        params![snapshot.provider.id, snapshot.source_revision],
+        "UPDATE symbol_edges SET status = 'removed', last_seen_revision = ?3
+         WHERE project_key = ?1 AND provider_id = ?2 AND status = 'active'",
+        params![
+            snapshot.project_key,
+            snapshot.provider.id,
+            snapshot.source_revision
+        ],
     )?;
     for edge in &snapshot.edges {
         transaction.execute(
             "INSERT INTO symbol_edges(
-                 provider_id, source_id, target_id, kind, status,
+                 project_key, provider_id, source_id, target_id, kind, status,
                  first_seen_revision, last_seen_revision
-             ) VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5)
-             ON CONFLICT(provider_id, source_id, target_id, kind) DO UPDATE SET
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)
+             ON CONFLICT(project_key, provider_id, source_id, target_id, kind) DO UPDATE SET
                  status = 'active', last_seen_revision = excluded.last_seen_revision",
             params![
+                edge.project_key,
                 edge.provider_id,
                 edge.source_id,
                 edge.target_id,
@@ -757,16 +813,16 @@ fn apply_snapshot_transaction(
             ],
         )?;
     }
-    Ok(delta)
+    Ok(())
 }
 
 fn decode_symbol_row(row: &rusqlite::Row<'_>) -> Result<SymbolNode, rusqlite::Error> {
-    let quality: String = row.get(2)?;
-    let language: String = row.get(3)?;
-    let status: String = row.get(11)?;
+    let quality: String = row.get(3)?;
+    let language: String = row.get(4)?;
+    let status: String = row.get(12)?;
     let identity_quality = IdentityQuality::parse(&quality).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            2,
+            3,
             rusqlite::types::Type::Text,
             Box::new(StoreError::InvalidSymbolField {
                 field: "identity_quality",
@@ -776,7 +832,7 @@ fn decode_symbol_row(row: &rusqlite::Row<'_>) -> Result<SymbolNode, rusqlite::Er
     })?;
     let language = SourceLanguage::parse(&language).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            3,
+            4,
             rusqlite::types::Type::Text,
             Box::new(StoreError::InvalidSymbolField {
                 field: "language",
@@ -786,7 +842,7 @@ fn decode_symbol_row(row: &rusqlite::Row<'_>) -> Result<SymbolNode, rusqlite::Er
     })?;
     let status = SymbolStatus::parse(&status).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            11,
+            12,
             rusqlite::types::Type::Text,
             Box::new(StoreError::InvalidSymbolField {
                 field: "status",
@@ -794,26 +850,28 @@ fn decode_symbol_row(row: &rusqlite::Row<'_>) -> Result<SymbolNode, rusqlite::Er
             }),
         )
     })?;
-    let start_line: i64 = row.get(8)?;
-    let end_line: i64 = row.get(9)?;
+    let start_line: i64 = row.get(9)?;
+    let end_line: i64 = row.get(10)?;
     Ok(SymbolNode {
-        id: row.get(0)?,
-        provider_id: row.get(1)?,
+        project_key: row.get(0)?,
+        id: row.get(1)?,
+        provider_id: row.get(2)?,
         identity_quality,
         language,
-        kind: row.get(4)?,
-        provider_key: row.get(5)?,
-        display_name: row.get(6)?,
-        path: row.get(7)?,
+        kind: row.get(5)?,
+        provider_key: row.get(6)?,
+        display_name: row.get(7)?,
+        path: row.get(8)?,
         start_line: usize::try_from(start_line).unwrap_or_default(),
         end_line: usize::try_from(end_line).unwrap_or_default(),
-        content_fingerprint: row.get(10)?,
+        content_fingerprint: row.get(11)?,
         status,
     })
 }
 
 fn same_symbol_observation(left: &SymbolNode, right: &SymbolNode) -> bool {
     left.id == right.id
+        && left.project_key == right.project_key
         && left.provider_id == right.provider_id
         && left.identity_quality == right.identity_quality
         && left.language == right.language
@@ -853,6 +911,8 @@ mod tests {
 
     use super::{AdapterRecordResult, BrainStore, StoreError};
 
+    const PROJECT_KEY: &str = "project_test";
+
     fn provider() -> ProviderDescriptor {
         ProviderDescriptor {
             id: "test-syntax".to_owned(),
@@ -862,9 +922,14 @@ mod tests {
     }
 
     fn symbol(name: &str) -> SymbolNode {
+        symbol_for(PROJECT_KEY, name)
+    }
+
+    fn symbol_for(project_key: &str, name: &str) -> SymbolNode {
         let provider_key = encode_provider_key(&["src/lib.rs", "function_item", name, "0"]);
         let content = format!("fn {name}() {{}}");
         SymbolNode::from_provider_key(
+            project_key,
             &provider(),
             SymbolNodeInput {
                 language: SourceLanguage::Rust,
@@ -880,6 +945,10 @@ mod tests {
     }
 
     fn snapshot(revision: &str, symbols: Vec<SymbolNode>) -> SymbolSnapshot {
+        snapshot_for(PROJECT_KEY, revision, symbols)
+    }
+
+    fn snapshot_for(project_key: &str, revision: &str, symbols: Vec<SymbolNode>) -> SymbolSnapshot {
         let sources = symbols
             .iter()
             .map(|symbol| (symbol.path.clone(), symbol.language))
@@ -891,6 +960,7 @@ mod tests {
             .collect();
         SymbolSnapshot {
             protocol_version: SYMBOL_PROTOCOL_VERSION,
+            project_key: project_key.to_owned(),
             provider: provider(),
             source_revision: revision.to_owned(),
             sources,
@@ -1139,8 +1209,14 @@ mod tests {
                 ..GraphDelta::default()
             }
         );
-        assert_eq!(store.list_symbols(None, false, 100).unwrap().len(), 1);
-        let history = store.list_symbols(None, true, 100).unwrap();
+        assert_eq!(
+            store
+                .list_symbols(PROJECT_KEY, None, false, 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        let history = store.list_symbols(PROJECT_KEY, None, true, 100).unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(
             history
@@ -1150,6 +1226,37 @@ mod tests {
                 .status,
             SymbolStatus::Removed
         );
+    }
+
+    #[test]
+    fn symbol_snapshots_and_tombstones_are_isolated_by_project() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let alpha = symbol_for("project_alpha", "run");
+        let beta = symbol_for("project_beta", "run");
+
+        store
+            .apply_symbol_snapshot(&snapshot_for(
+                "project_alpha",
+                "alpha-1",
+                vec![alpha.clone()],
+            ))
+            .unwrap();
+        store
+            .apply_symbol_snapshot(&snapshot_for("project_beta", "beta-1", vec![beta.clone()]))
+            .unwrap();
+        store
+            .apply_symbol_snapshot(&snapshot_for("project_alpha", "alpha-2", Vec::new()))
+            .unwrap();
+
+        assert!(
+            store
+                .list_symbols("project_alpha", None, false, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let beta_symbols = store.list_symbols("project_beta", None, false, 10).unwrap();
+        assert_eq!(beta_symbols, vec![beta]);
+        assert_ne!(alpha.id, beta_symbols[0].id);
     }
 
     #[test]
@@ -1183,8 +1290,13 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 3);
-        assert!(store.list_symbols(None, false, 10).unwrap().is_empty());
+        assert_eq!(store.database_schema_version().unwrap(), 4);
+        assert!(
+            store
+                .list_symbols(PROJECT_KEY, None, false, 10)
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             store
                 .recent_adapter_audit("project_a", 10)
@@ -1196,6 +1308,114 @@ mod tests {
     }
 
     #[test]
+    fn v3_migration_discards_unscoped_graph_but_preserves_adapter_audit() {
+        let (root, database) = temporary_database("v3-project-scope-migration");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata(key, value) VALUES('schema_version', '3');
+                 CREATE TABLE symbol_nodes (
+                     id TEXT PRIMARY KEY,
+                     provider_id TEXT NOT NULL,
+                     identity_quality TEXT NOT NULL,
+                     language TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     provider_key TEXT NOT NULL,
+                     display_name TEXT NOT NULL,
+                     path TEXT NOT NULL,
+                     start_line INTEGER NOT NULL,
+                     end_line INTEGER NOT NULL,
+                     content_fingerprint TEXT NOT NULL,
+                     status TEXT NOT NULL,
+                     first_seen_revision TEXT NOT NULL,
+                     last_seen_revision TEXT NOT NULL
+                 );
+                 INSERT INTO symbol_nodes VALUES(
+                     'legacy-id', 'legacy-provider', 'syntax_fallback', 'rust',
+                     'function_item', 'legacy-key', 'run', 'src/lib.rs', 1, 1,
+                     'sha256_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     'active', 'legacy-revision', 'legacy-revision'
+                 );
+                 CREATE TABLE symbol_edges (
+                     provider_id TEXT NOT NULL,
+                     source_id TEXT NOT NULL,
+                     target_id TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     status TEXT NOT NULL,
+                     first_seen_revision TEXT NOT NULL,
+                     last_seen_revision TEXT NOT NULL,
+                     PRIMARY KEY(provider_id, source_id, target_id, kind)
+                 );
+                 CREATE TABLE adapter_audit_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     project_key TEXT NOT NULL,
+                     adapter_kind TEXT NOT NULL,
+                     adapter_version INTEGER NOT NULL,
+                     event_id TEXT NOT NULL,
+                     session_key TEXT NOT NULL,
+                     event_kind TEXT NOT NULL,
+                     event_json TEXT NOT NULL,
+                     outcome_json TEXT,
+                     latency_ms INTEGER NOT NULL,
+                     failure TEXT,
+                     created_at_unix_seconds INTEGER NOT NULL,
+                     UNIQUE(project_key, adapter_kind, event_id)
+                 );
+                 INSERT INTO adapter_audit_events(
+                     project_key, adapter_kind, adapter_version, event_id, session_key,
+                     event_kind, event_json, outcome_json, latency_ms, failure,
+                     created_at_unix_seconds
+                 ) VALUES(
+                     'project_test', 'codex', 1, 'event-1', 'session-1',
+                     'session_opened', '{}', NULL, 1, 'legacy failure', 1
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = BrainStore::open(&database).unwrap();
+        assert_eq!(store.database_schema_version().unwrap(), 4);
+        assert!(
+            store
+                .list_symbols(PROJECT_KEY, None, true, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let audit = store.recent_adapter_audit(PROJECT_KEY, 10).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].event_id, "event-1");
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_symbol_or_edge_from_another_project() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let mut wrong_symbol = symbol("run");
+        wrong_symbol.project_key = "project_other".to_owned();
+        assert!(matches!(
+            store.apply_symbol_snapshot(&snapshot("rev-symbol", vec![wrong_symbol])),
+            Err(StoreError::InvalidSnapshot(_))
+        ));
+
+        let source = symbol("source");
+        let target = symbol("target");
+        let mut wrong_edge_snapshot = snapshot("rev-edge", vec![source.clone(), target.clone()]);
+        wrong_edge_snapshot.edges.push(brain_symbols::SymbolEdge {
+            project_key: "project_other".to_owned(),
+            provider_id: provider().id,
+            source_id: source.id,
+            target_id: target.id,
+            kind: brain_symbols::EdgeKind::Calls,
+        });
+        assert!(matches!(
+            store.apply_symbol_snapshot(&wrong_edge_snapshot),
+            Err(StoreError::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
     fn path_queries_treat_like_wildcards_as_literal_characters() {
         let store = BrainStore::open_in_memory().unwrap();
         let mut unusual = symbol("unusual");
@@ -1204,12 +1424,15 @@ mod tests {
             .apply_symbol_snapshot(&snapshot("rev-1", vec![unusual]))
             .unwrap();
         assert_eq!(
-            store.list_symbols(Some("src/a%"), false, 10).unwrap().len(),
+            store
+                .list_symbols(PROJECT_KEY, Some("src/a%"), false, 10)
+                .unwrap()
+                .len(),
             1
         );
         assert!(
             store
-                .list_symbols(Some("src/a_"), false, 10)
+                .list_symbols(PROJECT_KEY, Some("src/a_"), false, 10)
                 .unwrap()
                 .is_empty()
         );
@@ -1243,6 +1466,11 @@ mod tests {
             store.apply_symbol_snapshot(&snapshot("rev-1", vec![invalid])),
             Err(super::StoreError::InvalidSnapshot(_))
         ));
-        assert!(store.list_symbols(None, true, 10).unwrap().is_empty());
+        assert!(
+            store
+                .list_symbols(PROJECT_KEY, None, true, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

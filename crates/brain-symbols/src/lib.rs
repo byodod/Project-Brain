@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const SYMBOL_PROTOCOL_VERSION: u32 = 1;
+pub const SYMBOL_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -108,6 +108,8 @@ pub struct ProviderDescriptor {
 pub struct SymbolNode {
     /// Provider key 的稳定摘要。它不是跨 Provider 的全局语义真相。
     pub id: String,
+    /// 项目的稳定身份。符号身份不得跨项目隐式合并。
+    pub project_key: String,
     pub provider_id: String,
     pub identity_quality: IdentityQuality,
     pub language: SourceLanguage,
@@ -134,10 +136,15 @@ pub struct SymbolNodeInput<'a> {
 }
 
 impl SymbolNode {
-    pub fn from_provider_key(provider: &ProviderDescriptor, input: SymbolNodeInput<'_>) -> Self {
-        let id = symbol_id(&provider.id, input.provider_key);
+    pub fn from_provider_key(
+        project_key: &str,
+        provider: &ProviderDescriptor,
+        input: SymbolNodeInput<'_>,
+    ) -> Self {
+        let id = symbol_id(project_key, &provider.id, input.provider_key);
         Self {
             id,
+            project_key: project_key.to_owned(),
             provider_id: provider.id.clone(),
             identity_quality: provider.identity_quality,
             language: input.language,
@@ -155,6 +162,7 @@ impl SymbolNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SymbolEdge {
+    pub project_key: String,
     pub provider_id: String,
     pub source_id: String,
     pub target_id: String,
@@ -188,6 +196,7 @@ impl SourceFileState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SymbolSnapshot {
     pub protocol_version: u32,
+    pub project_key: String,
     pub provider: ProviderDescriptor,
     pub source_revision: String,
     pub sources: Vec<SourceFileState>,
@@ -197,6 +206,7 @@ pub struct SymbolSnapshot {
 
 impl SymbolSnapshot {
     pub fn for_worktree(
+        project_key: &str,
         provider: ProviderDescriptor,
         head_revision: &str,
         mut sources: Vec<SourceFileState>,
@@ -218,6 +228,7 @@ impl SymbolSnapshot {
             &mut revision_material,
             &u64::from(SYMBOL_PROTOCOL_VERSION).to_be_bytes(),
         );
+        append_digest_part(&mut revision_material, project_key.as_bytes());
         append_digest_part(&mut revision_material, head_revision.as_bytes());
         append_digest_part(&mut revision_material, provider.id.as_bytes());
         append_digest_part(&mut revision_material, provider.version.as_bytes());
@@ -239,6 +250,7 @@ impl SymbolSnapshot {
         }
         for symbol in &symbols {
             append_digest_part(&mut revision_material, symbol.id.as_bytes());
+            append_digest_part(&mut revision_material, symbol.project_key.as_bytes());
             append_digest_part(&mut revision_material, symbol.provider_id.as_bytes());
             append_digest_part(
                 &mut revision_material,
@@ -268,14 +280,16 @@ impl SymbolSnapshot {
             append_digest_part(&mut revision_material, symbol.status.as_str().as_bytes());
         }
         for edge in &edges {
+            append_digest_part(&mut revision_material, edge.project_key.as_bytes());
             append_digest_part(&mut revision_material, edge.provider_id.as_bytes());
             append_digest_part(&mut revision_material, edge.source_id.as_bytes());
             append_digest_part(&mut revision_material, edge.target_id.as_bytes());
             append_digest_part(&mut revision_material, edge.kind.as_str().as_bytes());
         }
-        let source_revision = format!("worktree_v2_{}", stable_digest(&[&revision_material]));
+        let source_revision = format!("worktree_v3_{}", stable_digest(&[&revision_material]));
         Self {
             protocol_version: SYMBOL_PROTOCOL_VERSION,
+            project_key: project_key.to_owned(),
             provider,
             source_revision,
             sources,
@@ -294,10 +308,14 @@ pub fn encode_provider_key(parts: &[&str]) -> String {
     encoded
 }
 
-pub fn symbol_id(provider_id: &str, provider_key: &str) -> String {
+pub fn symbol_id(project_key: &str, provider_id: &str, provider_key: &str) -> String {
     format!(
-        "sym_v1_{}",
-        stable_digest(&[provider_id.as_bytes(), provider_key.as_bytes()])
+        "sym_v2_{}",
+        stable_digest(&[
+            project_key.as_bytes(),
+            provider_id.as_bytes(),
+            provider_key.as_bytes(),
+        ])
     )
 }
 
@@ -334,6 +352,8 @@ mod tests {
         SymbolNodeInput, SymbolStatus, encode_provider_key,
     };
 
+    const PROJECT_KEY: &str = "project_alpha";
+
     fn provider() -> ProviderDescriptor {
         ProviderDescriptor {
             id: "tree-sitter-rust-syntax".to_owned(),
@@ -346,6 +366,7 @@ mod tests {
     fn same_provider_key_has_a_repeatable_id() {
         let key = encode_provider_key(&["src/lib.rs", "function_item", "run"]);
         let left = SymbolNode::from_provider_key(
+            PROJECT_KEY,
             &provider(),
             SymbolNodeInput {
                 language: SourceLanguage::Rust,
@@ -359,6 +380,7 @@ mod tests {
             },
         );
         let right = SymbolNode::from_provider_key(
+            PROJECT_KEY,
             &provider(),
             SymbolNodeInput {
                 language: SourceLanguage::Rust,
@@ -380,6 +402,7 @@ mod tests {
         let before_key = encode_provider_key(&["src/lib.rs", "function_item", "before"]);
         let after_key = encode_provider_key(&["src/lib.rs", "function_item", "after"]);
         let old = SymbolNode::from_provider_key(
+            PROJECT_KEY,
             &provider(),
             SymbolNodeInput {
                 language: SourceLanguage::Rust,
@@ -393,6 +416,7 @@ mod tests {
             },
         );
         let renamed = SymbolNode::from_provider_key(
+            PROJECT_KEY,
             &provider(),
             SymbolNodeInput {
                 language: SourceLanguage::Rust,
@@ -414,6 +438,7 @@ mod tests {
         let provider = provider();
         let make = |line| {
             SymbolNode::from_provider_key(
+                PROJECT_KEY,
                 &provider,
                 SymbolNodeInput {
                     language: SourceLanguage::Rust,
@@ -428,6 +453,7 @@ mod tests {
             )
         };
         let first = super::SymbolSnapshot::for_worktree(
+            PROJECT_KEY,
             provider.clone(),
             "head",
             vec![SourceFileState::from_source(
@@ -440,6 +466,7 @@ mod tests {
             Vec::new(),
         );
         let shifted = super::SymbolSnapshot::for_worktree(
+            PROJECT_KEY,
             provider.clone(),
             "head",
             vec![SourceFileState::from_source(
@@ -458,6 +485,7 @@ mod tests {
     fn worktree_revision_covers_symbol_free_source_and_syntax_state() {
         let make = |source: &[u8], has_syntax_errors| {
             super::SymbolSnapshot::for_worktree(
+                PROJECT_KEY,
                 provider(),
                 "unborn:refs/heads/main",
                 vec![SourceFileState::from_source(
@@ -484,6 +512,7 @@ mod tests {
             SourceFileState::from_source("src/lib.rs", SourceLanguage::Rust, b"fn run() {}", false);
         let make_symbol = |kind: &'static str, display_name: &'static str| {
             SymbolNode::from_provider_key(
+                PROJECT_KEY,
                 &provider(),
                 SymbolNodeInput {
                     language: SourceLanguage::Rust,
@@ -499,6 +528,7 @@ mod tests {
         };
         let snapshot = |provider, symbol| {
             super::SymbolSnapshot::for_worktree(
+                PROJECT_KEY,
                 provider,
                 "head",
                 vec![source.clone()],
@@ -519,5 +549,31 @@ mod tests {
         assert_ne!(baseline.source_revision, quality_changed.source_revision);
         assert_ne!(baseline.source_revision, kind_changed.source_revision);
         assert_ne!(baseline.source_revision, name_changed.source_revision);
+    }
+
+    #[test]
+    fn identical_provider_symbols_are_isolated_by_project() {
+        let make = |project_key| {
+            SymbolNode::from_provider_key(
+                project_key,
+                &provider(),
+                SymbolNodeInput {
+                    language: SourceLanguage::Rust,
+                    kind: "function_item",
+                    provider_key: "stable-key",
+                    display_name: "run",
+                    path: "src/lib.rs",
+                    start_line: 1,
+                    end_line: 1,
+                    content: b"fn run() {}",
+                },
+            )
+        };
+        let alpha = make("project_alpha");
+        let beta = make("project_beta");
+
+        assert_ne!(alpha.id, beta.id);
+        assert_eq!(alpha.project_key, "project_alpha");
+        assert_eq!(beta.project_key, "project_beta");
     }
 }

@@ -12,8 +12,8 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - Git Change Envelope 范围核对；
 - Codex `Stop` 自动 Change Envelope 对账与防循环保护；
 - 基于 Tree-sitter 的 Rust changed-symbol 与纯删除符号提取；
-- Provider-neutral 符号身份协议、完整工作区快照与本地派生符号图；
-- SQLite schema v1→v3 迁移、符号 removed 历史与幂等增量更新；
+- Project-scoped Provider-neutral 符号身份协议、完整工作区快照与本地派生符号图；
+- SQLite schema v1→v4 迁移、按项目隔离的符号 removed 历史与幂等增量更新；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
 ## 核心原则
@@ -180,7 +180,9 @@ project-brain symbols --path crates/brain-core --limit 50
 `identity_quality: syntax_fallback`：相同路径、种类和限定名具有可重复 ID，但 rename/move
 会产生新 ID，Runtime 不会自动声称其 lineage 相同。快照 revision 还覆盖所有受支持源文件
 的内容摘要和语法错误状态，因此无符号文件的变化也可检测；没有首个 commit 的仓库使用显式
-unborn HEAD 标记。未来 SCIP 等语义 Provider 可接入同一协议，跨快照 lineage 由 Brain 自己维护。
+unborn HEAD 标记。符号 ID、快照、查询和 tombstone 都显式绑定配置中的 `project_key`；相同代码
+在不同项目中生成不同身份，即使未来共用一个数据库也不会串图。未来 SCIP 等语义 Provider 可接入
+同一协议，跨快照 lineage 由 Brain 自己维护。
 
 ## Workspace
 

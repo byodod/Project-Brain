@@ -130,6 +130,7 @@ pub fn analyze_changed_symbols(
 ///
 /// Tree-sitter grammar 无法加载或解析器未产生语法树时返回错误。
 pub fn index_file_symbols(
+    project_key: &str,
     path: &str,
     language: SourceLanguage,
     source: &str,
@@ -145,6 +146,7 @@ pub fn index_file_symbols(
     collect_index_symbols(
         root,
         source,
+        project_key,
         path,
         language,
         &provider,
@@ -188,6 +190,7 @@ fn configured_parser(language: SourceLanguage) -> Result<Parser, AnalyzerError> 
 fn collect_index_symbols(
     node: Node<'_>,
     source: &str,
+    project_key: &str,
     path: &str,
     language: SourceLanguage,
     provider: &ProviderDescriptor,
@@ -213,6 +216,7 @@ fn collect_index_symbols(
             .get(node.start_byte()..node.end_byte())
             .unwrap_or_default();
         let symbol = SymbolNode::from_provider_key(
+            project_key,
             provider,
             SymbolNodeInput {
                 language,
@@ -227,6 +231,7 @@ fn collect_index_symbols(
         );
         if let Some(parent_id) = owner_ids.last() {
             edges.push(SymbolEdge {
+                project_key: project_key.to_owned(),
                 provider_id: provider.id.clone(),
                 source_id: parent_id.clone(),
                 target_id: symbol.id.clone(),
@@ -244,6 +249,7 @@ fn collect_index_symbols(
         collect_index_symbols(
             child,
             source,
+            project_key,
             path,
             language,
             provider,
@@ -403,7 +409,8 @@ mod tests {
     #[test]
     fn index_marks_syntax_identity_and_emits_contains_edges() {
         let source = "struct Worker;\nimpl Worker { fn run(&self) {} }\n";
-        let index = index_file_symbols("src/lib.rs", SourceLanguage::Rust, source).unwrap();
+        let index =
+            index_file_symbols("project_test", "src/lib.rs", SourceLanguage::Rust, source).unwrap();
         assert_eq!(
             index.provider.identity_quality,
             IdentityQuality::SyntaxFallback
@@ -425,7 +432,8 @@ mod tests {
     #[test]
     fn trait_impls_have_distinct_fallback_owners() {
         let source = "trait A { fn run(&self); }\ntrait B { fn run(&self); }\nstruct Worker;\nimpl A for Worker { fn run(&self) {} }\nimpl B for Worker { fn run(&self) {} }\n";
-        let index = index_file_symbols("src/lib.rs", SourceLanguage::Rust, source).unwrap();
+        let index =
+            index_file_symbols("project_test", "src/lib.rs", SourceLanguage::Rust, source).unwrap();
         assert!(
             index
                 .symbols
@@ -443,7 +451,8 @@ mod tests {
     #[test]
     fn multiple_inherent_impl_blocks_receive_distinct_fallback_ids() {
         let source = "struct Worker;\nimpl Worker { fn first(&self) {} }\nimpl Worker { fn second(&self) {} }\n";
-        let index = index_file_symbols("src/lib.rs", SourceLanguage::Rust, source).unwrap();
+        let index =
+            index_file_symbols("project_test", "src/lib.rs", SourceLanguage::Rust, source).unwrap();
         let impls = index
             .symbols
             .iter()
