@@ -349,7 +349,9 @@ pub struct GraphDelta {
     pub removed: u64,
 }
 
-pub const LINEAGE_ALGORITHM_VERSION: &str = "lineage-candidate-v1";
+pub const LINEAGE_ALGORITHM_ID: &str = "project-brain-lineage";
+pub const LINEAGE_ALGORITHM_VERSION: &str = "1";
+pub const LINEAGE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -359,13 +361,56 @@ pub enum LineageConfidence {
     High,
 }
 
+impl LineageConfidence {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LineageState {
     Proposed,
     Confirmed,
     Rejected,
-    Ambiguous,
+    Superseded,
+    Invalidated,
+}
+
+impl LineageState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::Confirmed => "confirmed",
+            Self::Rejected => "rejected",
+            Self::Superseded => "superseded",
+            Self::Invalidated => "invalidated",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "proposed" => Some(Self::Proposed),
+            "confirmed" => Some(Self::Confirmed),
+            "rejected" => Some(Self::Rejected),
+            "superseded" => Some(Self::Superseded),
+            "invalidated" => Some(Self::Invalidated),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -386,7 +431,8 @@ pub enum LineageEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LineageSymbolObservation {
     pub project_key: String,
-    pub provider_id: String,
+    pub provider_profile_id: String,
+    pub provider_contract_id: String,
     pub language: SourceLanguage,
     pub snapshot_revision: String,
     pub symbol_id: String,
@@ -406,16 +452,21 @@ pub struct PathRenameEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LineageCandidate {
-    pub id: String,
+pub struct LineageCandidateProposal {
     pub project_key: String,
+    pub provider_profile_id: String,
+    pub provider_contract_id: String,
+    pub language: SourceLanguage,
     pub from_snapshot: String,
     pub from_symbol: String,
     pub to_snapshot: String,
     pub to_symbol: String,
+    pub ambiguity_group_id: Option<String>,
+    pub algorithm_id: String,
     pub algorithm_version: String,
     pub confidence: LineageConfidence,
-    pub state: LineageState,
+    pub input_fingerprint: String,
+    pub evidence_fingerprint: String,
     pub evidence: Vec<LineageEvidence>,
 }
 
@@ -426,14 +477,27 @@ pub fn propose_lineage_candidates(
     previous: &[LineageSymbolObservation],
     current: &[LineageSymbolObservation],
     path_renames: &[PathRenameEvidence],
-) -> Vec<LineageCandidate> {
+) -> Vec<LineageCandidateProposal> {
+    let previous_ids = previous
+        .iter()
+        .map(|observation| observation.symbol_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let current_ids = current
+        .iter()
+        .map(|observation| observation.symbol_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
     let mut pairs = Vec::new();
     for (old_index, old) in previous.iter().enumerate() {
+        if current_ids.contains(old.symbol_id.as_str()) {
+            continue;
+        }
         for (new_index, new) in current.iter().enumerate() {
-            if !old.is_local
+            if !previous_ids.contains(new.symbol_id.as_str())
+                && !old.is_local
                 && !new.is_local
                 && old.project_key == new.project_key
-                && old.provider_id == new.provider_id
+                && old.provider_profile_id == new.provider_profile_id
+                && old.provider_contract_id == new.provider_contract_id
                 && old.language == new.language
                 && old.kind == new.kind
                 && old.normalized_definition_fingerprint == new.normalized_definition_fingerprint
@@ -447,7 +511,7 @@ pub fn propose_lineage_candidates(
     let mut candidates = pairs
         .into_iter()
         .map(|(old_index, new_index)| {
-            build_lineage_candidate(
+            build_lineage_candidate_proposal(
                 &previous[old_index],
                 &current[new_index],
                 path_renames,
@@ -456,7 +520,9 @@ pub fn propose_lineage_candidates(
             )
         })
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| left.id.cmp(&right.id));
+    candidates.sort_by(|left, right| {
+        (&left.from_symbol, &left.to_symbol).cmp(&(&right.from_symbol, &right.to_symbol))
+    });
     candidates
 }
 
@@ -473,12 +539,12 @@ fn match_counts(
     counts
 }
 
-fn build_lineage_candidate(
+fn build_lineage_candidate_proposal(
     old: &LineageSymbolObservation,
     new: &LineageSymbolObservation,
     path_renames: &[PathRenameEvidence],
     ambiguous: bool,
-) -> LineageCandidate {
+) -> LineageCandidateProposal {
     let mut evidence = vec![
         LineageEvidence::KindEqual,
         LineageEvidence::NormalizedDefinitionEqual,
@@ -512,11 +578,6 @@ fn build_lineage_candidate(
             similarity_basis_points: rename.similarity_basis_points,
         });
     }
-    let state = if ambiguous {
-        LineageState::Ambiguous
-    } else {
-        LineageState::Proposed
-    };
     let confidence = if ambiguous {
         LineageConfidence::Low
     } else if git_rename
@@ -530,27 +591,49 @@ fn build_lineage_candidate(
     } else {
         LineageConfidence::Medium
     };
-    let id = format!(
-        "lineage_v1_{}",
+    let input_fingerprint = format!(
+        "sha256_{}",
         stable_digest(&[
             old.project_key.as_bytes(),
+            old.provider_profile_id.as_bytes(),
+            old.provider_contract_id.as_bytes(),
+            old.language.as_str().as_bytes(),
             old.snapshot_revision.as_bytes(),
             old.symbol_id.as_bytes(),
             new.snapshot_revision.as_bytes(),
             new.symbol_id.as_bytes(),
-            LINEAGE_ALGORITHM_VERSION.as_bytes(),
         ])
     );
-    LineageCandidate {
-        id,
+    let evidence_json = serde_json::to_vec(&evidence).expect("lineage evidence is serializable");
+    let evidence_fingerprint = format!("sha256_{}", stable_digest(&[&evidence_json]));
+    let ambiguity_group_id = ambiguous.then(|| {
+        format!(
+            "ambiguity_v1_{}",
+            stable_digest(&[
+                old.project_key.as_bytes(),
+                old.provider_profile_id.as_bytes(),
+                old.provider_contract_id.as_bytes(),
+                old.language.as_str().as_bytes(),
+                old.snapshot_revision.as_bytes(),
+                new.snapshot_revision.as_bytes(),
+            ])
+        )
+    });
+    LineageCandidateProposal {
         project_key: old.project_key.clone(),
+        provider_profile_id: old.provider_profile_id.clone(),
+        provider_contract_id: old.provider_contract_id.clone(),
+        language: old.language.clone(),
         from_snapshot: old.snapshot_revision.clone(),
         from_symbol: old.symbol_id.clone(),
         to_snapshot: new.snapshot_revision.clone(),
         to_symbol: new.symbol_id.clone(),
+        ambiguity_group_id,
+        algorithm_id: LINEAGE_ALGORITHM_ID.to_owned(),
         algorithm_version: LINEAGE_ALGORITHM_VERSION.to_owned(),
         confidence,
-        state,
+        input_fingerprint,
+        evidence_fingerprint,
         evidence,
     }
 }
@@ -576,10 +659,9 @@ fn update_digest(hasher: &mut Sha256, part: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        IdentityQuality, LineageConfidence, LineageEvidence, LineageState,
-        LineageSymbolObservation, PathRenameEvidence, ProviderDescriptor, SourceFileState,
-        SourceLanguage, SymbolNode, SymbolNodeInput, SymbolStatus, encode_provider_key,
-        propose_lineage_candidates,
+        IdentityQuality, LineageConfidence, LineageEvidence, LineageSymbolObservation,
+        PathRenameEvidence, ProviderDescriptor, SourceFileState, SourceLanguage, SymbolNode,
+        SymbolNodeInput, SymbolStatus, encode_provider_key, propose_lineage_candidates,
     };
 
     const PROJECT_KEY: &str = "project_alpha";
@@ -819,7 +901,8 @@ mod tests {
     ) -> LineageSymbolObservation {
         LineageSymbolObservation {
             project_key: PROJECT_KEY.to_owned(),
-            provider_id: "scip-rust-main-rust-analyzer-contract-1".to_owned(),
+            provider_profile_id: "rust-main".to_owned(),
+            provider_contract_id: "scip-rust-main-rust-analyzer-contract-1".to_owned(),
             language: SourceLanguage::rust(),
             snapshot_revision: snapshot.to_owned(),
             symbol_id: symbol_id.to_owned(),
@@ -840,7 +923,7 @@ mod tests {
             &[],
         );
         assert_eq!(renamed.len(), 1);
-        assert_eq!(renamed[0].state, LineageState::Proposed);
+        assert_eq!(renamed[0].ambiguity_group_id, None);
         assert_eq!(renamed[0].confidence, LineageConfidence::High);
         assert_ne!(renamed[0].from_symbol, renamed[0].to_symbol);
 
@@ -853,12 +936,12 @@ mod tests {
                 similarity_basis_points: 10_000,
             }],
         );
-        assert_eq!(moved[0].state, LineageState::Proposed);
+        assert_eq!(moved[0].ambiguity_group_id, None);
         assert_eq!(moved[0].confidence, LineageConfidence::High);
     }
 
     #[test]
-    fn ambiguous_matches_are_never_confirmed() {
+    fn ambiguous_matches_share_a_group_but_remain_proposals() {
         let old = lineage_observation("old", "old-id", "run", "src/lib.rs");
         let first = lineage_observation("new", "new-a", "run_a", "src/a.rs");
         let second = lineage_observation("new", "new-b", "run_b", "src/b.rs");
@@ -866,9 +949,15 @@ mod tests {
 
         assert_eq!(candidates.len(), 2);
         assert!(candidates.iter().all(|candidate| {
-            candidate.state == LineageState::Ambiguous
-                && candidate.confidence == LineageConfidence::Low
+            candidate.ambiguity_group_id.is_some() && candidate.confidence == LineageConfidence::Low
         }));
+    }
+
+    #[test]
+    fn unchanged_symbol_ids_do_not_create_lineage_candidates() {
+        let old = lineage_observation("old", "stable-id", "run", "src/lib.rs");
+        let current = lineage_observation("new", "stable-id", "run", "src/lib.rs");
+        assert!(propose_lineage_candidates(&[old], &[current], &[]).is_empty());
     }
 
     #[test]
@@ -884,7 +973,7 @@ mod tests {
     fn lineage_never_matches_across_providers_or_languages() {
         let old = lineage_observation("old", "old-id", "run", "src/lib.rs");
         let mut other_provider = lineage_observation("new", "new-id", "run", "src/lib.rs");
-        other_provider.provider_id = "scip-secondary".to_owned();
+        other_provider.provider_contract_id = "scip-secondary".to_owned();
         assert!(
             propose_lineage_candidates(std::slice::from_ref(&old), &[other_provider], &[])
                 .is_empty()

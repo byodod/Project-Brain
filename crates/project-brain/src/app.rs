@@ -212,6 +212,72 @@ impl App {
         Ok(())
     }
 
+    pub fn lineage_candidates(
+        &self,
+        state: Option<brain_symbols::LineageState>,
+        snapshot: Option<&str>,
+        ambiguity_group: Option<&str>,
+        limit: u32,
+    ) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "project_key": self.config.project_key,
+                "candidates": self.store.list_lineage_candidates(
+                    &self.config.project_key,
+                    state,
+                    snapshot,
+                    ambiguity_group,
+                    limit,
+                )?,
+            }))?
+        );
+        Ok(())
+    }
+
+    pub fn confirm_lineage(
+        &self,
+        candidate_id: &str,
+        request_id: &str,
+        actor_ref: Option<&str>,
+        reason: Option<&str>,
+        supersede_candidate_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&self.store.confirm_lineage(
+                &self.config.project_key,
+                candidate_id,
+                request_id,
+                actor_ref,
+                reason,
+                supersede_candidate_id,
+            )?)?
+        );
+        Ok(())
+    }
+
+    pub fn reject_lineage(
+        &self,
+        candidate_id: &str,
+        request_id: &str,
+        actor_ref: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&self.store.reject_lineage(
+                &self.config.project_key,
+                candidate_id,
+                request_id,
+                actor_ref,
+                reason,
+            )?)?
+        );
+        Ok(())
+    }
+
     pub fn audit(&self, limit: u32) -> Result<(), AppError> {
         println!(
             "{}",

@@ -7,14 +7,17 @@ use brain_core::{
     ActionDescriptor, Decision, HOOK_PROTOCOL_VERSION, InternalHookEvent, InternalHookOutcome,
 };
 use brain_symbols::{
-    GraphDelta, IdentityQuality, SYMBOL_PROTOCOL_VERSION, SourceLanguage, SymbolNode,
-    SymbolSnapshot, SymbolStatus, symbol_id,
+    GraphDelta, IdentityQuality, LINEAGE_EVIDENCE_SCHEMA_VERSION, LineageCandidateProposal,
+    LineageState, LineageSymbolObservation, PathRenameEvidence, SYMBOL_PROTOCOL_VERSION,
+    SourceLanguage, SymbolNode, SymbolSnapshot, SymbolStatus, propose_lineage_candidates,
+    symbol_id,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const DATABASE_SCHEMA_VERSION: i64 = 4;
+const DATABASE_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -41,6 +44,15 @@ pub enum StoreError {
 
     #[error("数据库中存在无法识别的符号字段：{field}={value:?}")]
     InvalidSymbolField { field: &'static str, value: String },
+
+    #[error("lineage 输入或状态无效：{0}")]
+    InvalidLineage(String),
+
+    #[error("lineage 裁决发生冲突：{0}")]
+    LineageConflict(String),
+
+    #[error("lineage request_id 已用于不同请求：{0}")]
+    LineageIdempotencyConflict(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,6 +86,87 @@ pub struct AdapterAuditRecord {
 pub enum AdapterRecordResult {
     Inserted(i64),
     Duplicate(InternalHookOutcome),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SemanticApplyResult {
+    pub graph: GraphDelta,
+    pub snapshot_inserted: bool,
+    pub candidates_inserted: u64,
+    pub evidence_inserted: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LineageCandidateRecord {
+    pub candidate_id: String,
+    pub project_key: String,
+    pub provider_profile_id: String,
+    pub provider_contract_id: String,
+    pub language: SourceLanguage,
+    pub from_snapshot_fingerprint: String,
+    pub from_symbol_id: String,
+    pub to_snapshot_fingerprint: String,
+    pub to_symbol_id: String,
+    pub state: LineageState,
+    pub ambiguity_group_id: Option<String>,
+    pub revision: u64,
+    pub evidence_count: u64,
+    pub created_at_unix_seconds: i64,
+    pub updated_at_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageDecisionAction {
+    Confirm,
+    Reject,
+    Supersede,
+    Invalidate,
+}
+
+impl LineageDecisionAction {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirm => "confirm",
+            Self::Reject => "reject",
+            Self::Supersede => "supersede",
+            Self::Invalidate => "invalidate",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "confirm" => Some(Self::Confirm),
+            "reject" => Some(Self::Reject),
+            "supersede" => Some(Self::Supersede),
+            "invalidate" => Some(Self::Invalidate),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LineageDecisionRecord {
+    pub decision_id: String,
+    pub project_key: String,
+    pub request_id: String,
+    pub candidate_id: String,
+    pub action: LineageDecisionAction,
+    pub from_state: LineageState,
+    pub to_state: LineageState,
+    pub related_candidate_id: Option<String>,
+    pub actor_kind: String,
+    pub actor_ref: Option<String>,
+    pub reason: Option<String>,
+    pub created_at_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LineageAdjudicationResult {
+    pub decision: LineageDecisionRecord,
+    pub candidate: LineageCandidateRecord,
+    pub superseded_candidate: Option<LineageCandidateRecord>,
+    pub replayed: bool,
 }
 
 pub struct BrainStore {
@@ -189,6 +282,7 @@ impl BrainStore {
              CREATE INDEX IF NOT EXISTS idx_symbol_edges_target
                  ON symbol_edges(project_key, target_id, status, kind);",
         )?;
+        self.initialize_lineage_schema()?;
         self.initialize_adapter_audit_schema()?;
         self.connection.execute(
             "INSERT INTO metadata(key, value) VALUES('schema_version', ?1)
@@ -247,6 +341,113 @@ impl BrainStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn initialize_lineage_schema(&self) -> Result<(), StoreError> {
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS semantic_snapshots (
+                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                 project_key TEXT NOT NULL,
+                 provider_profile_id TEXT NOT NULL,
+                 provider_contract_id TEXT NOT NULL,
+                 snapshot_fingerprint TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 UNIQUE(project_key, provider_profile_id, provider_contract_id, snapshot_fingerprint)
+             );
+             CREATE INDEX IF NOT EXISTS idx_semantic_snapshot_latest
+                 ON semantic_snapshots(project_key, provider_profile_id, provider_contract_id, sequence DESC);
+             CREATE TABLE IF NOT EXISTS semantic_symbol_observations (
+                 project_key TEXT NOT NULL,
+                 provider_profile_id TEXT NOT NULL,
+                 provider_contract_id TEXT NOT NULL,
+                 language_id TEXT NOT NULL,
+                 snapshot_fingerprint TEXT NOT NULL,
+                 symbol_id TEXT NOT NULL,
+                 provider_symbol TEXT,
+                 is_local INTEGER NOT NULL CHECK(is_local IN (0, 1)),
+                 kind TEXT NOT NULL,
+                 display_name TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 normalized_definition_fingerprint TEXT NOT NULL,
+                 PRIMARY KEY(project_key, provider_profile_id, provider_contract_id,
+                             snapshot_fingerprint, symbol_id),
+                 FOREIGN KEY(project_key, symbol_id)
+                     REFERENCES symbol_nodes(project_key, id) ON DELETE RESTRICT
+             );
+             CREATE TABLE IF NOT EXISTS semantic_lineage_candidates (
+                 candidate_id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+                 project_key TEXT NOT NULL,
+                 provider_profile_id TEXT NOT NULL,
+                 provider_contract_id TEXT NOT NULL,
+                 language_id TEXT NOT NULL,
+                 from_snapshot_fingerprint TEXT NOT NULL,
+                 from_symbol_id TEXT NOT NULL,
+                 to_snapshot_fingerprint TEXT NOT NULL,
+                 to_symbol_id TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN
+                     ('proposed', 'confirmed', 'rejected', 'superseded', 'invalidated')),
+                 ambiguity_group_id TEXT,
+                 revision INTEGER NOT NULL DEFAULT 0,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 updated_at_unix_seconds INTEGER NOT NULL,
+                 UNIQUE(project_key, provider_profile_id, provider_contract_id, language_id,
+                        from_snapshot_fingerprint, from_symbol_id,
+                        to_snapshot_fingerprint, to_symbol_id),
+                 FOREIGN KEY(project_key, from_symbol_id)
+                     REFERENCES symbol_nodes(project_key, id) ON DELETE RESTRICT,
+                 FOREIGN KEY(project_key, to_symbol_id)
+                     REFERENCES symbol_nodes(project_key, id) ON DELETE RESTRICT
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS ux_lineage_confirmed_from
+                 ON semantic_lineage_candidates(
+                     project_key, provider_profile_id, provider_contract_id, language_id,
+                     from_snapshot_fingerprint, from_symbol_id, to_snapshot_fingerprint)
+                 WHERE state = 'confirmed';
+             CREATE UNIQUE INDEX IF NOT EXISTS ux_lineage_confirmed_to
+                 ON semantic_lineage_candidates(
+                     project_key, provider_profile_id, provider_contract_id, language_id,
+                     from_snapshot_fingerprint, to_snapshot_fingerprint, to_symbol_id)
+                 WHERE state = 'confirmed';
+             CREATE INDEX IF NOT EXISTS idx_lineage_candidate_query
+                 ON semantic_lineage_candidates(project_key, state, updated_at_unix_seconds DESC);
+             CREATE TABLE IF NOT EXISTS semantic_lineage_evidence (
+                 evidence_id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+                 candidate_id TEXT NOT NULL,
+                 algorithm_id TEXT NOT NULL,
+                 algorithm_version TEXT NOT NULL,
+                 evidence_schema_version INTEGER NOT NULL,
+                 input_fingerprint TEXT NOT NULL,
+                 confidence_band TEXT NOT NULL CHECK(confidence_band IN ('low', 'medium', 'high')),
+                 evidence_json TEXT NOT NULL,
+                 evidence_hash TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 FOREIGN KEY(candidate_id)
+                     REFERENCES semantic_lineage_candidates(candidate_id) ON DELETE RESTRICT,
+                 UNIQUE(candidate_id, algorithm_id, algorithm_version,
+                        input_fingerprint, evidence_hash)
+             );
+             CREATE TABLE IF NOT EXISTS semantic_lineage_decisions (
+                 decision_id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+                 project_key TEXT NOT NULL,
+                 request_id TEXT NOT NULL,
+                 request_hash TEXT NOT NULL,
+                 candidate_id TEXT NOT NULL,
+                 action TEXT NOT NULL CHECK(action IN
+                     ('confirm', 'reject', 'supersede', 'invalidate')),
+                 from_state TEXT NOT NULL,
+                 to_state TEXT NOT NULL,
+                 related_candidate_id TEXT,
+                 actor_kind TEXT NOT NULL,
+                 actor_ref TEXT,
+                 reason TEXT,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 FOREIGN KEY(candidate_id)
+                     REFERENCES semantic_lineage_candidates(candidate_id) ON DELETE RESTRICT,
+                 UNIQUE(project_key, request_id)
+             );",
+        )?;
+        Ok(())
+    }
+
     /// 原子应用一个 Provider 的完整符号快照，并把快照中消失的旧节点标记为 removed。
     ///
     /// # Errors
@@ -261,6 +462,348 @@ impl BrainStore {
         let delta = apply_snapshot_transaction(&transaction, snapshot)?;
         transaction.commit()?;
         Ok(delta)
+    }
+
+    /// 原子应用语义快照、保存不可变 symbol observations，并为相邻快照持久化 lineage 候选证据。
+    /// 候选生成永远不会改变已有人工裁决状态。
+    ///
+    /// # Errors
+    ///
+    /// 快照、观察或 provider 边界不一致，或 `SQLite` 事务失败时返回错误。
+    pub fn apply_semantic_snapshot(
+        &self,
+        snapshot: &SymbolSnapshot,
+        provider_profile_id: &str,
+        observations: &[LineageSymbolObservation],
+        path_renames: &[PathRenameEvidence],
+    ) -> Result<SemanticApplyResult, StoreError> {
+        validate_snapshot(snapshot)?;
+        validate_semantic_observations(snapshot, provider_profile_id, observations)?;
+        let now = unix_seconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM semantic_snapshots
+                 WHERE project_key = ?1 AND provider_profile_id = ?2
+                   AND provider_contract_id = ?3 AND snapshot_fingerprint = ?4
+             )",
+            params![
+                snapshot.project_key,
+                provider_profile_id,
+                snapshot.provider.id,
+                snapshot.source_revision
+            ],
+            |row| row.get(0),
+        )?;
+        let latest_snapshot = transaction
+            .query_row(
+                "SELECT snapshot_fingerprint FROM semantic_snapshots
+                 WHERE project_key = ?1 AND provider_profile_id = ?2
+                   AND provider_contract_id = ?3
+                 ORDER BY sequence DESC LIMIT 1",
+                params![
+                    snapshot.project_key,
+                    provider_profile_id,
+                    snapshot.provider.id
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if existing && latest_snapshot.as_deref() != Some(snapshot.source_revision.as_str()) {
+            return Err(StoreError::InvalidLineage(format!(
+                "不能把历史 snapshot={} 重新应用为当前图",
+                snapshot.source_revision
+            )));
+        }
+        let previous = if existing {
+            Vec::new()
+        } else {
+            latest_semantic_observations(
+                &transaction,
+                &snapshot.project_key,
+                provider_profile_id,
+                &snapshot.provider.id,
+            )?
+        };
+        let proposals = if existing {
+            Vec::new()
+        } else {
+            propose_lineage_candidates(&previous, observations, path_renames)
+        };
+        let graph = apply_snapshot_transaction(&transaction, snapshot)?;
+        let mut candidates_inserted = 0_u64;
+        let mut evidence_inserted = 0_u64;
+        if !existing {
+            transaction.execute(
+                "INSERT INTO semantic_snapshots(
+                     project_key, provider_profile_id, provider_contract_id,
+                     snapshot_fingerprint, created_at_unix_seconds
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    snapshot.project_key,
+                    provider_profile_id,
+                    snapshot.provider.id,
+                    snapshot.source_revision,
+                    now,
+                ],
+            )?;
+            persist_semantic_observations(&transaction, observations)?;
+            (candidates_inserted, evidence_inserted) =
+                persist_lineage_proposals(&transaction, &proposals, now)?;
+        }
+        transaction.commit()?;
+        Ok(SemanticApplyResult {
+            graph,
+            snapshot_inserted: !existing,
+            candidates_inserted,
+            evidence_inserted,
+        })
+    }
+
+    /// 查询当前项目的 lineage ledger，不读取或改写符号身份。
+    ///
+    /// # Errors
+    ///
+    /// `SQLite` 查询失败或持久化字段无效时返回错误。
+    pub fn list_lineage_candidates(
+        &self,
+        project_key: &str,
+        state: Option<LineageState>,
+        snapshot_fingerprint: Option<&str>,
+        ambiguity_group_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<LineageCandidateRecord>, StoreError> {
+        let state = state.map(LineageState::as_str).unwrap_or_default();
+        let snapshot = snapshot_fingerprint.unwrap_or_default();
+        let ambiguity = ambiguity_group_id.unwrap_or_default();
+        let mut statement = self.connection.prepare(
+            "SELECT c.candidate_id, c.project_key, c.provider_profile_id,
+                    c.provider_contract_id, c.language_id,
+                    c.from_snapshot_fingerprint, c.from_symbol_id,
+                    c.to_snapshot_fingerprint, c.to_symbol_id, c.state,
+                    c.ambiguity_group_id, c.revision,
+                    (SELECT COUNT(*) FROM semantic_lineage_evidence e
+                     WHERE e.candidate_id = c.candidate_id),
+                    c.created_at_unix_seconds, c.updated_at_unix_seconds
+             FROM semantic_lineage_candidates c
+             WHERE c.project_key = ?1
+               AND (?2 = '' OR c.state = ?2)
+               AND (?3 = '' OR c.from_snapshot_fingerprint = ?3
+                            OR c.to_snapshot_fingerprint = ?3)
+               AND (?4 = '' OR c.ambiguity_group_id = ?4)
+             ORDER BY c.updated_at_unix_seconds DESC, c.candidate_id
+             LIMIT ?5",
+        )?;
+        statement
+            .query_map(
+                params![project_key, state, snapshot, ambiguity, limit],
+                decode_lineage_candidate_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// 通过显式用户裁决确认候选；可在同一事务中 supersede 一条旧确认。
+    ///
+    /// # Errors
+    ///
+    /// 候选不存在、状态/边界冲突、request ID 冲突或 CAS 失败时返回错误。
+    pub fn confirm_lineage(
+        &self,
+        project_key: &str,
+        candidate_id: &str,
+        request_id: &str,
+        actor_ref: Option<&str>,
+        reason: Option<&str>,
+        supersede_candidate_id: Option<&str>,
+    ) -> Result<LineageAdjudicationResult, StoreError> {
+        if let Some(old_candidate_id) = supersede_candidate_id {
+            return self.confirm_and_supersede_lineage(
+                project_key,
+                candidate_id,
+                old_candidate_id,
+                request_id,
+                actor_ref,
+                reason,
+            );
+        }
+        self.adjudicate_single_lineage(
+            project_key,
+            candidate_id,
+            request_id,
+            LineageDecisionAction::Confirm,
+            actor_ref,
+            reason,
+        )
+    }
+
+    /// 通过显式用户裁决拒绝一条尚未裁决的候选。
+    ///
+    /// # Errors
+    ///
+    /// 候选不存在、状态冲突、request ID 冲突或 CAS 失败时返回错误。
+    pub fn reject_lineage(
+        &self,
+        project_key: &str,
+        candidate_id: &str,
+        request_id: &str,
+        actor_ref: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<LineageAdjudicationResult, StoreError> {
+        self.adjudicate_single_lineage(
+            project_key,
+            candidate_id,
+            request_id,
+            LineageDecisionAction::Reject,
+            actor_ref,
+            reason,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adjudicate_single_lineage(
+        &self,
+        project_key: &str,
+        candidate_id: &str,
+        request_id: &str,
+        action: LineageDecisionAction,
+        actor_ref: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<LineageAdjudicationResult, StoreError> {
+        validate_lineage_command(project_key, candidate_id, request_id, actor_ref, reason)?;
+        let request_hash = lineage_request_hash(
+            project_key,
+            candidate_id,
+            request_id,
+            action,
+            None,
+            actor_ref,
+            reason,
+        );
+        let now = unix_seconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        if let Some(replayed) =
+            replay_lineage_decision(&transaction, project_key, request_id, &request_hash)?
+        {
+            transaction.commit()?;
+            return Ok(replayed);
+        }
+        let before = lineage_candidate_by_id(&transaction, project_key, candidate_id)?;
+        let to_state = match (action, before.state) {
+            (LineageDecisionAction::Confirm, LineageState::Proposed | LineageState::Rejected) => {
+                LineageState::Confirmed
+            }
+            (LineageDecisionAction::Reject, LineageState::Proposed) => LineageState::Rejected,
+            _ => {
+                return Err(StoreError::LineageConflict(format!(
+                    "不允许 action={} 从 state={} 转移 candidate={candidate_id}",
+                    action.as_str(),
+                    before.state.as_str()
+                )));
+            }
+        };
+        let decision = insert_lineage_decision(
+            &transaction,
+            project_key,
+            request_id,
+            &request_hash,
+            candidate_id,
+            action,
+            before.state,
+            to_state,
+            None,
+            actor_ref,
+            reason,
+            now,
+        )?;
+        cas_lineage_state(&transaction, &before, to_state, now)?;
+        let candidate = lineage_candidate_by_id(&transaction, project_key, candidate_id)?;
+        transaction.commit()?;
+        Ok(LineageAdjudicationResult {
+            decision,
+            candidate,
+            superseded_candidate: None,
+            replayed: false,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn confirm_and_supersede_lineage(
+        &self,
+        project_key: &str,
+        new_candidate_id: &str,
+        old_candidate_id: &str,
+        request_id: &str,
+        actor_ref: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<LineageAdjudicationResult, StoreError> {
+        validate_lineage_command(project_key, new_candidate_id, request_id, actor_ref, reason)?;
+        if new_candidate_id == old_candidate_id {
+            return Err(StoreError::LineageConflict(
+                "不能用候选 supersede 自身".to_owned(),
+            ));
+        }
+        let action = LineageDecisionAction::Supersede;
+        let request_hash = lineage_request_hash(
+            project_key,
+            new_candidate_id,
+            request_id,
+            action,
+            Some(old_candidate_id),
+            actor_ref,
+            reason,
+        );
+        let now = unix_seconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        if let Some(replayed) =
+            replay_lineage_decision(&transaction, project_key, request_id, &request_hash)?
+        {
+            transaction.commit()?;
+            return Ok(replayed);
+        }
+        let new_before = lineage_candidate_by_id(&transaction, project_key, new_candidate_id)?;
+        let old_before = lineage_candidate_by_id(&transaction, project_key, old_candidate_id)?;
+        if old_before.state != LineageState::Confirmed
+            || !matches!(
+                new_before.state,
+                LineageState::Proposed | LineageState::Rejected
+            )
+            || !same_lineage_boundary(&old_before, &new_before)
+        {
+            return Err(StoreError::LineageConflict(
+                "supersede 要求旧候选已 confirmed、新候选为 proposed/rejected，且 snapshot/provider/language 边界一致"
+                    .to_owned(),
+            ));
+        }
+        let decision = insert_lineage_decision(
+            &transaction,
+            project_key,
+            request_id,
+            &request_hash,
+            old_candidate_id,
+            action,
+            LineageState::Confirmed,
+            LineageState::Superseded,
+            Some(new_candidate_id),
+            actor_ref,
+            reason,
+            now,
+        )?;
+        cas_lineage_state(&transaction, &old_before, LineageState::Superseded, now)?;
+        cas_lineage_state(&transaction, &new_before, LineageState::Confirmed, now)?;
+        let candidate = lineage_candidate_by_id(&transaction, project_key, new_candidate_id)?;
+        let superseded_candidate = Some(lineage_candidate_by_id(
+            &transaction,
+            project_key,
+            old_candidate_id,
+        )?);
+        transaction.commit()?;
+        Ok(LineageAdjudicationResult {
+            decision,
+            candidate,
+            superseded_candidate,
+            replayed: false,
+        })
     }
 
     /// 查询当前或历史符号。路径过滤使用项目相对路径边界，而不是任意字符串前缀。
@@ -567,6 +1110,522 @@ impl BrainStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
+}
+
+fn unix_seconds() -> Result<i64, StoreError> {
+    let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    Ok(i64::try_from(seconds).unwrap_or(i64::MAX))
+}
+
+fn validate_semantic_observations(
+    snapshot: &SymbolSnapshot,
+    provider_profile_id: &str,
+    observations: &[LineageSymbolObservation],
+) -> Result<(), StoreError> {
+    if provider_profile_id.trim().is_empty() || provider_profile_id.len() > 64 {
+        return Err(StoreError::InvalidLineage(
+            "provider_profile_id 为空或过长".to_owned(),
+        ));
+    }
+    let symbols = snapshot
+        .symbols
+        .iter()
+        .map(|symbol| (symbol.id.as_str(), symbol))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if observations.len() != symbols.len() {
+        return Err(StoreError::InvalidLineage(format!(
+            "observation 数量 {} 与 snapshot symbols {} 不一致",
+            observations.len(),
+            symbols.len()
+        )));
+    }
+    let mut observed = std::collections::BTreeSet::new();
+    for observation in observations {
+        let Some(symbol) = symbols.get(observation.symbol_id.as_str()) else {
+            return Err(StoreError::InvalidLineage(format!(
+                "observation 引用 snapshot 外 symbol={}",
+                observation.symbol_id
+            )));
+        };
+        if !observed.insert(observation.symbol_id.as_str())
+            || observation.project_key != snapshot.project_key
+            || observation.provider_profile_id != provider_profile_id
+            || observation.provider_contract_id != snapshot.provider.id
+            || observation.snapshot_revision != snapshot.source_revision
+            || observation.language != symbol.language
+            || observation.kind != symbol.kind
+            || observation.display_name != symbol.display_name
+            || observation.path != symbol.path
+            || !is_sha256_fingerprint(&observation.normalized_definition_fingerprint)
+        {
+            return Err(StoreError::InvalidLineage(format!(
+                "observation 与 snapshot 边界或内容不一致：symbol={}",
+                observation.symbol_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn latest_semantic_observations(
+    transaction: &Transaction<'_>,
+    project_key: &str,
+    provider_profile_id: &str,
+    provider_contract_id: &str,
+) -> Result<Vec<LineageSymbolObservation>, StoreError> {
+    let latest = transaction
+        .query_row(
+            "SELECT snapshot_fingerprint FROM semantic_snapshots
+             WHERE project_key = ?1 AND provider_profile_id = ?2 AND provider_contract_id = ?3
+             ORDER BY sequence DESC LIMIT 1",
+            params![project_key, provider_profile_id, provider_contract_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(snapshot) = latest else {
+        return Ok(Vec::new());
+    };
+    let mut statement = transaction.prepare(
+        "SELECT project_key, provider_profile_id, provider_contract_id, language_id,
+                snapshot_fingerprint, symbol_id, provider_symbol, is_local, kind,
+                display_name, path, normalized_definition_fingerprint
+         FROM semantic_symbol_observations
+         WHERE project_key = ?1 AND provider_profile_id = ?2
+           AND provider_contract_id = ?3 AND snapshot_fingerprint = ?4
+         ORDER BY symbol_id",
+    )?;
+    statement
+        .query_map(
+            params![
+                project_key,
+                provider_profile_id,
+                provider_contract_id,
+                snapshot
+            ],
+            decode_lineage_observation_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::from)
+}
+
+fn persist_semantic_observations(
+    transaction: &Transaction<'_>,
+    observations: &[LineageSymbolObservation],
+) -> Result<(), StoreError> {
+    for observation in observations {
+        transaction.execute(
+            "INSERT INTO semantic_symbol_observations(
+                 project_key, provider_profile_id, provider_contract_id, language_id,
+                 snapshot_fingerprint, symbol_id, provider_symbol, is_local, kind,
+                 display_name, path, normalized_definition_fingerprint
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                observation.project_key,
+                observation.provider_profile_id,
+                observation.provider_contract_id,
+                observation.language.as_str(),
+                observation.snapshot_revision,
+                observation.symbol_id,
+                observation.provider_symbol,
+                observation.is_local,
+                observation.kind,
+                observation.display_name,
+                observation.path,
+                observation.normalized_definition_fingerprint,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn persist_lineage_proposals(
+    transaction: &Transaction<'_>,
+    proposals: &[LineageCandidateProposal],
+    now: i64,
+) -> Result<(u64, u64), StoreError> {
+    let mut candidates_inserted = 0_u64;
+    let mut evidence_inserted = 0_u64;
+    for proposal in proposals {
+        if proposal.from_snapshot == proposal.to_snapshot {
+            return Err(StoreError::InvalidLineage(
+                "lineage endpoints 必须位于不同 snapshot".to_owned(),
+            ));
+        }
+        candidates_inserted += u64::try_from(transaction.execute(
+            "INSERT INTO semantic_lineage_candidates(
+                 project_key, provider_profile_id, provider_contract_id, language_id,
+                 from_snapshot_fingerprint, from_symbol_id,
+                 to_snapshot_fingerprint, to_symbol_id, state,
+                 ambiguity_group_id, created_at_unix_seconds, updated_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'proposed', ?9, ?10, ?10)
+             ON CONFLICT(project_key, provider_profile_id, provider_contract_id, language_id,
+                         from_snapshot_fingerprint, from_symbol_id,
+                         to_snapshot_fingerprint, to_symbol_id) DO NOTHING",
+            params![
+                proposal.project_key,
+                proposal.provider_profile_id,
+                proposal.provider_contract_id,
+                proposal.language.as_str(),
+                proposal.from_snapshot,
+                proposal.from_symbol,
+                proposal.to_snapshot,
+                proposal.to_symbol,
+                proposal.ambiguity_group_id,
+                now,
+            ],
+        )?)
+        .unwrap_or(u64::MAX);
+        let candidate_id: String = transaction.query_row(
+            "SELECT candidate_id FROM semantic_lineage_candidates
+             WHERE project_key = ?1 AND provider_profile_id = ?2
+               AND provider_contract_id = ?3 AND language_id = ?4
+               AND from_snapshot_fingerprint = ?5 AND from_symbol_id = ?6
+               AND to_snapshot_fingerprint = ?7 AND to_symbol_id = ?8",
+            params![
+                proposal.project_key,
+                proposal.provider_profile_id,
+                proposal.provider_contract_id,
+                proposal.language.as_str(),
+                proposal.from_snapshot,
+                proposal.from_symbol,
+                proposal.to_snapshot,
+                proposal.to_symbol,
+            ],
+            |row| row.get(0),
+        )?;
+        let evidence_json = serde_json::to_string(&proposal.evidence)?;
+        evidence_inserted += u64::try_from(transaction.execute(
+            "INSERT INTO semantic_lineage_evidence(
+                 candidate_id, algorithm_id, algorithm_version, evidence_schema_version,
+                 input_fingerprint, confidence_band, evidence_json, evidence_hash,
+                 created_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(candidate_id, algorithm_id, algorithm_version,
+                         input_fingerprint, evidence_hash) DO NOTHING",
+            params![
+                candidate_id,
+                proposal.algorithm_id,
+                proposal.algorithm_version,
+                LINEAGE_EVIDENCE_SCHEMA_VERSION,
+                proposal.input_fingerprint,
+                proposal.confidence.as_str(),
+                evidence_json,
+                proposal.evidence_fingerprint,
+                now,
+            ],
+        )?)
+        .unwrap_or(u64::MAX);
+    }
+    Ok((candidates_inserted, evidence_inserted))
+}
+
+fn decode_lineage_observation_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<LineageSymbolObservation, rusqlite::Error> {
+    let raw_language: String = row.get(3)?;
+    let language = SourceLanguage::parse(&raw_language)
+        .ok_or_else(|| invalid_lineage_sql(3, format!("language_id={raw_language:?}")))?;
+    Ok(LineageSymbolObservation {
+        project_key: row.get(0)?,
+        provider_profile_id: row.get(1)?,
+        provider_contract_id: row.get(2)?,
+        language,
+        snapshot_revision: row.get(4)?,
+        symbol_id: row.get(5)?,
+        provider_symbol: row.get(6)?,
+        is_local: row.get(7)?,
+        kind: row.get(8)?,
+        display_name: row.get(9)?,
+        path: row.get(10)?,
+        normalized_definition_fingerprint: row.get(11)?,
+    })
+}
+
+fn decode_lineage_candidate_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<LineageCandidateRecord, rusqlite::Error> {
+    let raw_language: String = row.get(4)?;
+    let language = SourceLanguage::parse(&raw_language)
+        .ok_or_else(|| invalid_lineage_sql(4, format!("language_id={raw_language:?}")))?;
+    let raw_state: String = row.get(9)?;
+    let state = LineageState::parse(&raw_state)
+        .ok_or_else(|| invalid_lineage_sql(9, format!("state={raw_state:?}")))?;
+    let revision: i64 = row.get(11)?;
+    let evidence_count: i64 = row.get(12)?;
+    Ok(LineageCandidateRecord {
+        candidate_id: row.get(0)?,
+        project_key: row.get(1)?,
+        provider_profile_id: row.get(2)?,
+        provider_contract_id: row.get(3)?,
+        language,
+        from_snapshot_fingerprint: row.get(5)?,
+        from_symbol_id: row.get(6)?,
+        to_snapshot_fingerprint: row.get(7)?,
+        to_symbol_id: row.get(8)?,
+        state,
+        ambiguity_group_id: row.get(10)?,
+        revision: u64::try_from(revision).unwrap_or_default(),
+        evidence_count: u64::try_from(evidence_count).unwrap_or_default(),
+        created_at_unix_seconds: row.get(13)?,
+        updated_at_unix_seconds: row.get(14)?,
+    })
+}
+
+fn invalid_lineage_sql(column: usize, message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        rusqlite::types::Type::Text,
+        Box::new(StoreError::InvalidLineage(message)),
+    )
+}
+
+fn validate_lineage_command(
+    project_key: &str,
+    candidate_id: &str,
+    request_id: &str,
+    actor_ref: Option<&str>,
+    reason: Option<&str>,
+) -> Result<(), StoreError> {
+    if !is_valid_project_key(project_key)
+        || candidate_id.trim().is_empty()
+        || candidate_id.len() > 128
+        || request_id.trim().is_empty()
+        || request_id.len() > 128
+        || actor_ref.is_some_and(|value| value.trim().is_empty() || value.len() > 256)
+        || reason.is_some_and(|value| value.trim().is_empty() || value.len() > 4_096)
+    {
+        return Err(StoreError::InvalidLineage(
+            "project/candidate/request/actor/reason 参数无效".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lineage_request_hash(
+    project_key: &str,
+    candidate_id: &str,
+    request_id: &str,
+    action: LineageDecisionAction,
+    related_candidate_id: Option<&str>,
+    actor_ref: Option<&str>,
+    reason: Option<&str>,
+) -> String {
+    let mut digest = Sha256::new();
+    for part in [
+        project_key,
+        candidate_id,
+        request_id,
+        action.as_str(),
+        related_candidate_id.unwrap_or_default(),
+        actor_ref.unwrap_or_default(),
+        reason.unwrap_or_default(),
+    ] {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("sha256_{:x}", digest.finalize())
+}
+
+fn lineage_candidate_by_id(
+    connection: &Connection,
+    project_key: &str,
+    candidate_id: &str,
+) -> Result<LineageCandidateRecord, StoreError> {
+    connection
+        .query_row(
+            "SELECT c.candidate_id, c.project_key, c.provider_profile_id,
+                    c.provider_contract_id, c.language_id,
+                    c.from_snapshot_fingerprint, c.from_symbol_id,
+                    c.to_snapshot_fingerprint, c.to_symbol_id, c.state,
+                    c.ambiguity_group_id, c.revision,
+                    (SELECT COUNT(*) FROM semantic_lineage_evidence e
+                     WHERE e.candidate_id = c.candidate_id),
+                    c.created_at_unix_seconds, c.updated_at_unix_seconds
+             FROM semantic_lineage_candidates c
+             WHERE c.project_key = ?1 AND c.candidate_id = ?2",
+            params![project_key, candidate_id],
+            decode_lineage_candidate_row,
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::LineageConflict(format!(
+                "项目 {project_key:?} 中不存在 candidate={candidate_id:?}"
+            ))
+        })
+}
+
+fn same_lineage_boundary(left: &LineageCandidateRecord, right: &LineageCandidateRecord) -> bool {
+    left.project_key == right.project_key
+        && left.provider_profile_id == right.provider_profile_id
+        && left.provider_contract_id == right.provider_contract_id
+        && left.language == right.language
+        && left.from_snapshot_fingerprint == right.from_snapshot_fingerprint
+        && left.to_snapshot_fingerprint == right.to_snapshot_fingerprint
+}
+
+fn cas_lineage_state(
+    transaction: &Transaction<'_>,
+    before: &LineageCandidateRecord,
+    to_state: LineageState,
+    now: i64,
+) -> Result<(), StoreError> {
+    let changed = transaction
+        .execute(
+            "UPDATE semantic_lineage_candidates
+             SET state = ?1, revision = revision + 1, updated_at_unix_seconds = ?2
+             WHERE project_key = ?3 AND candidate_id = ?4
+               AND state = ?5 AND revision = ?6",
+            params![
+                to_state.as_str(),
+                now,
+                before.project_key,
+                before.candidate_id,
+                before.state.as_str(),
+                i64::try_from(before.revision).unwrap_or(i64::MAX),
+            ],
+        )
+        .map_err(|error| StoreError::LineageConflict(error.to_string()))?;
+    if changed != 1 {
+        return Err(StoreError::LineageConflict(format!(
+            "candidate={} 已被并发修改",
+            before.candidate_id
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_lineage_decision(
+    transaction: &Transaction<'_>,
+    project_key: &str,
+    request_id: &str,
+    request_hash: &str,
+    candidate_id: &str,
+    action: LineageDecisionAction,
+    from_state: LineageState,
+    to_state: LineageState,
+    related_candidate_id: Option<&str>,
+    actor_ref: Option<&str>,
+    reason: Option<&str>,
+    now: i64,
+) -> Result<LineageDecisionRecord, StoreError> {
+    transaction.execute(
+        "INSERT INTO semantic_lineage_decisions(
+             project_key, request_id, request_hash, candidate_id, action,
+             from_state, to_state, related_candidate_id, actor_kind,
+             actor_ref, reason, created_at_unix_seconds
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                   'explicit_user', ?9, ?10, ?11)",
+        params![
+            project_key,
+            request_id,
+            request_hash,
+            candidate_id,
+            action.as_str(),
+            from_state.as_str(),
+            to_state.as_str(),
+            related_candidate_id,
+            actor_ref,
+            reason,
+            now,
+        ],
+    )?;
+    decision_by_request(transaction, project_key, request_id)?
+        .ok_or_else(|| StoreError::Integrity("lineage decision 插入后无法读取".to_owned()))
+}
+
+fn replay_lineage_decision(
+    transaction: &Transaction<'_>,
+    project_key: &str,
+    request_id: &str,
+    request_hash: &str,
+) -> Result<Option<LineageAdjudicationResult>, StoreError> {
+    let stored_hash = transaction
+        .query_row(
+            "SELECT request_hash FROM semantic_lineage_decisions
+             WHERE project_key = ?1 AND request_id = ?2",
+            params![project_key, request_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(stored_hash) = stored_hash else {
+        return Ok(None);
+    };
+    if stored_hash != request_hash {
+        return Err(StoreError::LineageIdempotencyConflict(
+            request_id.to_owned(),
+        ));
+    }
+    let decision = decision_by_request(transaction, project_key, request_id)?
+        .ok_or_else(|| StoreError::Integrity("lineage decision 缺失".to_owned()))?;
+    let (candidate_id, superseded_id) = if decision.action == LineageDecisionAction::Supersede {
+        (
+            decision.related_candidate_id.as_deref().ok_or_else(|| {
+                StoreError::Integrity("supersede decision 缺少 related".to_owned())
+            })?,
+            Some(decision.candidate_id.as_str()),
+        )
+    } else {
+        (decision.candidate_id.as_str(), None)
+    };
+    let candidate = lineage_candidate_by_id(transaction, project_key, candidate_id)?;
+    let superseded_candidate = superseded_id
+        .map(|id| lineage_candidate_by_id(transaction, project_key, id))
+        .transpose()?;
+    Ok(Some(LineageAdjudicationResult {
+        decision,
+        candidate,
+        superseded_candidate,
+        replayed: true,
+    }))
+}
+
+fn decision_by_request(
+    connection: &Connection,
+    project_key: &str,
+    request_id: &str,
+) -> Result<Option<LineageDecisionRecord>, StoreError> {
+    connection
+        .query_row(
+            "SELECT decision_id, project_key, request_id, candidate_id, action,
+                    from_state, to_state, related_candidate_id, actor_kind,
+                    actor_ref, reason, created_at_unix_seconds
+             FROM semantic_lineage_decisions
+             WHERE project_key = ?1 AND request_id = ?2",
+            params![project_key, request_id],
+            decode_lineage_decision_row,
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn decode_lineage_decision_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<LineageDecisionRecord, rusqlite::Error> {
+    let raw_action: String = row.get(4)?;
+    let action = LineageDecisionAction::parse(&raw_action)
+        .ok_or_else(|| invalid_lineage_sql(4, format!("action={raw_action:?}")))?;
+    let raw_from: String = row.get(5)?;
+    let from_state = LineageState::parse(&raw_from)
+        .ok_or_else(|| invalid_lineage_sql(5, format!("from_state={raw_from:?}")))?;
+    let raw_to: String = row.get(6)?;
+    let to_state = LineageState::parse(&raw_to)
+        .ok_or_else(|| invalid_lineage_sql(6, format!("to_state={raw_to:?}")))?;
+    Ok(LineageDecisionRecord {
+        decision_id: row.get(0)?,
+        project_key: row.get(1)?,
+        request_id: row.get(2)?,
+        candidate_id: row.get(3)?,
+        action,
+        from_state,
+        to_state,
+        related_candidate_id: row.get(7)?,
+        actor_kind: row.get(8)?,
+        actor_ref: row.get(9)?,
+        reason: row.get(10)?,
+        created_at_unix_seconds: row.get(11)?,
+    })
 }
 
 fn escape_like_pattern(value: &str) -> String {
@@ -903,9 +1962,9 @@ mod tests {
     };
 
     use brain_symbols::{
-        GraphDelta, IdentityQuality, ProviderDescriptor, SYMBOL_PROTOCOL_VERSION, SourceFileState,
-        SourceLanguage, SymbolNode, SymbolNodeInput, SymbolSnapshot, SymbolStatus,
-        encode_provider_key,
+        GraphDelta, IdentityQuality, LineageState, LineageSymbolObservation, ProviderDescriptor,
+        SYMBOL_PROTOCOL_VERSION, SourceFileState, SourceLanguage, SymbolNode, SymbolNodeInput,
+        SymbolSnapshot, SymbolStatus, encode_provider_key,
     };
     use rusqlite::Connection;
 
@@ -967,6 +2026,64 @@ mod tests {
             symbols,
             edges: Vec::new(),
         }
+    }
+
+    fn semantic_provider() -> ProviderDescriptor {
+        ProviderDescriptor {
+            id: "scip-test-main-test-contract-1".to_owned(),
+            version: "contract-1".to_owned(),
+            identity_quality: IdentityQuality::Semantic,
+        }
+    }
+
+    fn semantic_symbol(name: &str, path: &str, provider_key: &str) -> SymbolNode {
+        SymbolNode::from_provider_key(
+            PROJECT_KEY,
+            &semantic_provider(),
+            SymbolNodeInput {
+                language: SourceLanguage::rust(),
+                kind: "function",
+                provider_key,
+                display_name: name,
+                path,
+                start_line: 1,
+                end_line: 1,
+                content: format!("fn {name}() {{ same_body(); }}").as_bytes(),
+            },
+        )
+    }
+
+    fn semantic_snapshot(revision: &str, symbols: Vec<SymbolNode>) -> SymbolSnapshot {
+        let mut snapshot = snapshot(revision, symbols);
+        snapshot.provider = semantic_provider();
+        snapshot
+    }
+
+    fn semantic_observations(snapshot: &SymbolSnapshot) -> Vec<LineageSymbolObservation> {
+        snapshot
+            .symbols
+            .iter()
+            .map(|symbol| LineageSymbolObservation {
+                project_key: snapshot.project_key.clone(),
+                provider_profile_id: "test-main".to_owned(),
+                provider_contract_id: snapshot.provider.id.clone(),
+                language: symbol.language.clone(),
+                snapshot_revision: snapshot.source_revision.clone(),
+                symbol_id: symbol.id.clone(),
+                provider_symbol: Some("test package demo 1 stable().".to_owned()),
+                is_local: false,
+                kind: symbol.kind.clone(),
+                display_name: symbol.display_name.clone(),
+                path: symbol.path.clone(),
+                normalized_definition_fingerprint: format!("sha256_{}", "a".repeat(64)),
+            })
+            .collect()
+    }
+
+    fn apply_semantic(store: &BrainStore, snapshot: &SymbolSnapshot) -> super::SemanticApplyResult {
+        store
+            .apply_semantic_snapshot(snapshot, "test-main", &semantic_observations(snapshot), &[])
+            .unwrap()
     }
 
     fn hook_event(project_key: &str, event_id: &str) -> InternalHookEvent {
@@ -1290,7 +2407,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 4);
+        assert_eq!(store.database_schema_version().unwrap(), 5);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, false, 10)
@@ -1375,7 +2492,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 4);
+        assert_eq!(store.database_schema_version().unwrap(), 5);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, true, 10)
@@ -1472,5 +2589,375 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn semantic_snapshots_create_idempotent_candidates_without_auto_adjudication() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let first = semantic_snapshot(
+            "semantic-1",
+            vec![semantic_symbol("before", "src/a.rs", "stable-old")],
+        );
+        let second = semantic_snapshot(
+            "semantic-2",
+            vec![semantic_symbol("after", "src/b.rs", "stable-new")],
+        );
+        assert_eq!(apply_semantic(&store, &first).candidates_inserted, 0);
+        let applied = apply_semantic(&store, &second);
+        assert!(applied.snapshot_inserted);
+        assert_eq!(applied.candidates_inserted, 1);
+        assert_eq!(applied.evidence_inserted, 1);
+
+        let candidates = store
+            .list_lineage_candidates(PROJECT_KEY, None, None, None, 10)
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].state, LineageState::Proposed);
+        assert_eq!(candidates[0].evidence_count, 1);
+
+        let replay = apply_semantic(&store, &second);
+        assert!(!replay.snapshot_inserted);
+        assert_eq!(replay.candidates_inserted, 0);
+        assert_eq!(replay.evidence_inserted, 0);
+        assert_eq!(
+            store
+                .list_lineage_candidates(PROJECT_KEY, None, None, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            store
+                .apply_semantic_snapshot(&first, "test-main", &semantic_observations(&first), &[],),
+            Err(StoreError::InvalidLineage(_))
+        ));
+    }
+
+    #[test]
+    fn algorithm_upgrade_appends_evidence_without_rewriting_manual_state() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let first = semantic_snapshot(
+            "semantic-1",
+            vec![semantic_symbol("before", "src/a.rs", "stable-old")],
+        );
+        let second = semantic_snapshot(
+            "semantic-2",
+            vec![semantic_symbol("after", "src/b.rs", "stable-new")],
+        );
+        let before_observations = semantic_observations(&first);
+        let after_observations = semantic_observations(&second);
+        apply_semantic(&store, &first);
+        apply_semantic(&store, &second);
+        let candidate = store
+            .list_lineage_candidates(PROJECT_KEY, None, None, None, 10)
+            .unwrap()
+            .remove(0);
+        store
+            .reject_lineage(
+                PROJECT_KEY,
+                &candidate.candidate_id,
+                "request-reject-before-upgrade",
+                Some("test-user"),
+                Some("manual rejection must survive generator upgrades"),
+            )
+            .unwrap();
+
+        let mut proposals = brain_symbols::propose_lineage_candidates(
+            &before_observations,
+            &after_observations,
+            &[],
+        );
+        assert_eq!(proposals.len(), 1);
+        proposals[0].algorithm_version = "2".to_owned();
+        let transaction = store.connection.unchecked_transaction().unwrap();
+        let persisted = super::persist_lineage_proposals(
+            &transaction,
+            &proposals,
+            super::unix_seconds().unwrap(),
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        assert_eq!(persisted, (0, 1));
+        let updated = store
+            .list_lineage_candidates(PROJECT_KEY, None, None, None, 10)
+            .unwrap()
+            .remove(0);
+        assert_eq!(updated.candidate_id, candidate.candidate_id);
+        assert_eq!(updated.state, LineageState::Rejected);
+        assert_eq!(updated.evidence_count, 2);
+    }
+
+    #[test]
+    fn unchanged_semantic_symbols_do_not_create_self_lineage() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let stable = semantic_symbol("stable", "src/lib.rs", "stable-key");
+        let first = semantic_snapshot("semantic-1", vec![stable.clone()]);
+        let second = semantic_snapshot("semantic-2", vec![stable]);
+        apply_semantic(&store, &first);
+        let result = apply_semantic(&store, &second);
+        assert_eq!(result.candidates_inserted, 0);
+        assert!(
+            store
+                .list_lineage_candidates(PROJECT_KEY, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn explicit_lineage_decisions_are_append_only_and_idempotent() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let first = semantic_snapshot(
+            "semantic-1",
+            vec![semantic_symbol("before", "src/a.rs", "stable-old")],
+        );
+        let second = semantic_snapshot(
+            "semantic-2",
+            vec![semantic_symbol("after", "src/b.rs", "stable-new")],
+        );
+        apply_semantic(&store, &first);
+        apply_semantic(&store, &second);
+        let candidate = store
+            .list_lineage_candidates(PROJECT_KEY, None, None, None, 10)
+            .unwrap()
+            .remove(0);
+
+        let rejected = store
+            .reject_lineage(
+                PROJECT_KEY,
+                &candidate.candidate_id,
+                "request-reject",
+                Some("test-user"),
+                Some("not the same symbol"),
+            )
+            .unwrap();
+        assert_eq!(rejected.candidate.state, LineageState::Rejected);
+        let confirmed = store
+            .confirm_lineage(
+                PROJECT_KEY,
+                &candidate.candidate_id,
+                "request-confirm",
+                Some("test-user"),
+                Some("reconsidered with explicit evidence"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(confirmed.candidate.state, LineageState::Confirmed);
+        let replay = store
+            .confirm_lineage(
+                PROJECT_KEY,
+                &candidate.candidate_id,
+                "request-confirm",
+                Some("test-user"),
+                Some("reconsidered with explicit evidence"),
+                None,
+            )
+            .unwrap();
+        assert!(replay.replayed);
+        assert!(matches!(
+            store.reject_lineage(
+                PROJECT_KEY,
+                &candidate.candidate_id,
+                "request-confirm",
+                Some("test-user"),
+                Some("different payload"),
+            ),
+            Err(StoreError::LineageIdempotencyConflict(_))
+        ));
+        let decision_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_lineage_decisions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(decision_count, 2);
+
+        let third = semantic_snapshot(
+            "semantic-3",
+            vec![semantic_symbol("latest", "src/c.rs", "stable-latest")],
+        );
+        apply_semantic(&store, &third);
+        let old = store
+            .list_lineage_candidates(PROJECT_KEY, None, Some("semantic-2"), None, 10)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.candidate_id == candidate.candidate_id)
+            .unwrap();
+        assert_eq!(old.state, LineageState::Confirmed);
+    }
+
+    #[test]
+    fn competing_confirmations_require_atomic_explicit_supersede() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let first = semantic_snapshot(
+            "semantic-1",
+            vec![semantic_symbol("before", "src/a.rs", "stable-old")],
+        );
+        let second = semantic_snapshot(
+            "semantic-2",
+            vec![
+                semantic_symbol("after_a", "src/b.rs", "stable-new-a"),
+                semantic_symbol("after_b", "src/c.rs", "stable-new-b"),
+            ],
+        );
+        apply_semantic(&store, &first);
+        apply_semantic(&store, &second);
+        let candidates = store
+            .list_lineage_candidates(PROJECT_KEY, None, None, None, 10)
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.ambiguity_group_id.is_some())
+        );
+        let first_id = &candidates[0].candidate_id;
+        let second_id = &candidates[1].candidate_id;
+        store
+            .confirm_lineage(PROJECT_KEY, first_id, "confirm-a", None, None, None)
+            .unwrap();
+        assert!(matches!(
+            store.confirm_lineage(PROJECT_KEY, second_id, "confirm-b", None, None, None),
+            Err(StoreError::LineageConflict(_))
+        ));
+        let replacement = store
+            .confirm_lineage(
+                PROJECT_KEY,
+                second_id,
+                "supersede-a-with-b",
+                Some("test-user"),
+                Some("selected the other successor"),
+                Some(first_id),
+            )
+            .unwrap();
+        assert_eq!(replacement.candidate.state, LineageState::Confirmed);
+        assert_eq!(
+            replacement.superseded_candidate.unwrap().state,
+            LineageState::Superseded
+        );
+        assert!(matches!(
+            store.confirm_lineage(
+                "project_other",
+                second_id,
+                "cross-project",
+                None,
+                None,
+                None,
+            ),
+            Err(StoreError::LineageConflict(_))
+        ));
+    }
+
+    #[test]
+    fn v4_migration_preserves_project_scoped_graph_and_adds_lineage_ledger() {
+        let (root, database) = temporary_database("v4-lineage-migration");
+        let store = BrainStore::open(&database).unwrap();
+        store
+            .apply_symbol_snapshot(&snapshot("rev-1", vec![symbol("preserved")]))
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE semantic_lineage_decisions;
+                 DROP TABLE semantic_lineage_evidence;
+                 DROP TABLE semantic_lineage_candidates;
+                 DROP TABLE semantic_symbol_observations;
+                 DROP TABLE semantic_snapshots;
+                 UPDATE metadata SET value = '4' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        drop(store);
+
+        let migrated = BrainStore::open(&database).unwrap();
+        assert_eq!(migrated.database_schema_version().unwrap(), 5);
+        assert_eq!(
+            migrated
+                .list_symbols(PROJECT_KEY, None, false, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            migrated
+                .list_lineage_candidates(PROJECT_KEY, None, None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        drop(migrated);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_competing_confirmations_have_one_winner() {
+        let (root, database) = temporary_database("concurrent-lineage-confirm");
+        let store = BrainStore::open(&database).unwrap();
+        let first = semantic_snapshot(
+            "semantic-1",
+            vec![semantic_symbol("before", "src/a.rs", "stable-old")],
+        );
+        let second = semantic_snapshot(
+            "semantic-2",
+            vec![
+                semantic_symbol("after_a", "src/b.rs", "stable-new-a"),
+                semantic_symbol("after_b", "src/c.rs", "stable-new-b"),
+            ],
+        );
+        apply_semantic(&store, &first);
+        apply_semantic(&store, &second);
+        let ids = store
+            .list_lineage_candidates(PROJECT_KEY, None, None, None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|candidate| candidate.candidate_id)
+            .collect::<Vec<_>>();
+        drop(store);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate_id)| {
+                let database = database.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let store = BrainStore::open(&database).unwrap();
+                    barrier.wait();
+                    store.confirm_lineage(
+                        PROJECT_KEY,
+                        &candidate_id,
+                        &format!("concurrent-{index}"),
+                        None,
+                        None,
+                        None,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let successes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().is_ok())
+            .filter(|success| *success)
+            .count();
+        assert_eq!(successes, 1);
+        let store = BrainStore::open(&database).unwrap();
+        assert_eq!(
+            store
+                .list_lineage_candidates(
+                    PROJECT_KEY,
+                    Some(LineageState::Confirmed),
+                    None,
+                    None,
+                    10,
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -15,6 +15,7 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - Project-scoped Provider-neutral 符号身份协议、完整工作区快照与本地派生符号图；
 - 按项目显式配置的离线 SCIP 导入，首批契约覆盖 rust-analyzer、scip-dotnet 与 scip-python；
 - 开放 language ID、逐文档语言映射和四态语义能力声明；
+- Project-scoped semantic lineage ledger、不可变证据与 append-only 显式裁决；
 - SQLite schema v1→v4 迁移、按项目隔离的符号 removed 历史与幂等增量更新；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
@@ -242,6 +243,46 @@ project-brain index-scip --provider rust-main --input index.scip
 Python 的空 `Document.language` 只有在 profile 显式声明 `raw_language: null` 和
 `allow_missing_language: true` 时才接受。Producer 版本只记录来源，不参与 Brain contract 版本。
 
+## Semantic lineage ledger
+
+连续导入同一 semantic provider 的新快照时，Project Brain 只对相邻快照中真正消失和新增的
+symbol 生成 lineage 候选。稳定 ID 不会生成“自己指向自己”的候选，本地 symbol 不参与跨快照
+lineage。候选默认永远是 `proposed`；高置信、唯一匹配或 raw SCIP symbol 相同都不能自动确认。
+
+查看候选：
+
+```text
+project-brain lineage candidates --state proposed
+```
+
+显式确认或拒绝时必须提供调用者生成的幂等 request ID：
+
+```text
+project-brain lineage confirm \
+  --candidate <candidate-id> \
+  --request-id <request-id> \
+  --actor-ref user@example \
+  --reason "confirmed rename"
+
+project-brain lineage reject \
+  --candidate <candidate-id> \
+  --request-id <request-id> \
+  --reason "different responsibility"
+```
+
+修正既有确认必须原子完成：
+
+```text
+project-brain lineage confirm \
+  --candidate <new-candidate-id> \
+  --supersede <old-confirmed-candidate-id> \
+  --request-id <request-id>
+```
+
+状态为 `proposed / confirmed / rejected / superseded / invalidated`。Ambiguity 是候选组属性，
+不是状态。新快照、算法升级或置信度变化不会修改旧候选或人工裁决；裁决也不会修改 symbol ID、
+tombstone 或历史快照。
+
 ## Workspace
 
 ```text
@@ -269,5 +310,7 @@ crates/
   type-definition 关系；不会从 occurrence 猜测 call/import/implementation。
 - scip-dotnet 与 scip-python 使用合成契约 fixture；本阶段不捆绑或自动运行外部 producer。
 - syntax fallback 不自动关联 rename/move lineage；这必须由语义证据或显式确认完成。
+- semantic lineage 当前只支持同项目、同 provider profile/contract、同语言、相邻快照的一对一
+  predecessor/successor；split/merge、跨 provider equivalence 和传递闭包不在本阶段。
 - `Stop` 自动对账只核对文件范围；符号级 Change Envelope 约束尚未加入。
 - Semantic Sentinel / Architecture Judge 尚未加入；这是有意的 V0 边界。

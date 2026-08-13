@@ -6,8 +6,8 @@ use brain_core::{
 use brain_scip::{
     ScipImportProfile, ScipImportStats, ScipLanguageCapabilities, ScipLanguageMapping,
 };
-use brain_store::BrainStore;
-use brain_symbols::{GraphDelta, ProviderDescriptor, SourceLanguage};
+use brain_store::{BrainStore, SemanticApplyResult};
+use brain_symbols::{ProviderDescriptor, SourceLanguage};
 use serde::Serialize;
 
 use crate::{error::AppError, git};
@@ -26,7 +26,7 @@ pub struct ScipIndexReport {
     pub source_revision: String,
     pub stats: ScipImportStats,
     pub lineage_observations: u64,
-    pub delta: GraphDelta,
+    pub apply: SemanticApplyResult,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -80,7 +80,12 @@ pub fn evaluate(
     let imported =
         brain_scip::import_file(root, project_key, &head_revision, input, &import_profile)?;
     validate_project_roots(&imported.snapshot, language_profiles)?;
-    let delta = store.apply_symbol_snapshot(&imported.snapshot)?;
+    let apply = store.apply_semantic_snapshot(
+        &imported.snapshot,
+        &configured.id,
+        &imported.lineage_observations,
+        &[],
+    )?;
     Ok(ScipIndexReport {
         schema_version: brain_core::CURRENT_SCHEMA_VERSION,
         experimental: true,
@@ -95,7 +100,7 @@ pub fn evaluate(
         stats: imported.stats,
         lineage_observations: u64::try_from(imported.lineage_observations.len())
             .unwrap_or(u64::MAX),
-        delta,
+        apply,
     })
 }
 

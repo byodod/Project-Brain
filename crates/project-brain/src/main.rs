@@ -11,7 +11,7 @@ mod scip_index;
 use std::{path::PathBuf, process::ExitCode};
 
 use app::{AgentKind, App, HookEvent};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "project-brain")]
@@ -67,6 +67,12 @@ enum Command {
         input: PathBuf,
     },
 
+    /// 查看或显式裁决 semantic lineage 候选
+    Lineage {
+        #[command(subcommand)]
+        command: LineageCommand,
+    },
+
     /// 查询本地符号图
     Symbols {
         #[arg(long)]
@@ -86,6 +92,78 @@ enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum LineageCommand {
+    /// 查询项目级 lineage 候选 ledger
+    Candidates {
+        #[arg(long)]
+        state: Option<LineageStateArg>,
+
+        #[arg(long)]
+        snapshot: Option<String>,
+
+        #[arg(long)]
+        ambiguity_group: Option<String>,
+
+        #[arg(long, default_value_t = 200)]
+        limit: u32,
+    },
+
+    /// 显式确认候选；可原子替代一条旧确认
+    Confirm {
+        #[arg(long)]
+        candidate: String,
+
+        #[arg(long)]
+        request_id: String,
+
+        #[arg(long)]
+        actor_ref: Option<String>,
+
+        #[arg(long)]
+        reason: Option<String>,
+
+        #[arg(long)]
+        supersede: Option<String>,
+    },
+
+    /// 显式拒绝尚未裁决的候选
+    Reject {
+        #[arg(long)]
+        candidate: String,
+
+        #[arg(long)]
+        request_id: String,
+
+        #[arg(long)]
+        actor_ref: Option<String>,
+
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LineageStateArg {
+    Proposed,
+    Confirmed,
+    Rejected,
+    Superseded,
+    Invalidated,
+}
+
+impl From<LineageStateArg> for brain_symbols::LineageState {
+    fn from(value: LineageStateArg) -> Self {
+        match value {
+            LineageStateArg::Proposed => Self::Proposed,
+            LineageStateArg::Confirmed => Self::Confirmed,
+            LineageStateArg::Rejected => Self::Rejected,
+            LineageStateArg::Superseded => Self::Superseded,
+            LineageStateArg::Invalidated => Self::Invalidated,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -101,6 +179,43 @@ fn main() -> ExitCode {
         Command::IndexScip { provider, input } => {
             App::open(cli.project_root).and_then(|app| app.index_scip(&provider, &input))
         }
+        Command::Lineage { command } => App::open(cli.project_root).and_then(|app| match command {
+            LineageCommand::Candidates {
+                state,
+                snapshot,
+                ambiguity_group,
+                limit,
+            } => app.lineage_candidates(
+                state.map(Into::into),
+                snapshot.as_deref(),
+                ambiguity_group.as_deref(),
+                limit,
+            ),
+            LineageCommand::Confirm {
+                candidate,
+                request_id,
+                actor_ref,
+                reason,
+                supersede,
+            } => app.confirm_lineage(
+                &candidate,
+                &request_id,
+                actor_ref.as_deref(),
+                reason.as_deref(),
+                supersede.as_deref(),
+            ),
+            LineageCommand::Reject {
+                candidate,
+                request_id,
+                actor_ref,
+                reason,
+            } => app.reject_lineage(
+                &candidate,
+                &request_id,
+                actor_ref.as_deref(),
+                reason.as_deref(),
+            ),
+        }),
         Command::Symbols {
             path,
             include_removed,

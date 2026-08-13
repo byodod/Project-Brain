@@ -239,6 +239,7 @@ struct ImportContext {
     head_revision: String,
     index_digest: String,
     provider: ProviderDescriptor,
+    provider_profile_id: String,
     producer_name: String,
     producer_version: String,
 }
@@ -367,7 +368,8 @@ fn finish_import(
         .drain(..)
         .map(|definition| LineageSymbolObservation {
             project_key: context.project_key.clone(),
-            provider_id: snapshot.provider.id.clone(),
+            provider_profile_id: context.provider_profile_id.clone(),
+            provider_contract_id: snapshot.provider.id.clone(),
             language: definition.node.language.clone(),
             snapshot_revision: snapshot.source_revision.clone(),
             symbol_id: definition.node.id,
@@ -451,6 +453,7 @@ fn decode_index(
             version: format!("contract-{}", profile.contract_version),
             identity_quality: IdentityQuality::Semantic,
         },
+        provider_profile_id: profile.id.clone(),
         producer_name: tool.name.clone(),
         producer_version: tool.version.clone(),
     };
@@ -1032,7 +1035,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use brain_symbols::{EdgeKind, LineageState, propose_lineage_candidates};
+    use brain_symbols::{EdgeKind, propose_lineage_candidates};
     use protobuf::{EnumOrUnknown, Message, MessageField};
     use scip::types::{
         Document, Index, Metadata, Occurrence, PositionEncoding, Relationship, SingleLineRange,
@@ -1040,7 +1043,8 @@ mod tests {
     };
 
     use super::{
-        CapabilitySupport, ScipError, ScipImportProfile, ScipLanguageMapping, import_bytes,
+        CapabilitySupport, ScipError, ScipImport, ScipImportProfile, ScipLanguageMapping,
+        import_bytes,
     };
 
     const PROJECT_KEY: &str = "project_fixture";
@@ -1389,18 +1393,26 @@ mod tests {
             .into_iter()
             .filter(|item| !item.is_local)
             .collect::<Vec<_>>();
-        let current = second
+        let mut current = second
             .lineage_observations
             .into_iter()
             .filter(|item| !item.is_local)
             .collect::<Vec<_>>();
+        for observation in &mut current {
+            observation.symbol_id.push_str("-new-provider-identity");
+        }
+        assert!(
+            old.iter()
+                .zip(&current)
+                .all(|(before, after)| before.symbol_id != after.symbol_id)
+        );
         let candidates = propose_lineage_candidates(&old, &current, &[]);
 
         assert!(!candidates.is_empty());
         assert!(
             candidates
                 .iter()
-                .all(|candidate| candidate.state != LineageState::Confirmed)
+                .all(|candidate| candidate.ambiguity_group_id.is_none())
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -1618,7 +1630,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first.snapshot.provider, second.snapshot.provider);
-        assert_eq!(first.snapshot.symbols[0].id, second.snapshot.symbols[0].id);
+        let global_id = |import: &ScipImport| {
+            import
+                .snapshot
+                .symbols
+                .iter()
+                .find(|symbol| symbol.display_name == "target")
+                .unwrap()
+                .id
+                .clone()
+        };
+        assert_eq!(global_id(&first), global_id(&second));
         assert_ne!(first.producer_version, second.producer_version);
 
         let other_profile = profile(
@@ -1628,7 +1650,7 @@ mod tests {
         );
         let third = import_bytes(&root, PROJECT_KEY, "head", &bytes, &other_profile).unwrap();
         assert_ne!(first.snapshot.provider.id, third.snapshot.provider.id);
-        assert_ne!(first.snapshot.symbols[0].id, third.snapshot.symbols[0].id);
+        assert_ne!(global_id(&first), global_id(&third));
 
         let punctuation_profile = profile(
             "rust.main",

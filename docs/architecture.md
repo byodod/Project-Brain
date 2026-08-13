@@ -94,11 +94,33 @@ supported/partial/unsupported/unknown 四态，不从某个索引“恰好出现
 SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照以事务应用；快照中消失的节点
 进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
 符号 ID、快照 revision、节点/边主键、查询和墓碑更新都包含 `project_key`。数据库 schema v4
-迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与 adapter 审计，避免把旧节点错误归入
-某个项目。
+首次建立这组项目隔离约束；对应迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与
+adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v5，并在这些约束上
+增加独立的语义血缘账本。
 数据库迁移拒绝缺失或非整数的已有 `schema_version`，不会把损坏元数据静默当作 v1。
 Adapter 审计依赖 SQLite 唯一约束和 busy timeout，使并发连接对同一项目事件收敛到首次 outcome；
 失败记录可在重开数据库后由成功重试升级，后续重复成功不能覆盖首次成功。
+
+Semantic lineage 使用独立 ledger，不改变符号图：
+
+```text
+immutable semantic snapshots + observations
+                 │ adjacent removed/inserted only
+                 ▼
+         proposed candidate
+           │ evidence append-only
+           │ explicit user request
+           ▼
+confirmed / rejected / superseded / invalidated
+           │ decision append-only
+           └── never rewrites SymbolNode / tombstone / snapshot
+```
+
+SQLite schema v5 保存 semantic snapshots、symbol observations、candidate、evidence 和 decision。
+Candidate endpoint 唯一键负责算法重跑幂等，算法版本只产生新的 evidence observation；人工状态
+永远不会被 generator 恢复或覆盖。Partial unique indexes 约束同 snapshot pair 中 predecessor 与
+successor 一对一，竞争确认不会自动选择赢家。`request_id + request_hash` 提供 at-least-once 命令
+提交的幂等与碰撞检测，状态更新使用 revision CAS。
 
 ## 阻断权限
 
@@ -142,4 +164,5 @@ Prime Agent 是独立 runtime，当前已确认的 Extension `agent_end` 不具�
 [ADR-0002](adr/0002-internal-hook-protocol.md)、
 [ADR-0003](adr/0003-project-identity-and-adapter-audit.md) 与
 [ADR-0004](adr/0004-project-scoped-symbol-graph.md)、
-[ADR-0005](adr/0005-project-language-and-scip-profiles.md)。
+[ADR-0005](adr/0005-project-language-and-scip-profiles.md) 与
+[ADR-0006](adr/0006-semantic-lineage-ledger.md)。

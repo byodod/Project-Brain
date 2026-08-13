@@ -268,3 +268,37 @@ SCIP 导入遵循以下 fail-closed 规则：
    归一化后发生身份碰撞。
 10. lineage 候选只在同一 project、provider 与 language 内比较；Git rename similarity 必须位于
     0..10000，且达到 5000 才能单独把候选提升为 high confidence。
+
+## Semantic lineage ledger
+
+Lineage 连接两个历史 observation，而不是合并或重命名 `SymbolNode`。持久化边界为：
+
+- `semantic_snapshots`：按项目、provider profile/contract 排序的不可变导入事实；
+- `semantic_symbol_observations`：某次快照实际看到的 symbol；
+- `semantic_lineage_candidates`：endpoint 唯一、当前状态 materialization；
+- `semantic_lineage_evidence`：算法 ID、版本、输入摘要、结构化证据与置信度的 append-only 观察；
+- `semantic_lineage_decisions`：显式用户裁决的 append-only 日志。
+
+候选状态只有：
+
+```text
+proposed | confirmed | rejected | superseded | invalidated
+```
+
+`ambiguity_group_id` 保存生成时的竞争集合；ambiguous 不属于生命周期。允许
+`rejected -> confirmed`，但必须是新的显式请求并保留两条 decision。禁止
+`confirmed -> rejected`；纠错使用原子 `confirmed -> superseded` 加替代候选确认，结构性损坏才使用
+`invalidated`。
+
+硬不变量：
+
+1. 只比较同 project、provider profile、provider contract、language 的相邻 semantic snapshot；
+2. 只为旧快照 removed 与新快照 inserted symbol 生成候选；稳定 symbol ID 不产生 self-lineage；
+3. 新快照和算法重跑不改变旧 candidate state；只可追加去重后的 evidence；
+4. confirm/reject 只能来自显式用户命令，必须携带 request ID；同 request 同 payload 重放首次结果，
+   同 request 不同 payload 拒绝；
+5. 一次裁决在单个事务内写 decision、执行 revision CAS、更新 materialized state；
+6. 同 snapshot pair 的 confirmed predecessor/successor 都是一对一；split/merge 留待独立协议；
+7. 不自动确认、拒绝竞争项、supersede、延伸传递 lineage、修改 symbol ID、恢复 tombstone、改写
+   snapshot 或跨 provider 建 equivalence；
+8. 已导入但不是当前最新的历史 snapshot 不能重新应用为当前符号图。
