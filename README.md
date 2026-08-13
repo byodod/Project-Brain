@@ -54,6 +54,24 @@ cargo build --release --locked -p project-brain
 project-brain init
 ```
 
+语言能力必须显式选择；Project Brain 不扫描项目文件或扩展名进行猜测。单语言项目例如：
+
+```text
+project-brain init --profile rust
+project-brain init --profile dotnet
+project-brain init --profile python
+```
+
+同一项目可组合多个 profile：
+
+```text
+project-brain init --profile dotnet --profile python --profile rust
+```
+
+`dotnet` 模板声明 `csharp` 与 `visual-basic`，并绑定 `scip-dotnet`；`rust` 绑定
+`rust-analyzer`；`python` 绑定显式允许空 `Document.language` 的 `scip-python` 契约。
+重复参数会被幂等去重。省略所有 `--profile` 仍只创建基础控制面，不引入任何语言假设。
+
 它会创建：
 
 ```text

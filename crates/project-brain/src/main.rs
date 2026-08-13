@@ -10,7 +10,7 @@ mod scip_index;
 
 use std::{path::PathBuf, process::ExitCode};
 
-use app::{AgentKind, App, HookEvent};
+use app::{AgentKind, App, HookEvent, ProjectProfile};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -27,8 +27,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// 初始化仓库级 Project Brain 配置
-    Init,
+    /// 初始化仓库级 Project Brain 配置；语言能力只能通过显式 profile 声明
+    Init {
+        /// 可重复指定 rust、dotnet、python；省略时创建不含语言假设的基础配置
+        #[arg(long, value_enum)]
+        profile: Vec<ProjectProfile>,
+    },
 
     /// 从标准输入读取 `ActionDescriptor` 并输出通用决策 JSON
     Preflight,
@@ -167,7 +171,7 @@ impl From<LineageStateArg> for brain_symbols::LineageState {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Init => App::init(cli.project_root),
+        Command::Init { profile } => App::init(cli.project_root, &profile),
         Command::Preflight => App::open(cli.project_root).and_then(|app| app.preflight()),
         Command::Hook { agent, event } => App::run_hook(cli.project_root, agent, event),
         Command::Capabilities { agent } => App::capabilities(agent),

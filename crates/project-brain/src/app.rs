@@ -5,8 +5,9 @@ use std::{
 };
 
 use brain_core::{
-    ActionDescriptor, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, MemoryStatus, Rule,
-    RuleEffect, RuleEngine, RuleStrength, StopReconcileConfig, normalize_project_path,
+    ActionDescriptor, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, MemoryStatus,
+    ProjectLanguageProfile, Rule, RuleEffect, RuleEngine, RuleStrength, SemanticLanguageMapping,
+    SemanticProviderFormat, SemanticProviderProfile, StopReconcileConfig, normalize_project_path,
 };
 use brain_store::BrainStore;
 use clap::ValueEnum;
@@ -37,6 +38,16 @@ pub enum HookEvent {
     Stop,
 }
 
+/// 由用户显式选择的项目语言/语义 Provider 模板。
+///
+/// 这里刻意不提供 `Auto`：Project Brain 不根据仓库文件猜测语言。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum ProjectProfile {
+    Rust,
+    Dotnet,
+    Python,
+}
+
 pub struct App {
     root: PathBuf,
     config: BrainConfig,
@@ -52,7 +63,10 @@ impl App {
         Ok(())
     }
 
-    pub fn init(explicit_root: Option<PathBuf>) -> Result<(), AppError> {
+    pub fn init(
+        explicit_root: Option<PathBuf>,
+        profiles: &[ProjectProfile],
+    ) -> Result<(), AppError> {
         let root = explicit_root.unwrap_or(env::current_dir()?);
         let brain_dir = root.join(BRAIN_DIRECTORY);
         let config_path = brain_dir.join(CONFIG_FILE);
@@ -66,7 +80,7 @@ impl App {
             .and_then(|name| name.to_str())
             .unwrap_or("project")
             .to_owned();
-        let config = initial_config(project_name, generate_project_key(&root)?);
+        let config = initial_config(project_name, generate_project_key(&root)?, profiles);
         config.validate()?;
         fs::write(&config_path, pretty_json(&config)?)?;
         fs::write(
@@ -293,13 +307,18 @@ impl App {
     }
 }
 
-fn initial_config(project_name: String, project_key: String) -> BrainConfig {
+fn initial_config(
+    project_name: String,
+    project_key: String,
+    profiles: &[ProjectProfile],
+) -> BrainConfig {
+    let (language_profiles, semantic_providers) = profile_config(profiles);
     BrainConfig {
         schema_version: CURRENT_SCHEMA_VERSION,
         project_key,
         project_name,
-        language_profiles: Vec::new(),
-        semantic_providers: Vec::new(),
+        language_profiles,
+        semantic_providers,
         stop_reconcile: StopReconcileConfig {
             enabled: true,
             base: "HEAD".to_owned(),
@@ -358,6 +377,88 @@ fn initial_config(project_name: String, project_key: String) -> BrainConfig {
             },
         ],
     }
+}
+
+fn profile_config(
+    profiles: &[ProjectProfile],
+) -> (Vec<ProjectLanguageProfile>, Vec<SemanticProviderProfile>) {
+    let profiles = profiles
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut languages = Vec::new();
+    let mut providers = Vec::new();
+
+    for profile in profiles {
+        match profile {
+            ProjectProfile::Rust => {
+                languages.push(ProjectLanguageProfile {
+                    language: "rust".to_owned(),
+                    roots: Vec::new(),
+                });
+                providers.push(SemanticProviderProfile {
+                    id: "rust-main".to_owned(),
+                    format: SemanticProviderFormat::Scip,
+                    producer: "rust-analyzer".to_owned(),
+                    contract_version: 1,
+                    language_mappings: vec![SemanticLanguageMapping {
+                        raw_language: Some("rust".to_owned()),
+                        language: "rust".to_owned(),
+                        allow_missing_language: false,
+                    }],
+                });
+            }
+            ProjectProfile::Dotnet => {
+                languages.extend([
+                    ProjectLanguageProfile {
+                        language: "csharp".to_owned(),
+                        roots: Vec::new(),
+                    },
+                    ProjectLanguageProfile {
+                        language: "visual-basic".to_owned(),
+                        roots: Vec::new(),
+                    },
+                ]);
+                providers.push(SemanticProviderProfile {
+                    id: "dotnet-main".to_owned(),
+                    format: SemanticProviderFormat::Scip,
+                    producer: "scip-dotnet".to_owned(),
+                    contract_version: 1,
+                    language_mappings: vec![
+                        SemanticLanguageMapping {
+                            raw_language: Some("C#".to_owned()),
+                            language: "csharp".to_owned(),
+                            allow_missing_language: false,
+                        },
+                        SemanticLanguageMapping {
+                            raw_language: Some("Visual Basic".to_owned()),
+                            language: "visual-basic".to_owned(),
+                            allow_missing_language: false,
+                        },
+                    ],
+                });
+            }
+            ProjectProfile::Python => {
+                languages.push(ProjectLanguageProfile {
+                    language: "python".to_owned(),
+                    roots: Vec::new(),
+                });
+                providers.push(SemanticProviderProfile {
+                    id: "python-main".to_owned(),
+                    format: SemanticProviderFormat::Scip,
+                    producer: "scip-python".to_owned(),
+                    contract_version: 1,
+                    language_mappings: vec![SemanticLanguageMapping {
+                        raw_language: None,
+                        language: "python".to_owned(),
+                        allow_missing_language: true,
+                    }],
+                });
+            }
+        }
+    }
+
+    (languages, providers)
 }
 
 fn generate_project_key(root: &Path) -> Result<String, std::time::SystemTimeError> {
@@ -426,7 +527,10 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{App, discover_root, initial_config, legacy_project_key, pretty_json};
+    use super::{
+        App, ProjectProfile, discover_root, initial_config, legacy_project_key, pretty_json,
+        profile_config,
+    };
 
     #[test]
     fn missing_marker_does_not_guess_a_project_root() {
@@ -448,7 +552,7 @@ mod tests {
         ));
         fs::create_dir(&root).unwrap();
 
-        App::init(Some(root.clone())).unwrap();
+        App::init(Some(root.clone()), &[]).unwrap();
 
         assert!(root.join(".project-brain/config.json").is_file());
         assert!(root.join(".project-brain/envelope.json").is_file());
@@ -479,7 +583,7 @@ mod tests {
         ));
         let brain_dir = root.join(".project-brain");
         fs::create_dir_all(&brain_dir).unwrap();
-        let legacy = initial_config("legacy".to_owned(), String::new());
+        let legacy = initial_config("legacy".to_owned(), String::new(), &[]);
         fs::write(brain_dir.join("config.json"), pretty_json(&legacy).unwrap()).unwrap();
 
         let app = App::open(Some(root.clone())).unwrap();
@@ -495,8 +599,8 @@ mod tests {
 
     #[test]
     fn legacy_project_key_depends_on_project_config_not_checkout_path() {
-        let first = initial_config("same".to_owned(), String::new());
-        let second = initial_config("other".to_owned(), String::new());
+        let first = initial_config("same".to_owned(), String::new(), &[]);
+        let second = initial_config("other".to_owned(), String::new(), &[]);
         assert_eq!(
             legacy_project_key(&first).unwrap(),
             legacy_project_key(&first).unwrap()
@@ -505,5 +609,44 @@ mod tests {
             legacy_project_key(&first).unwrap(),
             legacy_project_key(&second).unwrap()
         );
+    }
+
+    #[test]
+    fn explicit_profiles_are_composable_deduplicated_and_never_inferred() {
+        let empty = initial_config("empty".to_owned(), "pb_empty".to_owned(), &[]);
+        assert!(empty.language_profiles.is_empty());
+        assert!(empty.semantic_providers.is_empty());
+
+        let (languages, providers) = profile_config(&[
+            ProjectProfile::Python,
+            ProjectProfile::Rust,
+            ProjectProfile::Dotnet,
+            ProjectProfile::Rust,
+        ]);
+        assert_eq!(
+            languages
+                .iter()
+                .map(|profile| profile.language.as_str())
+                .collect::<Vec<_>>(),
+            ["rust", "csharp", "visual-basic", "python"]
+        );
+        assert_eq!(
+            providers
+                .iter()
+                .map(|profile| profile.id.as_str())
+                .collect::<Vec<_>>(),
+            ["rust-main", "dotnet-main", "python-main"]
+        );
+
+        let configured = initial_config(
+            "polyglot".to_owned(),
+            "pb_polyglot".to_owned(),
+            &[
+                ProjectProfile::Rust,
+                ProjectProfile::Dotnet,
+                ProjectProfile::Python,
+            ],
+        );
+        configured.validate().unwrap();
     }
 }
