@@ -27,7 +27,8 @@ finding，后者只能 advisory。对于 Godot C#，编译事实必须引用已�
    HOME、临时目录、.NET CLI home 与输出目录指向机器 scratch。
 5. `.NET --no-restore` 只复制白名单 NuGet restore metadata 到 scratch；不复制旧 DLL 或生成源码。
    NuGet package cache 是显式机器输入，仓库不能改写其位置。
-6. ArtifactSet 递归记录普通文件相对路径、大小与 SHA-256，并限制文件数和总大小；链接或越界路径拒绝。
+6. ArtifactSet 递归记录最终输出普通文件的相对路径、大小与 SHA-256，并限制文件数和总大小；链接或
+   越界路径拒绝。`.NET obj` 中含 scratch 绝对路径的 cache 不进入权威产物清单。
 7. 运行前后 worktree 指纹或 executable hash 漂移时丢弃结果。
 8. `coverage=complete` 不代表成功。项目构建错误为 complete error finding；工具链/准备状态不可用为
    partial warning finding。失败证据先持久化，CLI 再返回非零。
@@ -36,7 +37,8 @@ finding，后者只能 advisory。对于 Godot C#，编译事实必须引用已�
 ## 验证
 
 - Godot 4.6 C# 项目：真实 Engine upstream 后，隔离 `.NET 9.0.308` Debug build 得到 0 warning、
-  0 error、23 个产物；项目仓库没有新增跟踪修改，也未执行 export。
+  0 error；连续构建的最终 `bin/Debug` 文件哈希一致，只有 4 个 obj cache 因 scratch 路径变化而不同，
+  因此这些 cache 被排除。项目仓库没有新增跟踪修改，也未执行 export。
 - 本仓库 Rust workspace：全新临时 target、`--workspace --all-targets --frozen` 成功，记录 2996 个
   产物条目，完成后 scratch 删除。
 - Python 工具目录：isolated compile validation 成功，合同显示 `compiler_only + validation_only`。

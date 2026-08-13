@@ -216,7 +216,8 @@ Build Snapshot 的 `coverage` 描述观测是否完整，而不是进程是否�
 保存 `partial + build_unavailable(warning)`。成功的 ArtifactSet 合同没有普通产物时保存
 `required_artifact_missing(error)`。CLI 在这些情况下仍原子保存 Evidence 后返回非零。下游 Runtime
 必须检查 Build findings，而不能只检查 complete/fresh。Godot C# 的 Build Snapshot 还必须通过
-显式 `EvidenceReference` 固定其 Engine upstream。
+显式 `EvidenceReference` 固定其 Engine upstream。`.NET` manifest 只覆盖最终 bin output；包含
+scratch 绝对路径的 obj cache 是执行中间态，不进入 artifact identity。
 
 SQLite schema v13 为 Evidence Protocol 维护四类项目隔离记录：
 

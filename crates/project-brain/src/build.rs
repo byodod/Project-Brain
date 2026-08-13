@@ -173,7 +173,7 @@ pub fn run_dotnet(request: &BuildRequest<'_>) -> Result<BuildRunReport, AppError
         &argv,
         ExecutionClass::RepositoryBuildCode,
         BuildOutputKind::ArtifactSet,
-        Some(&artifacts),
+        Some(&bin_debug),
     )
 }
 

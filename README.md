@@ -306,7 +306,8 @@ MSBuild task、build.rs 或 proc macro，因此除了信任机器 executable，�
 
 Python v1 是 `validation_only`：以 `-I -S -B` 启动 Project Brain 内置 bootstrap，对项目内 `.py`
 逐文件调用 `compile()`，不 import、不 exec、不构建 wheel。三种合同都会固定 executable SHA-256，
-清空并重建环境，比较运行前后 worktree 指纹，限制输出大小，并为临时产物生成文件级哈希清单。
+清空并重建环境，比较运行前后 worktree 指纹，限制输出大小，并为最终产物生成文件级哈希清单；
+.NET 的 `obj` 路径相关 cache 不进入权威产物清单。
 命令不会运行测试、应用或任何 export。
 
 `coverage=complete` 表示“完整观测了本次合同”，不表示构建成功。非零退出可同时是
