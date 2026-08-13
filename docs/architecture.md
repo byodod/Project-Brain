@@ -124,7 +124,7 @@ SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照�
 进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
 符号 ID、快照 revision、节点/边主键、查询和墓碑更新都包含 `project_key`。数据库 schema v4
 首次建立这组项目隔离约束；对应迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与
-adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v12，并在这些约束上
+adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v13，并在这些约束上
 增加独立的语义血缘账本、append-only 来源证明、不可伪造的源码 Document manifest，以及
 Evidence Plane 当前 head 与 staleness 事件。
 数据库迁移拒绝缺失或非整数的已有 `schema_version`，不会把损坏元数据静默当作 v1。
@@ -146,7 +146,7 @@ confirmed / rejected / superseded / invalidated
            └── never rewrites SymbolNode / tombstone / snapshot
 ```
 
-SQLite schema v12 保存 semantic snapshots、append-only source attestations、source manifests、
+SQLite schema v13 保存 semantic snapshots、append-only source attestations、source manifests、
 symbol observations、group/member/generation run、candidate/evidence/decision，以及显式旧账压缩的
 run/group 审计和 append-only Provider qualification events。压缩默认只读；apply 必须携带人工确认与幂等 request ID，且逻辑删除与审计同事务。
 物理 `VACUUM` 不属于压缩事务，也不能替代候选资格证明。
@@ -173,9 +173,11 @@ workspace run 的 union 不构成一致的语义世界，因此协议明确禁�
 
 Engine/Build/Runtime 等跨语言证据使用独立 ledger：不可变 `evidence_snapshots` 只按 fingerprint 保存
 一次完整 JSON，重复真实运行只追加小型 `evidence_attestations`；`evidence_heads` 保存每个项目、plane、
-provider 当前指向及 fresh/stale 状态。明确的文件 Create/Modify/Delete 完成事件以 project + event ID
-幂等写入 `evidence_staleness_events`，并把当前 Engine head 标为 stale；重新执行真实 Provider 才能将
-head 恢复 fresh。这个结构避免重复保存大型 ArtifactGraph，也不把 stale finding 提升为硬阻断。
+provider 当前指向及 fresh/stale/unknown 状态。明确的文件 Create/Modify/Delete 完成事件以
+project + event ID 幂等写入 `evidence_staleness_events`，并把现有 Semantic、Engine、Build、Runtime
+heads 原子标为 stale。Provider 应用快照时按其显式 upstream 引用计算 freshness，并向依赖该
+fingerprint 的下游传递失效；重新执行对应真实 Provider 才能恢复自己的 head。这个结构避免重复保存
+大型 ArtifactGraph，也不把 stale finding 提升为硬阻断。
 
 ## 阻断权限
 

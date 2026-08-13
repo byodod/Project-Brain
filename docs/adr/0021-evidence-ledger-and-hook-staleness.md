@@ -14,7 +14,7 @@ Godot Provider 已能产生确定性 Engine Evidence Snapshot，但只打印 JSO
 
 ## 决策
 
-1. SQLite schema 升级为 v12，新增 `evidence_snapshots`、`evidence_attestations`、`evidence_heads` 和
+1. SQLite schema v12 新增 `evidence_snapshots`、`evidence_attestations`、`evidence_heads` 和
    `evidence_staleness_events`；所有身份键都显式包含 `project_key`。
 2. 完整 Snapshot 按 project、plane、provider、fingerprint 不可变去重；每次真实运行只追加一条轻量
    attestation。应用快照、追加证明和把 head 恢复 fresh 在同一事务完成。

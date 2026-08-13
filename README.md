@@ -262,8 +262,10 @@ project-brain evidence status
 ```
 
 完整 ArtifactGraph 按 fingerprint 只保存一次；每次真实运行追加轻量 attestation。Codex、Claude Code
-或 Prime Agent 的 `PostToolUse` 一旦观察到明确的 Create/Modify/Delete，当前 Engine Evidence 就会变为
-`stale`，并在后续 Session/Intent/PreTool/Stop 注入提示；重新运行 Godot probe 才恢复 `fresh`。
+或 Prime Agent 的 `PostToolUse` 一旦观察到明确的 Create/Modify/Delete，现有 Semantic、Engine、Build、
+Runtime Evidence heads 会作为一个幂等事件变为 `stale`，并在后续 Session/Intent/PreTool/Stop 注入提示。
+Provider 应用新快照时会校验其显式 upstream fingerprint，并把失效传递给真正依赖它的下游；只有逐层
+重新运行对应 Provider 才能恢复各自 `fresh`。
 `stale` 证据永远没有硬阻断资格。即便是 `fresh + complete + deterministic + error` finding，也仍须
 仓库规则显式提供 authority/strength/effect，Provider 本身不能自动 block。
 
