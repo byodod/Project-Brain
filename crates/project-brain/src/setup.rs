@@ -985,22 +985,14 @@ fn managed_claude_handlers(launcher: &Path) -> BTreeMap<String, Value> {
         .into_iter()
         .map(|event| {
             let event_arg = event_arg(event);
-            #[cfg(target_os = "windows")]
-            let command = format!(
-                "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& {} dispatch claude-code {event_arg}\"",
-                quote_powershell(&launcher.to_string_lossy())
-            );
-            #[cfg(not(target_os = "windows"))]
-            let command = format!(
-                "{} dispatch claude-code {event_arg}",
-                quote_posix(&launcher.to_string_lossy())
-            );
             (
                 event.to_owned(),
                 json!({
                     "type": "command",
-                    "command": command,
-                    "timeout": 10
+                    "command": launcher,
+                    "args": ["dispatch", "claude-code", event_arg],
+                    "timeout": 10,
+                    "statusMessage": "Project Brain deterministic governance"
                 }),
             )
         })
@@ -1220,10 +1212,27 @@ fn is_managed_signature(handler: &Value) -> bool {
 }
 
 fn is_claude_managed_signature(handler: &Value) -> bool {
-    handler
-        .get("command")
-        .and_then(Value::as_str)
-        .is_some_and(|command| command.contains(" dispatch claude-code "))
+    let marker_matches = handler.get("statusMessage").and_then(Value::as_str)
+        == Some("Project Brain deterministic governance");
+    let args_match = handler
+        .get("args")
+        .and_then(Value::as_array)
+        .is_some_and(|args| {
+            args.len() == 3
+                && args[0] == "dispatch"
+                && args[1] == "claude-code"
+                && args[2].as_str().is_some_and(|event| {
+                    matches!(
+                        event,
+                        "session-start"
+                            | "user-prompt-submit"
+                            | "pre-tool-use"
+                            | "post-tool-use"
+                            | "stop"
+                    )
+                })
+        });
+    marker_matches && args_match
 }
 
 fn codex_integration_valid(install_root: &Path, codex_home: Option<&Path>) -> bool {

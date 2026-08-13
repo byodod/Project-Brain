@@ -173,6 +173,9 @@ adapter identity、event ID namespace 与 operation ID namespace，不能跨 ven
 Claude Code adapter v1 提供直接 `hook/dispatch` 协议入口和用户级 `settings.json` 安装器。
 安装器使用独立 manifest、精确 handler hash 与原子替换；只管理五个已实现事件。
 `SubagentStart` 与 `SessionEnd` 不在这一阶段；未实现的 lifecycle 不会被折叠成现有五类事件。
+handler 使用 `command` 指向稳定 launcher、`args` 保存三个独立参数的 exec form；不得通过 shell
+字符串拼接 launcher 路径或生命周期参数。固定 `statusMessage` 用作托管签名的一部分，实际路径与
+完整 handler 仍由 manifest hash 校验。
 `doctor [codex|claude-code]` 选择对应的配置、manifest 和 handler hash 域；未给参数时为兼容旧调用
 默认检查 Codex。Doctor v2 使用通用 adapter 字段，不把 Claude 状态伪装成 Codex 状态。
 

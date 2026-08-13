@@ -4,7 +4,7 @@
 
 ## 状态
 
-Accepted
+Accepted；Windows command 形态由 ADR-0017 修订
 
 ## 背景
 
@@ -18,8 +18,8 @@ ADR-0014 只允许 Claude Code direct adapter，不允许在缺少合并和漂�
    `--claude-home` 可显式覆盖。
 2. 只安装 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse` 与 `Stop`。工具 matcher
    固定为 `Bash|Edit|Write|NotebookEdit`。
-3. Windows command 显式启动非交互 PowerShell 再调用稳定 launcher；Unix 直接使用 POSIX 单引号
-   转义的 launcher。配置中只写 `type`、`command` 与 `timeout`。
+3. 原始决策使用平台 shell 包裹稳定 launcher；ADR-0017 根据 Claude Code 的正式 exec-form 契约
+   将其修订为不经过 shell 的 `command` + `args`。
 4. Claude 使用独立的 `state/integrations/claude-code.json`、锁文件和 handler signature；不得与
    Codex manifest 或 hash 混用。
 5. 安装采用 compare-and-swap 原子替换。已有 manifest 且 handler 完全一致时返回 no-op；任何缺失、
@@ -35,6 +35,7 @@ uninstall，验证五个 handler、用户 `language` 和自定义 `Stop` hook �
 
 - Claude Code 获得与 Codex 同级的可回滚用户级接入，但两套配置和审计仍完全隔离。
 - 按 adapter 选择的就绪检查由 ADR-0016 补充。
+- 安装后 handler 的无 shell 真实子进程验证由 ADR-0017 补充。
 - 不因安装器存在而声称 `SubagentStart`、`SessionEnd` 或 Prime Agent 已实现。
 
 ## 参考

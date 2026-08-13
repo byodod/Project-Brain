@@ -45,6 +45,31 @@ fn run(executable: &Path, arguments: &[&str], cwd: &Path, stdin: Option<&str>) -
     child.wait_with_output().expect("wait for project-brain")
 }
 
+fn run_installed_handler(handler: &Value, cwd: &Path, stdin: &str) -> Output {
+    let command = handler["command"].as_str().expect("handler command");
+    let arguments: Vec<&str> = handler["args"]
+        .as_array()
+        .expect("handler args")
+        .iter()
+        .map(|argument| argument.as_str().expect("string argument"))
+        .collect();
+    let mut child = Command::new(command)
+        .args(arguments)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn installed exec-form handler");
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(stdin.as_bytes())
+        .expect("write handler stdin");
+    child.wait_with_output().expect("wait for handler")
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -289,6 +314,37 @@ fn install_bootstrap_dispatch_doctor_and_uninstall_are_end_to_end() {
         &root,
         None,
     ));
+    let claude_settings: Value =
+        serde_json::from_slice(&fs::read(claude_home.join("settings.json")).unwrap()).unwrap();
+    let claude_handler = claude_settings["hooks"]["PreToolUse"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+        .find(|handler| {
+            handler["args"]
+                .as_array()
+                .is_some_and(|args| args.get(1) == Some(&serde_json::json!("claude-code")))
+        })
+        .unwrap();
+    let claude_input = format!(
+        "{{\"session_id\":\"claude-session\",\"cwd\":{},\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_use_id\":\"claude-tool\",\"tool_input\":{{\"command\":\"rm .project-brain/config.json\"}}}}",
+        serde_json::to_string(project.to_str().unwrap()).unwrap()
+    );
+    let claude_process = run_installed_handler(claude_handler, &project, &claude_input);
+    assert_success(&claude_process);
+    let claude_decision: Value =
+        serde_json::from_slice(&claude_process.stdout).unwrap_or_else(|error| {
+            panic!(
+                "installed Claude handler returned invalid JSON: {error}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&claude_process.stdout),
+                String::from_utf8_lossy(&claude_process.stderr)
+            )
+        });
+    assert_eq!(
+        claude_decision["hookSpecificOutput"]["permissionDecision"], "deny",
+        "unexpected Claude decision: {claude_decision}"
+    );
     let claude_doctor = run(
         &launcher,
         &[
@@ -384,12 +440,12 @@ fn install_bootstrap_dispatch_doctor_and_uninstall_are_end_to_end() {
 fn assert_claude_hooks_installed(settings: &Value) {
     assert_eq!(settings["language"], "chinese");
     assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
-    for event in [
-        "SessionStart",
-        "UserPromptSubmit",
-        "PreToolUse",
-        "PostToolUse",
-        "Stop",
+    for (event, event_arg) in [
+        ("SessionStart", "session-start"),
+        ("UserPromptSubmit", "user-prompt-submit"),
+        ("PreToolUse", "pre-tool-use"),
+        ("PostToolUse", "post-tool-use"),
+        ("Stop", "stop"),
     ] {
         let managed = settings["hooks"][event]
             .as_array()
@@ -397,14 +453,20 @@ fn assert_claude_hooks_installed(settings: &Value) {
             .iter()
             .flat_map(|group| group["hooks"].as_array().unwrap())
             .find(|handler| {
-                handler["command"]
-                    .as_str()
-                    .is_some_and(|command| command.contains(" dispatch claude-code "))
+                handler["args"] == serde_json::json!(["dispatch", "claude-code", event_arg])
             })
             .unwrap();
         assert_eq!(managed["type"], "command");
         assert_eq!(managed["timeout"], 10);
+        assert_eq!(
+            managed["statusMessage"],
+            "Project Brain deterministic governance"
+        );
+        let command = Path::new(managed["command"].as_str().unwrap());
+        assert!(command.is_absolute());
+        assert!(command.is_file());
         assert!(managed.get("commandWindows").is_none());
+        assert!(managed.get("shell").is_none());
     }
 }
 
@@ -415,9 +477,7 @@ fn drift_claude_pre_tool_timeout(settings: &mut Value) {
         .iter_mut()
         .find(|group| {
             group["hooks"].as_array().unwrap().iter().any(|handler| {
-                handler["command"]
-                    .as_str()
-                    .is_some_and(|command| command.contains(" dispatch claude-code "))
+                handler["args"] == serde_json::json!(["dispatch", "claude-code", "pre-tool-use"])
             })
         })
         .unwrap();

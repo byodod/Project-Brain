@@ -216,7 +216,9 @@ project-brain install-hooks claude-code
 
 可用 `--claude-home` 显式指定配置根；省略时读取 `CLAUDE_CONFIG_DIR` 或 `~/.claude`。
 安装器只追加五个 Project Brain handler，保留用户字段和现有 hooks；重复安装幂等，检测到
-托管 handler 漂移时拒绝覆盖。卸载同样只删除 manifest 精确记录的 handler。
+托管 handler 漂移时拒绝覆盖。handler 使用 Claude Code 的 `command` + `args` exec form 直接
+启动绝对路径 launcher，不经过 Git Bash、PowerShell 或 POSIX shell。卸载同样只删除 manifest
+精确记录的 handler。
 
 手工验证适配器：
 
