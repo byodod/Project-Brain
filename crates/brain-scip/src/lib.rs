@@ -449,7 +449,7 @@ fn decode_index(
         head_revision: head_revision.to_owned(),
         index_digest: sha256(bytes),
         provider: ProviderDescriptor {
-            id: provider_id(profile),
+            id: provider_contract_id(profile),
             version: format!("contract-{}", profile.contract_version),
             identity_quality: IdentityQuality::Semantic,
         },
@@ -1002,7 +1002,10 @@ fn validate_import_profile(profile: &ScipImportProfile) -> Result<(), ScipError>
     Ok(())
 }
 
-fn provider_id(profile: &ScipImportProfile) -> String {
+/// 返回配置契约对应的稳定 Provider ID。
+///
+/// 该 ID 同时用于快照命名空间与存储查询；调用方不得根据 producer 版本临时拼接。
+pub fn provider_contract_id(profile: &ScipImportProfile) -> String {
     let raw = format!(
         "{}-{}-contract-{}",
         profile.id, profile.producer, profile.contract_version

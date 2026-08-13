@@ -94,7 +94,8 @@ profile/root 与工作区前后指纹全部通过后，才进入 semantic snapsh
         │
         ├── audit_events 本地派生记录、不进入版本控制
         ├── adapter_audit_events 按项目/适配器隔离的事件、结果、延迟与失败
-        └── symbol graph 按 project_key 隔离、可从工作区完整重建的派生索引
+        ├── symbol graph 按 project_key 隔离、可从工作区完整重建的派生索引
+        └── semantic source manifest 快照实际覆盖的完整 Document 证据
 
 <ProjectBrainData>/state/providers.json
         │
@@ -107,8 +108,8 @@ SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照�
 进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
 符号 ID、快照 revision、节点/边主键、查询和墓碑更新都包含 `project_key`。数据库 schema v4
 首次建立这组项目隔离约束；对应迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与
-adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v5，并在这些约束上
-增加独立的语义血缘账本。
+adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v7，并在这些约束上
+增加独立的语义血缘账本、append-only 来源证明和不可伪造的源码 Document manifest。
 数据库迁移拒绝缺失或非整数的已有 `schema_version`，不会把损坏元数据静默当作 v1。
 Adapter 审计依赖 SQLite 唯一约束和 busy timeout，使并发连接对同一项目事件收敛到首次 outcome；
 失败记录可在重开数据库后由成功重试升级，后续重复成功不能覆盖首次成功。
@@ -128,12 +129,17 @@ confirmed / rejected / superseded / invalidated
            └── never rewrites SymbolNode / tombstone / snapshot
 ```
 
-SQLite schema v6 保存 semantic snapshots、append-only source attestations、symbol observations、
-candidate、evidence 和 decision。
+SQLite schema v7 保存 semantic snapshots、append-only source attestations、source manifests、
+symbol observations、candidate、evidence 和 decision。
 Candidate endpoint 唯一键负责算法重跑幂等，算法版本只产生新的 evidence observation；人工状态
 永远不会被 generator 恢复或覆盖。Partial unique indexes 约束同 snapshot pair 中 predecessor 与
 successor 一对一，竞争确认不会自动选择赢家。`request_id + request_hash` 提供 at-least-once 命令
 提交的幂等与碰撞检测，状态更新使用 revision CAS。
+
+Source manifest 与新快照在同一 SQLite 事务内写入，并保存路径/language/内容摘要、数量和 manifest
+摘要。旧库迁移绝不从“仍有 symbol 的文件”推断完整文档集合；只有真实重跑完整 Provider 输入才可
+补录。索引报告与显式 doctor 将 manifest 和 Git 当前文件集合比较，区分 complete、partial、stale、
+not_indexed 与 unverifiable，避免“Provider 成功退出”等价于“全仓源码已覆盖”的错误推论。
 
 ## 阻断权限
 

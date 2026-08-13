@@ -275,6 +275,8 @@ Lineage 连接两个历史 observation，而不是合并或重命名 `SymbolNode
 
 - `semantic_snapshots`：按项目、provider profile/contract 排序的不可变导入事实；
 - `semantic_snapshot_attestations`：同一快照在不同已验证 worktree 状态上的 append-only 来源证明；
+- `semantic_source_manifests`：每个 v7+ 快照的完整 Document 清单计数与摘要；
+- `semantic_source_observations`：清单内路径、language、内容摘要和语法状态；
 - `semantic_symbol_observations`：某次快照实际看到的 symbol；
 - `semantic_lineage_candidates`：endpoint 唯一、当前状态 materialization；
 - `semantic_lineage_evidence`：算法 ID、版本、输入摘要、结构化证据与置信度的 append-only 观察；
@@ -304,9 +306,15 @@ proposed | confirmed | rejected | superseded | invalidated
    snapshot 或跨 provider 建 equivalence；
 8. 已导入但不是当前最新的历史 snapshot 不能重新应用为当前符号图。
 
-SQLite schema v6 保存 semantic snapshots、source attestations、symbol observations、candidate、evidence
-和 decision。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升为硬证据。同一
-snapshot 的可信重跑只追加 attestation，不改写 symbol observations 或人工 lineage 状态。
+SQLite schema v7 保存 semantic snapshots、source attestations、source manifests、symbol observations、
+candidate、evidence 和 decision。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升
+为硬证据，也不会从现存 symbol 反推缺失 Document。真实重跑相同 snapshot 时可以首次补录 manifest；
+可信重跑只追加 attestation，不改写 symbol observations 或人工 lineage 状态。
+
+覆盖率是独立的确定性证据：对 Provider profile 显式映射的 Rust/Python/C#/VB/F# language，比较
+Git 已跟踪及未忽略、位于声明 roots 且扩展名属于该 language 契约的文件，与 SCIP Document 清单。
+未知 language 必须报告 `unverifiable`，不得猜扩展名。已有快照的 `partial` 或与当前 worktree/HEAD
+不一致的 `stale` 会使显式 `doctor` 降级；从未索引则只报告 `not_indexed` warning。
 
 ## Symbol scope 与证据等级
 

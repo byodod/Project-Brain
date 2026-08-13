@@ -105,7 +105,10 @@ pub struct DoctorReport {
     pub providers: CheckState,
     pub codex_hooks: CheckState,
     pub codex_trust_state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_coverage: Option<crate::scip_index::SemanticCoverageDoctorReport>,
     pub issues: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -476,7 +479,9 @@ pub fn doctor(
                 providers: CheckState::Fail,
                 codex_hooks: CheckState::Fail,
                 codex_trust_state: "not_programmatically_verifiable",
+                semantic_coverage: None,
                 issues: vec![error.to_string()],
+                warnings: Vec::new(),
             };
         }
     };
@@ -537,7 +542,9 @@ pub fn doctor(
         providers: providers.ready.into(),
         codex_hooks: codex_hooks_valid.into(),
         codex_trust_state: "not_programmatically_verifiable",
+        semantic_coverage: None,
         issues,
+        warnings: Vec::new(),
     }
 }
 

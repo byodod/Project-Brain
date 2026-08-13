@@ -129,13 +129,30 @@ impl App {
         install_root: Option<&Path>,
         codex_home: Option<&Path>,
     ) -> Result<(), AppError> {
-        let report = setup::doctor(
+        let mut report = setup::doctor(
             install_root,
             codex_home,
             &self.root,
             &self.config.project_key,
             &self.config.semantic_providers,
         );
+        let semantic_coverage = scip_index::doctor_coverage(
+            &self.root,
+            &self.config.project_key,
+            &self.config.language_profiles,
+            &self.config.semantic_providers,
+            &self.store,
+        );
+        report
+            .issues
+            .extend(semantic_coverage.issues.iter().cloned());
+        report
+            .warnings
+            .extend(semantic_coverage.warnings.iter().cloned());
+        if !semantic_coverage.issues.is_empty() {
+            report.status = "degraded";
+        }
+        report.semantic_coverage = Some(semantic_coverage);
         println!("{}", pretty_json(&report)?);
         if report.is_ready() {
             Ok(())
@@ -478,6 +495,29 @@ impl App {
             }))?
         );
         Ok(())
+    }
+
+    pub fn provider_coverage(&self, require_indexed: bool) -> Result<(), AppError> {
+        let report = scip_index::doctor_coverage(
+            &self.root,
+            &self.config.project_key,
+            &self.config.language_profiles,
+            &self.config.semantic_providers,
+            &self.store,
+        );
+        println!("{}", pretty_json(&report)?);
+        if report.issues.is_empty() && (!require_indexed || report.status == "ready") {
+            Ok(())
+        } else {
+            let mut reasons = report.issues.clone();
+            if reasons.is_empty() {
+                reasons.push(format!(
+                    "semantic coverage status={}，但 --require-indexed 要求 ready",
+                    report.status
+                ));
+            }
+            Err(AppError::DoctorDegraded(reasons.join("；")))
+        }
     }
 
     pub fn symbols(

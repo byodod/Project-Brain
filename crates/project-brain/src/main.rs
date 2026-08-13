@@ -184,6 +184,13 @@ enum ProviderCommand {
         #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
     },
+
+    /// 检查最新语义快照对声明源码的实际覆盖；partial/stale 返回非零
+    Coverage {
+        /// 同时要求每个 profile 已索引且覆盖率可验证为 complete
+        #[arg(long)]
+        require_indexed: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -391,6 +398,9 @@ fn main() -> ExitCode {
                     timeout_seconds,
                 } => {
                     app.index_with_provider(cli.install_root.as_deref(), &profile, timeout_seconds)
+                }
+                ProviderCommand::Coverage { require_indexed } => {
+                    app.provider_coverage(require_indexed)
                 }
             })
         }

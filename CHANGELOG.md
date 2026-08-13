@@ -14,6 +14,7 @@
 - Project-scoped 机器 Provider 注册、哈希漂移检查、固定 argv 安全 Runner、源码指纹门禁与有界失败审计。
 - 仓库级 symbol-scoped rules、confirmed-lineage-only 解析、SQLite v6 source attestation、证据等级与
   PreToolUse/Stop 语义门控。
+- SQLite v7 semantic source manifest、逐语言 expected/indexed 覆盖率报告与 partial/stale doctor 降级。
 
 ### Security
 

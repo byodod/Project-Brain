@@ -16,7 +16,7 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - 按项目显式配置的 SCIP 导入与机器级安全 Runner，首批契约覆盖 rust-analyzer、scip-dotnet 与 scip-python；
 - 开放 language ID、逐文档语言映射和四态语义能力声明；
 - Project-scoped semantic lineage ledger、不可变证据与 append-only 显式裁决；
-- SQLite schema v1→v4 迁移、按项目隔离的符号 removed 历史与幂等增量更新；
+- SQLite schema v1→v7 迁移、按项目隔离的符号 removed 历史与幂等增量更新；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
 ## 核心原则
@@ -350,6 +350,11 @@ Node entrypoint 哈希，关闭 stdin，使用环境白名单和净化后的 `PA
 都会核对完整工作区内容指纹；源码变化、超时、非零退出、二进制漂移、链接输出、过大/非法 SCIP
 均不会提交 semantic snapshot。过程 provenance 与失败只写入机器级有界 JSONL audit。
 
+每次导入同时输出 `coverage`：Project Brain 把 Git 已跟踪及未忽略文件与 Provider 实际 Document
+逐语言比较。Rust、Python、C#、Visual Basic、F# 使用显式扩展名契约；自定义语言不会被猜测，
+而是报告 `unverifiable`。报告包含 expected/indexed/provider document 数量以及最多 200 条缺失和
+Provider-only 路径样本。`partial` 仍允许保存可用的语义事实，但绝不能被误读成全仓覆盖。
+
 如果 `.scip` 由 CI 或其他流程生成，仍可按项目内稳定 profile ID 手工导入：
 
 ```text
@@ -360,6 +365,20 @@ project-brain index-scip --provider rust-main --input index.scip
 Hook 硬阻断权。只有 `provider index` 通过当前机器已登记且哈希未漂移的 executable 产生的快照，
 才追加 `trusted_provider` attestation；证明同时固定 registration ID、executable SHA-256、SCIP
 artifact SHA-256、Git HEAD 与完整 worktree 指纹。
+
+`doctor` 会读取 SQLite v7 中与快照同事务保存的 source manifest，并按当前 worktree/HEAD 重新计算
+覆盖率。已有索引若为 `partial`、`stale`、损坏或来自未保存 manifest 的旧库，doctor 会降级并返回
+非零；尚未运行过索引只报告 `not_indexed` warning，不阻断首次 bootstrap。旧库迁移不会从符号表
+猜测文档清单；必须真实重跑一次 `provider index` 或 `index-scip` 才能补录 manifest。
+
+只运行覆盖率 CI 门禁而不检查用户级 Hooks：
+
+```text
+project-brain provider coverage --require-indexed
+```
+
+`partial`、`stale`、存储损坏始终返回非零；`--require-indexed` 还会把 `not_indexed` 与
+`unverifiable` 视为失败。
 
 一个 `.scip` 可以逐文档映射多种语言，例如同一 scip-dotnet 索引内的 C# 与 Visual Basic。
 Python 的空 `Document.language` 只有在 profile 显式声明 `raw_language: null` 和

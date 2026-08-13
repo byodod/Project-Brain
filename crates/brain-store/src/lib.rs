@@ -9,15 +9,15 @@ use brain_core::{
 use brain_symbols::{
     GraphDelta, IdentityQuality, LINEAGE_EVIDENCE_SCHEMA_VERSION, LineageCandidateProposal,
     LineageState, LineageSymbolObservation, PathRenameEvidence, SYMBOL_PROTOCOL_VERSION,
-    SourceLanguage, SymbolNode, SymbolSnapshot, SymbolStatus, propose_lineage_candidates,
-    symbol_id,
+    SourceFileState, SourceLanguage, SymbolNode, SymbolSnapshot, SymbolStatus,
+    propose_lineage_candidates, symbol_id,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const DATABASE_SCHEMA_VERSION: i64 = 6;
+const DATABASE_SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -105,6 +105,15 @@ pub struct SemanticSnapshotSource {
     pub provider_registration_id: Option<String>,
     pub executable_sha256: Option<String>,
     pub artifact_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SemanticSourceManifest {
+    pub snapshot_fingerprint: String,
+    pub source: SemanticSnapshotSource,
+    /// `false` 表示快照来自 v7 之前，存储层不会凭空补造当时的文档清单。
+    pub recorded: bool,
+    pub sources: Vec<SourceFileState>,
 }
 
 impl SemanticSnapshotSource {
@@ -481,6 +490,41 @@ impl BrainStore {
                     project_key, provider_profile_id, provider_contract_id,
                     snapshot_fingerprint, sequence DESC
                  );
+             CREATE TABLE IF NOT EXISTS semantic_source_manifests (
+                 project_key TEXT NOT NULL,
+                 provider_profile_id TEXT NOT NULL,
+                 provider_contract_id TEXT NOT NULL,
+                 snapshot_fingerprint TEXT NOT NULL,
+                 source_count INTEGER NOT NULL CHECK(source_count >= 0),
+                 manifest_sha256 TEXT NOT NULL,
+                 PRIMARY KEY(project_key, provider_profile_id, provider_contract_id,
+                             snapshot_fingerprint),
+                 FOREIGN KEY(project_key, provider_profile_id, provider_contract_id,
+                             snapshot_fingerprint)
+                     REFERENCES semantic_snapshots(project_key, provider_profile_id,
+                                                   provider_contract_id, snapshot_fingerprint)
+                     ON DELETE RESTRICT
+             );
+             CREATE TABLE IF NOT EXISTS semantic_source_observations (
+                 project_key TEXT NOT NULL,
+                 provider_profile_id TEXT NOT NULL,
+                 provider_contract_id TEXT NOT NULL,
+                 snapshot_fingerprint TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 language_id TEXT NOT NULL,
+                 content_fingerprint TEXT NOT NULL,
+                 has_syntax_errors INTEGER NOT NULL CHECK(has_syntax_errors IN (0, 1)),
+                 PRIMARY KEY(project_key, provider_profile_id, provider_contract_id,
+                             snapshot_fingerprint, path),
+                 FOREIGN KEY(project_key, provider_profile_id, provider_contract_id,
+                             snapshot_fingerprint)
+                     REFERENCES semantic_source_manifests(project_key, provider_profile_id,
+                                                          provider_contract_id,
+                                                          snapshot_fingerprint)
+                     ON DELETE RESTRICT
+             );
+             CREATE INDEX IF NOT EXISTS idx_semantic_source_observation_path
+                 ON semantic_source_observations(project_key, path, snapshot_fingerprint);
              CREATE TABLE IF NOT EXISTS semantic_symbol_observations (
                  project_key TEXT NOT NULL,
                  provider_profile_id TEXT NOT NULL,
@@ -664,6 +708,8 @@ impl BrainStore {
             ],
             |row| row.get(0),
         )?;
+        let source_manifest_recorded =
+            semantic_source_manifest_recorded(&transaction, snapshot, provider_profile_id)?;
         let latest_snapshot = transaction
             .query_row(
                 "SELECT snapshot_fingerprint FROM semantic_snapshots
@@ -729,6 +775,11 @@ impl BrainStore {
             (candidates_inserted, evidence_inserted) =
                 persist_lineage_proposals(&transaction, &proposals, now)?;
         }
+        if !source_manifest_recorded {
+            // v6 及更早快照只有在真实 Provider/离线导入再次提交同一完整快照时才补录，
+            // 迁移本身绝不从符号表反推缺失文档。
+            persist_semantic_source_manifest(&transaction, snapshot, provider_profile_id)?;
+        }
         persist_semantic_attestation(&transaction, snapshot, provider_profile_id, source, now)?;
         transaction.commit()?;
         Ok(SemanticApplyResult {
@@ -737,6 +788,83 @@ impl BrainStore {
             candidates_inserted,
             evidence_inserted,
         })
+    }
+
+    /// 读取某个 Provider 契约的最新、可审计源码清单。
+    ///
+    /// v7 之前的快照会返回 `recorded=false`，调用方必须将其视为不可验证，而不是空清单。
+    ///
+    /// # Errors
+    ///
+    /// 查询边界无效、SQLite 读取失败或 manifest 完整性校验失败时返回错误。
+    pub fn latest_semantic_source_manifest(
+        &self,
+        project_key: &str,
+        provider_profile_id: &str,
+        provider_contract_id: &str,
+    ) -> Result<Option<SemanticSourceManifest>, StoreError> {
+        if !is_valid_project_key(project_key)
+            || provider_profile_id.trim().is_empty()
+            || provider_contract_id.trim().is_empty()
+        {
+            return Err(StoreError::InvalidSnapshot(
+                "源码清单查询边界无效".to_owned(),
+            ));
+        }
+        let boundary = SemanticScopeBoundary {
+            project_key,
+            provider_profile_id,
+            provider_contract_id,
+            language_id: "",
+        };
+        let Some(latest) = semantic_snapshot_chain(&self.connection, &boundary, "")?.pop() else {
+            return Ok(None);
+        };
+        let fingerprint = latest.fingerprint;
+        let source = latest.source;
+        let manifest = self
+            .connection
+            .query_row(
+                "SELECT source_count, manifest_sha256
+                 FROM semantic_source_manifests
+                 WHERE project_key = ?1 AND provider_profile_id = ?2
+                   AND provider_contract_id = ?3 AND snapshot_fingerprint = ?4",
+                params![
+                    project_key,
+                    provider_profile_id,
+                    provider_contract_id,
+                    fingerprint,
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((source_count, expected_hash)) = manifest else {
+            return Ok(Some(SemanticSourceManifest {
+                snapshot_fingerprint: fingerprint,
+                source,
+                recorded: false,
+                sources: Vec::new(),
+            }));
+        };
+        let source_count = u64::try_from(source_count).map_err(|_| {
+            StoreError::Integrity(format!(
+                "semantic source manifest={fingerprint} 包含负数 source_count"
+            ))
+        })?;
+        let sources = semantic_source_observations(&self.connection, &boundary, &fingerprint)?;
+        if u64::try_from(sources.len()).unwrap_or(u64::MAX) != source_count
+            || semantic_source_manifest_hash(&sources) != expected_hash
+        {
+            return Err(StoreError::Integrity(format!(
+                "semantic source manifest={fingerprint} 计数或摘要不匹配"
+            )));
+        }
+        Ok(Some(SemanticSourceManifest {
+            snapshot_fingerprint: fingerprint,
+            source,
+            recorded: true,
+            sources,
+        }))
     }
 
     /// 查询当前项目的 lineage ledger，不读取或改写符号身份。
@@ -1528,11 +1656,11 @@ fn semantic_snapshot_chain(
                           ORDER BY a.sequence DESC LIMIT 1), s.artifact_sha256)
          FROM semantic_snapshots s
          WHERE s.project_key = ?1 AND s.provider_profile_id = ?2 AND s.provider_contract_id = ?3
-           AND s.sequence >= COALESCE((
+           AND (?4 = '' OR s.sequence >= COALESCE((
                SELECT sequence FROM semantic_snapshots
                WHERE project_key = ?1 AND provider_profile_id = ?2
                  AND provider_contract_id = ?3 AND snapshot_fingerprint = ?4
-           ), 9223372036854775807)
+           ), 9223372036854775807))
          ORDER BY s.sequence",
     )?;
     let rows = statement
@@ -1580,6 +1708,53 @@ fn semantic_snapshot_chain(
                 })
             },
         )
+        .collect()
+}
+
+fn semantic_source_observations(
+    connection: &Connection,
+    boundary: &SemanticScopeBoundary<'_>,
+    snapshot_fingerprint: &str,
+) -> Result<Vec<SourceFileState>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT path, language_id, content_fingerprint, has_syntax_errors
+         FROM semantic_source_observations
+         WHERE project_key = ?1 AND provider_profile_id = ?2
+           AND provider_contract_id = ?3 AND snapshot_fingerprint = ?4
+         ORDER BY path",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                boundary.project_key,
+                boundary.provider_profile_id,
+                boundary.provider_contract_id,
+                snapshot_fingerprint,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(path, language, content_fingerprint, has_syntax_errors)| {
+            let language =
+                SourceLanguage::parse(&language).ok_or_else(|| StoreError::InvalidSymbolField {
+                    field: "semantic_source_language",
+                    value: language,
+                })?;
+            Ok(SourceFileState {
+                path,
+                language,
+                content_fingerprint,
+                has_syntax_errors,
+            })
+        })
         .collect()
 }
 
@@ -1737,6 +1912,93 @@ fn unresolved_scope(
         lineage_decision_ids: Vec::new(),
         reason: Some(reason.to_owned()),
     }
+}
+
+fn semantic_source_manifest_recorded(
+    transaction: &Transaction<'_>,
+    snapshot: &SymbolSnapshot,
+    provider_profile_id: &str,
+) -> Result<bool, StoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM semantic_source_manifests
+                 WHERE project_key = ?1 AND provider_profile_id = ?2
+                   AND provider_contract_id = ?3 AND snapshot_fingerprint = ?4
+             )",
+            params![
+                snapshot.project_key,
+                provider_profile_id,
+                snapshot.provider.id,
+                snapshot.source_revision
+            ],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
+fn persist_semantic_source_manifest(
+    transaction: &Transaction<'_>,
+    snapshot: &SymbolSnapshot,
+    provider_profile_id: &str,
+) -> Result<(), StoreError> {
+    let source_count = i64::try_from(snapshot.sources.len()).map_err(|_| {
+        StoreError::InvalidSnapshot("源文件清单数量超出 SQLite 整数范围".to_owned())
+    })?;
+    transaction.execute(
+        "INSERT INTO semantic_source_manifests(
+             project_key, provider_profile_id, provider_contract_id,
+             snapshot_fingerprint, source_count, manifest_sha256
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            snapshot.project_key,
+            provider_profile_id,
+            snapshot.provider.id,
+            snapshot.source_revision,
+            source_count,
+            semantic_source_manifest_hash(&snapshot.sources),
+        ],
+    )?;
+    let mut statement = transaction.prepare_cached(
+        "INSERT INTO semantic_source_observations(
+             project_key, provider_profile_id, provider_contract_id,
+             snapshot_fingerprint, path, language_id,
+             content_fingerprint, has_syntax_errors
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for source in &snapshot.sources {
+        statement.execute(params![
+            snapshot.project_key,
+            provider_profile_id,
+            snapshot.provider.id,
+            snapshot.source_revision,
+            source.path,
+            source.language.as_str(),
+            source.content_fingerprint,
+            source.has_syntax_errors,
+        ])?;
+    }
+    Ok(())
+}
+
+fn semantic_source_manifest_hash(sources: &[SourceFileState]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"project-brain/semantic-source-manifest/v1\0");
+    let mut ordered = sources.iter().collect::<Vec<_>>();
+    ordered
+        .sort_by(|left, right| (&left.path, &left.language).cmp(&(&right.path, &right.language)));
+    for source in ordered {
+        for value in [
+            source.path.as_bytes(),
+            source.language.as_str().as_bytes(),
+            source.content_fingerprint.as_bytes(),
+        ] {
+            digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+            digest.update(value);
+        }
+        digest.update([u8::from(source.has_syntax_errors)]);
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn persist_semantic_attestation(
@@ -2680,9 +2942,24 @@ mod tests {
     };
     use rusqlite::Connection;
 
-    use super::{AdapterRecordResult, BrainStore, SemanticSnapshotSource, StoreError};
+    use super::{
+        AdapterRecordResult, BrainStore, SemanticSnapshotSource, StoreError,
+        semantic_source_manifest_hash,
+    };
 
     const PROJECT_KEY: &str = "project_test";
+
+    #[test]
+    fn semantic_source_manifest_hash_is_independent_of_input_order() {
+        let first =
+            SourceFileState::from_source("src/a.rs", SourceLanguage::rust(), b"fn a() {}", false);
+        let second =
+            SourceFileState::from_source("src/b.rs", SourceLanguage::rust(), b"fn b() {}", false);
+        assert_eq!(
+            semantic_source_manifest_hash(&[first.clone(), second.clone()]),
+            semantic_source_manifest_hash(&[second, first])
+        );
+    }
 
     fn provider() -> ProviderDescriptor {
         ProviderDescriptor {
@@ -3125,7 +3402,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 6);
+        assert_eq!(store.database_schema_version().unwrap(), 7);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, false, 10)
@@ -3210,7 +3487,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 6);
+        assert_eq!(store.database_schema_version().unwrap(), 7);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, true, 10)
@@ -3250,7 +3527,7 @@ mod tests {
         drop(connection);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 6);
+        assert_eq!(migrated.database_schema_version().unwrap(), 7);
         let legacy_source = migrated
             .connection
             .query_row(
@@ -3276,6 +3553,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attestations, 0);
+        let manifest = migrated
+            .latest_semantic_source_manifest("project_test", "test-main", "contract")
+            .unwrap()
+            .unwrap();
+        assert!(!manifest.recorded);
+        assert!(manifest.sources.is_empty());
         drop(migrated);
         fs::remove_dir_all(root).unwrap();
     }
@@ -3479,6 +3762,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resolved.source, Some(refreshed));
+        let manifest = store
+            .latest_semantic_source_manifest(PROJECT_KEY, "test-main", &semantic_provider().id)
+            .unwrap()
+            .unwrap();
+        assert!(manifest.recorded);
+        assert_eq!(manifest.snapshot_fingerprint, snapshot.source_revision);
+        assert_eq!(manifest.sources, snapshot.sources);
+        assert_eq!(manifest.source.head_revision, "new-clean-head");
         let count: i64 = store
             .connection
             .query_row(
@@ -3488,6 +3779,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn replaying_a_legacy_snapshot_records_manifest_from_real_input() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let snapshot = semantic_snapshot(
+            "semantic-legacy-replay",
+            vec![semantic_symbol("stable", "src/lib.rs", "stable-key")],
+        );
+        apply_semantic(&store, &snapshot);
+        store
+            .connection
+            .execute("DELETE FROM semantic_source_observations", [])
+            .unwrap();
+        store
+            .connection
+            .execute("DELETE FROM semantic_source_manifests", [])
+            .unwrap();
+        assert!(
+            !store
+                .latest_semantic_source_manifest(PROJECT_KEY, "test-main", &semantic_provider().id,)
+                .unwrap()
+                .unwrap()
+                .recorded
+        );
+
+        let replay = store
+            .apply_semantic_snapshot(
+                &snapshot,
+                "test-main",
+                &semantic_observations(&snapshot),
+                &[],
+                &SemanticSnapshotSource::offline(
+                    "d".repeat(64),
+                    "legacy-replay-head".to_owned(),
+                    true,
+                ),
+            )
+            .unwrap();
+        assert!(!replay.snapshot_inserted);
+        let manifest = store
+            .latest_semantic_source_manifest(PROJECT_KEY, "test-main", &semantic_provider().id)
+            .unwrap()
+            .unwrap();
+        assert!(manifest.recorded);
+        assert_eq!(manifest.sources, snapshot.sources);
     }
 
     #[test]
@@ -3818,7 +4155,7 @@ mod tests {
         drop(store);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 6);
+        assert_eq!(migrated.database_schema_version().unwrap(), 7);
         assert_eq!(
             migrated
                 .list_symbols(PROJECT_KEY, None, false, 10)
