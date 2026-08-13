@@ -340,3 +340,153 @@ fn install_bootstrap_dispatch_doctor_and_uninstall_are_end_to_end() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+fn assert_claude_hooks_installed(settings: &Value) {
+    assert_eq!(settings["language"], "chinese");
+    assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+    ] {
+        let managed = settings["hooks"][event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["hooks"].as_array().unwrap())
+            .find(|handler| {
+                handler["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains(" dispatch claude-code "))
+            })
+            .unwrap();
+        assert_eq!(managed["type"], "command");
+        assert_eq!(managed["timeout"], 10);
+        assert!(managed.get("commandWindows").is_none());
+    }
+}
+
+fn drift_claude_pre_tool_timeout(settings: &mut Value) {
+    let managed_group = settings["hooks"]["PreToolUse"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|group| {
+            group["hooks"].as_array().unwrap().iter().any(|handler| {
+                handler["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains(" dispatch claude-code "))
+            })
+        })
+        .unwrap();
+    managed_group["hooks"][0]["timeout"] = serde_json::json!(99);
+}
+
+fn assert_only_user_claude_hook_remains(settings: &Value) {
+    assert_eq!(settings["language"], "chinese");
+    assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        settings["hooks"]["Stop"][0]["hooks"][0]["command"],
+        "user-stop"
+    );
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+    ] {
+        assert!(
+            settings["hooks"][event]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+    }
+}
+
+#[test]
+fn claude_hook_install_is_atomic_idempotent_and_preserves_user_settings() {
+    let root = temp_root("claude-hooks");
+    let install_root = root.join("machine/Project Brain");
+    let claude_home = root.join("Claude Home");
+    fs::create_dir_all(&claude_home).unwrap();
+    let user_settings = serde_json::json!({
+        "language": "chinese",
+        "hooks": {
+            "Stop": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "user-stop",
+                    "timeout": 3
+                }]
+            }]
+        }
+    });
+    fs::write(
+        claude_home.join("settings.json"),
+        serde_json::to_vec_pretty(&user_settings).unwrap(),
+    )
+    .unwrap();
+
+    let source = PathBuf::from(env!("CARGO_BIN_EXE_project-brain"));
+    assert_success(&run(
+        &source,
+        &["--install-root", install_root.to_str().unwrap(), "install"],
+        &root,
+        None,
+    ));
+    let launcher = install_root.join("bin").join(source.file_name().unwrap());
+    let install_args = [
+        "--install-root",
+        install_root.to_str().unwrap(),
+        "--claude-home",
+        claude_home.to_str().unwrap(),
+        "install-hooks",
+        "claude-code",
+    ];
+    let first = run(&launcher, &install_args, &root, None);
+    assert_success(&first);
+    let first_report: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_report["changed"], true);
+    assert_eq!(first_report["managed_handler_count"], 5);
+
+    let settings_path = claude_home.join("settings.json");
+    let installed_bytes = fs::read(&settings_path).unwrap();
+    let installed: Value = serde_json::from_slice(&installed_bytes).unwrap();
+    assert_claude_hooks_installed(&installed);
+
+    let second = run(&launcher, &install_args, &root, None);
+    assert_success(&second);
+    let second_report: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second_report["changed"], false);
+    assert_eq!(fs::read(&settings_path).unwrap(), installed_bytes);
+
+    let mut drifted = installed.clone();
+    drift_claude_pre_tool_timeout(&mut drifted);
+    let drifted_bytes = serde_json::to_vec_pretty(&drifted).unwrap();
+    fs::write(&settings_path, &drifted_bytes).unwrap();
+    let drift_install = run(&launcher, &install_args, &root, None);
+    assert!(!drift_install.status.success());
+    assert_eq!(fs::read(&settings_path).unwrap(), drifted_bytes);
+
+    fs::write(&settings_path, installed_bytes).unwrap();
+    let uninstall = run(
+        &launcher,
+        &[
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--claude-home",
+            claude_home.to_str().unwrap(),
+            "uninstall-hooks",
+            "claude-code",
+        ],
+        &root,
+        None,
+    );
+    assert_success(&uninstall);
+    let after: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+    assert_only_user_claude_hook_remains(&after);
+
+    fs::remove_dir_all(root).unwrap();
+}

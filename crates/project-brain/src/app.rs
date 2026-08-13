@@ -72,21 +72,21 @@ impl App {
 
     pub fn install_hooks(
         install_root: Option<&Path>,
-        codex_home: Option<&Path>,
+        agent_home: Option<&Path>,
         agent: AgentKind,
     ) -> Result<(), AppError> {
         match agent {
             AgentKind::Codex => {
                 println!(
                     "{}",
-                    pretty_json(&setup::install_codex_hooks(install_root, codex_home)?)?
+                    pretty_json(&setup::install_codex_hooks(install_root, agent_home)?)?
                 );
             }
             AgentKind::ClaudeCode => {
-                return Err(AppError::Setup(
-                    "Claude Code adapter 已可直接运行；用户级 Hook 原子安装器尚未在本提交启用"
-                        .to_owned(),
-                ));
+                println!(
+                    "{}",
+                    pretty_json(&setup::install_claude_hooks(install_root, agent_home)?)?
+                );
             }
         }
         Ok(())
@@ -94,7 +94,7 @@ impl App {
 
     pub fn uninstall_hooks(
         install_root: Option<&Path>,
-        codex_home: Option<&Path>,
+        agent_home: Option<&Path>,
         agent: AgentKind,
         force: bool,
     ) -> Result<(), AppError> {
@@ -104,15 +104,20 @@ impl App {
                     "{}",
                     pretty_json(&setup::uninstall_codex_hooks(
                         install_root,
-                        codex_home,
+                        agent_home,
                         force,
                     )?)?
                 );
             }
             AgentKind::ClaudeCode => {
-                return Err(AppError::Setup(
-                    "Claude Code 用户级 Hook 安装器尚未启用，没有可卸载的托管集成".to_owned(),
-                ));
+                println!(
+                    "{}",
+                    pretty_json(&setup::uninstall_claude_hooks(
+                        install_root,
+                        agent_home,
+                        force,
+                    )?)?
+                );
             }
         }
         Ok(())

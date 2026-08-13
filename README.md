@@ -206,8 +206,15 @@ project-brain capabilities claude-code
 project-brain hook claude-code pre-tool-use
 ```
 
-本阶段只启用直接协议入口；Claude Code 用户级 `settings.json` 原子安装器尚未开放，
-`install-hooks claude-code` 会明确拒绝，而不会写入未经完整漂移测试的配置。
+安装 Claude Code 用户级 `settings.json` dispatcher：
+
+```text
+project-brain install-hooks claude-code
+```
+
+可用 `--claude-home` 显式指定配置根；省略时读取 `CLAUDE_CONFIG_DIR` 或 `~/.claude`。
+安装器只追加五个 Project Brain handler，保留用户字段和现有 hooks；重复安装幂等，检测到
+托管 handler 漂移时拒绝覆盖。卸载同样只删除 manifest 精确记录的 handler。
 
 手工验证适配器：
 
@@ -549,8 +556,8 @@ crates/
 
 ## 当前限制
 
-- Codex 已提供直接适配器和用户级 Hook 安装器；Claude Code 已提供直接适配器，但用户级 Hook
-  安装器尚未启用；Prime Agent 仍未实现。
+- Codex 与 Claude Code 已提供直接适配器和用户级 Hook 安装器；当前 `doctor` 的 Hook 就绪字段仍
+  只覆盖 Codex，Claude 安装健康检查将在后续拆成按 adapter 选择；Prime Agent 仍未实现。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。

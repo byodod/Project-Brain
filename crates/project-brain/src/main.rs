@@ -33,6 +33,10 @@ struct Cli {
     #[arg(long, global = true)]
     codex_home: Option<PathBuf>,
 
+    /// Claude Code 配置根；省略时使用 `CLAUDE_CONFIG_DIR` 或 `~/.claude`
+    #[arg(long, global = true)]
+    claude_home: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -392,17 +396,20 @@ fn main() -> ExitCode {
                 codex,
             )
         }),
-        Command::InstallHooks { agent } => App::install_hooks(
-            cli.install_root.as_deref(),
-            cli.codex_home.as_deref(),
-            agent,
-        ),
-        Command::UninstallHooks { agent, force } => App::uninstall_hooks(
-            cli.install_root.as_deref(),
-            cli.codex_home.as_deref(),
-            agent,
-            force,
-        ),
+        Command::InstallHooks { agent } => {
+            let agent_home = match agent {
+                AgentKind::Codex => cli.codex_home.as_deref(),
+                AgentKind::ClaudeCode => cli.claude_home.as_deref(),
+            };
+            App::install_hooks(cli.install_root.as_deref(), agent_home, agent)
+        }
+        Command::UninstallHooks { agent, force } => {
+            let agent_home = match agent {
+                AgentKind::Codex => cli.codex_home.as_deref(),
+                AgentKind::ClaudeCode => cli.claude_home.as_deref(),
+            };
+            App::uninstall_hooks(cli.install_root.as_deref(), agent_home, agent, force)
+        }
         Command::Dispatch { agent, event } => {
             App::dispatch_hook(cli.install_root.as_deref(), agent, event)
         }

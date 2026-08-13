@@ -18,9 +18,17 @@ use crate::{error::AppError, provider};
 const INSTALL_SCHEMA_VERSION: u32 = 1;
 const REGISTRY_SCHEMA_VERSION: u32 = 1;
 const CODEX_INTEGRATION_VERSION: u32 = 1;
+const CLAUDE_INTEGRATION_VERSION: u32 = 1;
 const INSTALL_ROOT_ENV: &str = "PROJECT_BRAIN_INSTALL_ROOT";
 const LAUNCHED_ENV: &str = "PROJECT_BRAIN_LAUNCHED";
 const REQUIRED_CODEX_EVENTS: [&str; 5] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+];
+const REQUIRED_CLAUDE_EVENTS: [&str; 5] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
@@ -49,6 +57,16 @@ struct ProjectRegistry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CodexIntegrationManifest {
+    schema_version: u32,
+    integration_version: u32,
+    target_path: PathBuf,
+    managed_handler_hashes: BTreeMap<String, String>,
+    before_hash: String,
+    after_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ClaudeIntegrationManifest {
     schema_version: u32,
     integration_version: u32,
     target_path: PathBuf,
@@ -458,6 +476,132 @@ pub fn uninstall_codex_hooks(
     })
 }
 
+pub fn install_claude_hooks(
+    explicit_install_root: Option<&Path>,
+    explicit_claude_home: Option<&Path>,
+) -> Result<HookInstallReport, AppError> {
+    let install_root = resolve_install_root(explicit_install_root)?;
+    let _install = ensure_install_ready(&install_root)?;
+    let launcher = stable_launcher_path(&install_root, &env::current_exe()?)?;
+    if !launcher.is_file() {
+        return Err(AppError::Setup(format!(
+            "稳定 launcher 不存在：{}；请重新执行 project-brain install",
+            launcher.display()
+        )));
+    }
+    let claude_home = resolve_claude_home(explicit_claude_home)?;
+    let target = claude_home.join("settings.json");
+    let integration_path = install_root.join("state/integrations/claude-code.json");
+    fs::create_dir_all(&claude_home)?;
+    fs::create_dir_all(integration_path.parent().expect("integration has parent"))?;
+    let _lock = MutationLock::acquire(&install_root.join("state/integrations/claude-code.lock"))?;
+
+    let original = if target.is_file() {
+        fs::read(&target)?
+    } else {
+        b"{}\n".to_vec()
+    };
+    let mut document: Value = serde_json::from_slice(&original)?;
+    require_object(&document, "Claude settings.json 顶层必须是 JSON object")?;
+    let expected_handlers = managed_claude_handlers(&launcher);
+
+    if integration_path.is_file() {
+        let manifest: ClaudeIntegrationManifest = read_json(&integration_path)?;
+        validate_claude_integration_manifest(&manifest, &target)?;
+        let observed = observed_claude_managed_hashes(&document);
+        if observed == manifest.managed_handler_hashes
+            && manifest.managed_handler_hashes == handler_hashes(&expected_handlers)?
+        {
+            return Ok(HookInstallReport {
+                schema_version: CLAUDE_INTEGRATION_VERSION,
+                target_path: target,
+                changed: false,
+                managed_handler_count: expected_handlers.len(),
+                trust_state: "not_programmatically_verifiable",
+            });
+        }
+        return Err(AppError::IntegrationDrift(target));
+    }
+    if !observed_claude_managed_hashes(&document).is_empty() {
+        return Err(AppError::IntegrationDrift(target));
+    }
+
+    append_claude_managed_groups(&mut document, &expected_handlers)?;
+    let updated = pretty_json_bytes(&document)?;
+    let before_hash = digest_bytes(&original);
+    let after_hash = digest_bytes(&updated);
+    atomic_replace(&target, &updated, Some(&before_hash))?;
+    let manifest = ClaudeIntegrationManifest {
+        schema_version: INSTALL_SCHEMA_VERSION,
+        integration_version: CLAUDE_INTEGRATION_VERSION,
+        target_path: target.clone(),
+        managed_handler_hashes: handler_hashes(&expected_handlers)?,
+        before_hash,
+        after_hash,
+    };
+    if let Err(error) = atomic_replace(&integration_path, &pretty_json_bytes(&manifest)?, None) {
+        let _ = atomic_replace(&target, &original, Some(&manifest.after_hash));
+        return Err(error);
+    }
+
+    Ok(HookInstallReport {
+        schema_version: CLAUDE_INTEGRATION_VERSION,
+        target_path: target,
+        changed: true,
+        managed_handler_count: expected_handlers.len(),
+        trust_state: "not_programmatically_verifiable",
+    })
+}
+
+pub fn uninstall_claude_hooks(
+    explicit_install_root: Option<&Path>,
+    explicit_claude_home: Option<&Path>,
+    force: bool,
+) -> Result<HookInstallReport, AppError> {
+    let install_root = resolve_install_root(explicit_install_root)?;
+    let claude_home = resolve_claude_home(explicit_claude_home)?;
+    let target = claude_home.join("settings.json");
+    let integration_path = install_root.join("state/integrations/claude-code.json");
+    let _lock = MutationLock::acquire(&install_root.join("state/integrations/claude-code.lock"))?;
+    if !target.is_file() || !integration_path.is_file() {
+        return Ok(HookInstallReport {
+            schema_version: CLAUDE_INTEGRATION_VERSION,
+            target_path: target,
+            changed: false,
+            managed_handler_count: 0,
+            trust_state: "not_programmatically_verifiable",
+        });
+    }
+
+    let original = fs::read(&target)?;
+    let mut document: Value = serde_json::from_slice(&original)?;
+    let manifest: ClaudeIntegrationManifest = read_json(&integration_path)?;
+    validate_claude_integration_manifest(&manifest, &target)?;
+    let observed = observed_claude_managed_hashes(&document);
+    if !force && observed != manifest.managed_handler_hashes {
+        return Err(AppError::IntegrationDrift(target));
+    }
+    let removed = remove_claude_managed_handlers(
+        &mut document,
+        &manifest.managed_handler_hashes.values().cloned().collect(),
+        force,
+    );
+    if removed == 0 && !force {
+        return Err(AppError::IntegrationDrift(target));
+    }
+    let updated = pretty_json_bytes(&document)?;
+    atomic_replace(&target, &updated, Some(&digest_bytes(&original)))?;
+    fs::remove_file(&integration_path)?;
+
+    Ok(HookInstallReport {
+        schema_version: CLAUDE_INTEGRATION_VERSION,
+        target_path: target,
+        changed: true,
+        managed_handler_count: 0,
+        trust_state: "not_programmatically_verifiable",
+    })
+}
+
 pub fn doctor(
     explicit_install_root: Option<&Path>,
     explicit_codex_home: Option<&Path>,
@@ -592,6 +736,20 @@ fn validate_integration_manifest(
     Ok(())
 }
 
+fn validate_claude_integration_manifest(
+    manifest: &ClaudeIntegrationManifest,
+    target: &Path,
+) -> Result<(), AppError> {
+    if manifest.schema_version != INSTALL_SCHEMA_VERSION
+        || manifest.integration_version != CLAUDE_INTEGRATION_VERSION
+        || manifest.target_path != target
+        || manifest.managed_handler_hashes.len() != REQUIRED_CLAUDE_EVENTS.len()
+    {
+        return Err(AppError::IntegrationDrift(target.to_owned()));
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_install_root(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
     if let Some(path) = explicit {
         return absolute_path(path);
@@ -631,6 +789,18 @@ fn resolve_codex_home(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
     user_home()
         .map(|home| home.join(".codex"))
         .ok_or_else(|| AppError::Setup("无法确定 Codex home；请传入 --codex-home".to_owned()))
+}
+
+fn resolve_claude_home(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
+    if let Some(path) = explicit {
+        return absolute_path(path);
+    }
+    if let Some(path) = env::var_os("CLAUDE_CONFIG_DIR") {
+        return absolute_path(Path::new(&path));
+    }
+    user_home()
+        .map(|home| home.join(".claude"))
+        .ok_or_else(|| AppError::Setup("无法确定 Claude home；请传入 --claude-home".to_owned()))
 }
 
 fn user_home() -> Option<PathBuf> {
@@ -773,6 +943,33 @@ fn managed_handlers(launcher: &Path) -> BTreeMap<String, Value> {
         .collect()
 }
 
+fn managed_claude_handlers(launcher: &Path) -> BTreeMap<String, Value> {
+    REQUIRED_CLAUDE_EVENTS
+        .into_iter()
+        .map(|event| {
+            let event_arg = event_arg(event);
+            #[cfg(target_os = "windows")]
+            let command = format!(
+                "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& {} dispatch claude-code {event_arg}\"",
+                quote_powershell(&launcher.to_string_lossy())
+            );
+            #[cfg(not(target_os = "windows"))]
+            let command = format!(
+                "{} dispatch claude-code {event_arg}",
+                quote_posix(&launcher.to_string_lossy())
+            );
+            (
+                event.to_owned(),
+                json!({
+                    "type": "command",
+                    "command": command,
+                    "timeout": 10
+                }),
+            )
+        })
+        .collect()
+}
+
 fn event_arg(event: &str) -> &'static str {
     match event {
         "SessionStart" => "session-start",
@@ -818,6 +1015,37 @@ fn append_managed_groups(
     Ok(())
 }
 
+fn append_claude_managed_groups(
+    document: &mut Value,
+    handlers: &BTreeMap<String, Value>,
+) -> Result<(), AppError> {
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| AppError::Setup("Claude settings.json 顶层必须是 JSON object".to_owned()))?;
+    let hooks = object
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| AppError::Setup("Claude settings.json 的 hooks 必须是 object".to_owned()))?;
+
+    for (event, handler) in handlers {
+        let groups = hooks
+            .entry(event)
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| {
+                AppError::Setup(format!("Claude settings.json hooks.{event} 必须是 array"))
+            })?;
+        let mut group = Map::new();
+        if matches!(event.as_str(), "PreToolUse" | "PostToolUse") {
+            group.insert("matcher".to_owned(), json!("Bash|Edit|Write|NotebookEdit"));
+        }
+        group.insert("hooks".to_owned(), Value::Array(vec![handler.clone()]));
+        groups.push(Value::Object(group));
+    }
+    Ok(())
+}
+
 fn observed_managed_hashes(document: &Value) -> BTreeMap<String, String> {
     let mut observed = BTreeMap::new();
     let Some(hooks) = document.get("hooks").and_then(Value::as_object) else {
@@ -833,6 +1061,32 @@ fn observed_managed_hashes(document: &Value) -> BTreeMap<String, String> {
             };
             for handler in handlers {
                 if is_managed_signature(handler) {
+                    let hash = hash_value(handler).unwrap_or_default();
+                    if observed.insert(event.clone(), hash).is_some() {
+                        observed.insert(format!("{event}#duplicate"), String::new());
+                    }
+                }
+            }
+        }
+    }
+    observed
+}
+
+fn observed_claude_managed_hashes(document: &Value) -> BTreeMap<String, String> {
+    let mut observed = BTreeMap::new();
+    let Some(hooks) = document.get("hooks").and_then(Value::as_object) else {
+        return observed;
+    };
+    for (event, groups) in hooks {
+        let Some(groups) = groups.as_array() else {
+            continue;
+        };
+        for group in groups {
+            let Some(handlers) = group.get("hooks").and_then(Value::as_array) else {
+                continue;
+            };
+            for handler in handlers {
+                if is_claude_managed_signature(handler) {
                     let hash = hash_value(handler).unwrap_or_default();
                     if observed.insert(event.clone(), hash).is_some() {
                         observed.insert(format!("{event}#duplicate"), String::new());
@@ -885,6 +1139,38 @@ fn remove_managed_handlers(
     removed
 }
 
+fn remove_claude_managed_handlers(
+    document: &mut Value,
+    expected_hashes: &BTreeSet<String>,
+    force: bool,
+) -> usize {
+    let Some(hooks) = document.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for groups in hooks.values_mut() {
+        let Some(groups) = groups.as_array_mut() else {
+            continue;
+        };
+        groups.retain_mut(|group| {
+            let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            let before = handlers.len();
+            handlers.retain(|handler| {
+                if !is_claude_managed_signature(handler) {
+                    return true;
+                }
+                let hash = hash_value(handler).unwrap_or_default();
+                !(force || expected_hashes.contains(&hash))
+            });
+            removed += before - handlers.len();
+            !(before > 0 && handlers.is_empty())
+        });
+    }
+    removed
+}
+
 fn is_managed_signature(handler: &Value) -> bool {
     handler
         .get("command")
@@ -894,6 +1180,13 @@ fn is_managed_signature(handler: &Value) -> bool {
             .get("commandWindows")
             .and_then(Value::as_str)
             .is_some_and(|command| command.contains(" dispatch codex "))
+}
+
+fn is_claude_managed_signature(handler: &Value) -> bool {
+    handler
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| command.contains(" dispatch claude-code "))
 }
 
 fn codex_integration_valid(install_root: &Path, codex_home: Option<&Path>) -> bool {

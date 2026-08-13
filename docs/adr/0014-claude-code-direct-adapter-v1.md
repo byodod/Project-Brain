@@ -4,7 +4,7 @@
 
 ## 状态
 
-Accepted
+Accepted；其中“安装器暂不启用”的边界已由 [ADR-0015](0015-claude-code-atomic-hook-install.md) supersede。
 
 ## 背景
 

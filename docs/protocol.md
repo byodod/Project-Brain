@@ -170,8 +170,9 @@ adapter identity、event ID namespace 与 operation ID namespace，不能跨 ven
 `PostToolUse.tool_response` 只有存在可识别的 success、exit code、error 或 status 证据时才映射
 为 succeeded/failed，否则记录 unknown，不从事件名称猜测成功。
 
-Claude Code adapter v1 当前只提供直接 `hook/dispatch` 协议入口。用户级配置安装、
-`SubagentStart` 与 `SessionEnd` 不在这一提交中；未实现的 lifecycle 不会被折叠成现有五类事件。
+Claude Code adapter v1 提供直接 `hook/dispatch` 协议入口和用户级 `settings.json` 安装器。
+安装器使用独立 manifest、精确 handler hash 与原子替换；只管理五个已实现事件。
+`SubagentStart` 与 `SessionEnd` 不在这一阶段；未实现的 lifecycle 不会被折叠成现有五类事件。
 
 ## AnalysisReport
 
