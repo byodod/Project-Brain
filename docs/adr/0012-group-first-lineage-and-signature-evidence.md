@@ -29,6 +29,10 @@ Accepted，2026-08-13。
    不在 schema migration 中删除或重新解释。
 7. 旧笛卡尔积行只允许由后续显式 compact 命令处理：先 dry-run，证明 group 可完整重建、实际 pair
    等于笛卡尔积、状态仍为 proposed、且没有 decision 引用，才能压缩。VACUUM 不能替代逻辑压缩。
+8. SQLite schema v9 落地 `compact-legacy-proposals`：默认 dry-run；apply 需要 request ID 与
+   `--human-confirmed`。每个可压缩 group 必须只有 version 1 证据且没有额外 evidence，按 kind 拆分后
+   精确覆盖 from×to。事务先保存 group/member、candidate/evidence manifest hash 和 append-only run
+   审计，再删除对应旧行。由失真 token 指纹恢复的 group 只作历史审计，不允许重新物化候选。
 
 ## 后果
 

@@ -421,6 +421,26 @@ project-brain lineage materialize \
 `materialize` 仍只产生 `proposed` candidate；随后必须单独 confirm。超过单侧 4096 members 的恶意或
 病态 group 仅保存计数和成员集摘要，不能直接物化。
 
+V7 曾把歧义 group 物化为 pair-first 笛卡尔积。升级不会静默删除这些历史行；先运行只读预演：
+
+```text
+project-brain lineage compact-legacy-proposals
+```
+
+只有完整笛卡尔积、仍为 `proposed`、只有旧算法证据且未被任何 decision 引用的 group 才会列为
+可压缩。确认报告后才能显式执行：
+
+```text
+project-brain lineage compact-legacy-proposals \
+  --apply \
+  --request-id <request-id> \
+  --human-confirmed
+```
+
+执行会在同一事务中保存 group/member、候选与证据 manifest hash 及追加式审计，再删除已证明冗余的
+旧 pair/evidence。重放同一 request ID 返回原报告；命令不会执行 `VACUUM`。由旧 token 指纹压缩成的
+group 只保留历史事实，禁止重新 materialize。
+
 查看候选：
 
 ```text

@@ -5,6 +5,7 @@
     ".gitattributes",
     ".gitignore",
     ".project-brain",
+    "CHANGELOG.md",
     "Cargo.lock",
     "Cargo.toml",
     "README.md",

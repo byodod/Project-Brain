@@ -205,6 +205,21 @@ enum ProviderCommand {
 
 #[derive(Debug, Subcommand)]
 enum LineageCommand {
+    /// 预演或显式执行 V7 pair-first 歧义候选压缩；默认只读
+    CompactLegacyProposals {
+        /// 执行已预演的压缩；省略时绝不写数据库
+        #[arg(long)]
+        apply: bool,
+
+        /// apply 模式必填，用于幂等重放与碰撞检测
+        #[arg(long)]
+        request_id: Option<String>,
+
+        /// 确认本次逻辑删除来自显式人工决定
+        #[arg(long)]
+        human_confirmed: bool,
+    },
+
     /// 查询 group-first lineage 摘要，不展开潜在笛卡尔积
     Groups {
         #[arg(long, default_value_t = 200)]
@@ -449,6 +464,13 @@ fn main() -> ExitCode {
             })
         }
         Command::Lineage { command } => App::open(cli.project_root).and_then(|app| match command {
+            LineageCommand::CompactLegacyProposals {
+                apply,
+                request_id,
+                human_confirmed,
+            } => {
+                app.compact_legacy_lineage_proposals(apply, request_id.as_deref(), human_confirmed)
+            }
             LineageCommand::Groups { limit } => app.lineage_groups(limit),
             LineageCommand::Group { group } => app.lineage_group(&group),
             LineageCommand::Materialize {

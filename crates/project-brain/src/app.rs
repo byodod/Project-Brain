@@ -702,6 +702,35 @@ impl App {
         Ok(())
     }
 
+    pub fn compact_legacy_lineage_proposals(
+        &self,
+        apply: bool,
+        request_id: Option<&str>,
+        human_confirmed: bool,
+    ) -> Result<(), AppError> {
+        let report = if apply {
+            require_human_confirmation(human_confirmed, "compact legacy lineage proposals")?;
+            let request_id = request_id.ok_or_else(|| {
+                AppError::Governance(
+                    "--apply 必须同时提供非空 --request-id 以保证幂等审计".to_owned(),
+                )
+            })?;
+            self.store
+                .apply_legacy_lineage_compaction(&self.config.project_key, request_id)?
+        } else {
+            if request_id.is_some() || human_confirmed {
+                return Err(AppError::Governance(
+                    "dry-run 不接受 --request-id 或 --human-confirmed；只有 --apply 会写数据库"
+                        .to_owned(),
+                ));
+            }
+            self.store
+                .preview_legacy_lineage_compaction(&self.config.project_key)?
+        };
+        println!("{}", pretty_json(&report)?);
+        Ok(())
+    }
+
     pub fn lineage_groups(&self, limit: u32) -> Result<(), AppError> {
         println!(
             "{}",

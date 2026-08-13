@@ -282,7 +282,9 @@ Lineage 连接两个历史 observation，而不是合并或重命名 `SymbolNode
 - `semantic_lineage_generation_runs`：算法版本、group manifest、潜在 pair 与实际物化数；
 - `semantic_lineage_candidates`：只有 1×1 自动生成或人工从 group 选择的 endpoint materialization；
 - `semantic_lineage_evidence`：算法 ID、版本、输入摘要、结构化证据与置信度的 append-only 观察；
-- `semantic_lineage_decisions`：显式用户裁决的 append-only 日志。
+- `semantic_lineage_decisions`：显式用户裁决的 append-only 日志；
+- `semantic_lineage_compaction_runs` / `semantic_lineage_compaction_groups`：V7 pair-first 旧账的
+  幂等逻辑压缩审计、候选/证据 manifest hash 与目标 group。
 
 候选状态只有：
 
@@ -312,10 +314,16 @@ V8 的 ambiguity 属于 `semantic_lineage_groups`；candidate 的旧 `ambiguity_
    snapshot 或跨 provider 建 equivalence；
 10. 已导入但不是当前最新的历史 snapshot 不能重新应用为当前符号图。
 
-SQLite schema v8 保存 semantic snapshots、source attestations、source manifests、symbol observations、
-lineage groups/members/generation runs 与 candidate/evidence/decision。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升
+SQLite schema v9 保存 semantic snapshots、source attestations、source manifests、symbol observations、
+lineage groups/members/generation runs、candidate/evidence/decision 与 legacy compaction audit。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升
 为硬证据，也不会从现存 symbol 反推缺失 Document。真实重跑相同 snapshot 时可以首次补录 manifest；
 可信重跑只追加 attestation，不改写 symbol observations 或人工 lineage 状态。
+
+V7 legacy compaction 默认是 dry-run。只有一个 group 的所有行仍为 `proposed`、每条恰有一份
+`project-brain-lineage` version 1 evidence、没有 decision/related decision 引用，且按 kind 与 definition
+fingerprint 重建后的实际 pair 集精确等于 from×to，才可进入 apply。任何缺行、附加证据、裁决或损坏
+observation 都保护整个 group。apply 先保存 group/member 与 append-only compaction audit，再在同一事务
+删除对应 evidence/candidate；不执行 `VACUUM`，压缩后的 legacy group 不得重新物化。
 
 覆盖率是独立的确定性证据：对 Provider profile 显式映射的 Rust/Python/C#/VB/F# language，比较
 Git 已跟踪及未忽略、位于声明 roots 且扩展名属于该 language 契约的文件，与 SCIP Document 清单。
