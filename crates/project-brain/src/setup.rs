@@ -118,6 +118,12 @@ impl From<bool> for CheckState {
     }
 }
 
+impl DoctorReport {
+    pub fn is_ready(&self) -> bool {
+        self.status == "ready"
+    }
+}
+
 pub fn delegate_if_installed_launcher() -> Result<Option<ExitCode>, AppError> {
     if env::var_os(LAUNCHED_ENV).is_some() {
         return Ok(None);
@@ -161,6 +167,7 @@ pub fn delegate_if_installed_launcher() -> Result<Option<ExitCode>, AppError> {
 
 pub fn install(explicit_root: Option<&Path>) -> Result<InstallReport, AppError> {
     let root = resolve_install_root(explicit_root)?;
+    let _lock = MutationLock::acquire(&root.join("state/install.lock"))?;
     let executable = env::current_exe()?;
     let version = env!("CARGO_PKG_VERSION").to_owned();
     let payload = version_payload(&root, &version, &executable)?;
@@ -177,6 +184,7 @@ pub fn install(explicit_root: Option<&Path>) -> Result<InstallReport, AppError> 
     }
 
     let manifest_path = root.join("state/install.json");
+    let manifest_before_hash = target_hash(&manifest_path)?;
     let previous = if manifest_path.is_file() {
         let existing: InstallManifest = read_json(&manifest_path)?;
         validate_install_manifest(&existing)?;
@@ -196,7 +204,7 @@ pub fn install(explicit_root: Option<&Path>) -> Result<InstallReport, AppError> 
     };
     let manifest_bytes = pretty_json_bytes(&manifest)?;
     if read_optional(&manifest_path)? != manifest_bytes {
-        atomic_replace(&manifest_path, &manifest_bytes, None)?;
+        atomic_replace(&manifest_path, &manifest_bytes, Some(&manifest_before_hash))?;
         changed = true;
     }
 
@@ -212,6 +220,9 @@ pub fn install(explicit_root: Option<&Path>) -> Result<InstallReport, AppError> 
 
 pub fn rollback(explicit_root: Option<&Path>) -> Result<RollbackReport, AppError> {
     let root = resolve_install_root(explicit_root)?;
+    let _lock = MutationLock::acquire(&root.join("state/install.lock"))?;
+    let manifest_path = root.join("state/install.json");
+    let manifest_before_hash = target_hash(&manifest_path)?;
     let mut manifest = ensure_install_ready(&root)?;
     let previous = manifest
         .previous
@@ -229,9 +240,9 @@ pub fn rollback(explicit_root: Option<&Path>) -> Result<RollbackReport, AppError
     let current = std::mem::replace(&mut manifest.current, previous.clone());
     manifest.previous = Some(current.clone());
     atomic_replace(
-        &root.join("state/install.json"),
+        &manifest_path,
         &pretty_json_bytes(&manifest)?,
-        None,
+        Some(&manifest_before_hash),
     )?;
     Ok(RollbackReport {
         schema_version: INSTALL_SCHEMA_VERSION,
@@ -643,6 +654,9 @@ fn self_check(payload: &Path, root: &Path) -> Result<(), AppError> {
 }
 
 fn register_project(root: &Path, project_root: &Path, project_key: &str) -> Result<bool, AppError> {
+    let _lock = MutationLock::acquire(&root.join("state/projects.lock"))?;
+    let registry_path = root.join("state/projects.json");
+    let registry_before_hash = target_hash(&registry_path)?;
     let mut registry = read_registry(root)?;
     if let Some(existing) = registry
         .projects
@@ -667,22 +681,25 @@ fn register_project(root: &Path, project_root: &Path, project_key: &str) -> Resu
             .then(left.project_key.cmp(&right.project_key))
     });
     atomic_replace(
-        &root.join("state/projects.json"),
+        &registry_path,
         &pretty_json_bytes(&registry)?,
-        None,
+        Some(&registry_before_hash),
     )?;
     Ok(true)
 }
 
 fn unregister_project(root: &Path, project_root: &Path, project_key: &str) -> Result<(), AppError> {
+    let _lock = MutationLock::acquire(&root.join("state/projects.lock"))?;
+    let registry_path = root.join("state/projects.json");
+    let registry_before_hash = target_hash(&registry_path)?;
     let mut registry = read_registry(root)?;
     registry
         .projects
         .retain(|entry| entry.canonical_root != project_root || entry.project_key != project_key);
     atomic_replace(
-        &root.join("state/projects.json"),
+        &registry_path,
         &pretty_json_bytes(&registry)?,
-        None,
+        Some(&registry_before_hash),
     )
 }
 
@@ -975,7 +992,7 @@ fn digest_bytes(bytes: &[u8]) -> String {
 }
 
 struct MutationLock {
-    path: PathBuf,
+    _file: fs::File,
 }
 
 impl MutationLock {
@@ -983,26 +1000,28 @@ impl MutationLock {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(false)
             .open(path)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    AppError::Setup(format!("另一个集成变更正在进行：{}", path.display()))
-                } else {
-                    error.into()
-                }
-            })?;
-        Ok(Self {
-            path: path.to_owned(),
-        })
+            .map_err(AppError::from)?;
+        file.try_lock().map_err(|error| match error {
+            fs::TryLockError::WouldBlock => {
+                AppError::Setup(format!("另一个状态变更正在进行：{}", path.display()))
+            }
+            fs::TryLockError::Error(error) => error.into(),
+        })?;
+        Ok(Self { _file: file })
     }
 }
 
-impl Drop for MutationLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+fn target_hash(path: &Path) -> Result<String, AppError> {
+    if path.is_file() {
+        Ok(digest_bytes(&fs::read(path)?))
+    } else {
+        Ok(digest_bytes(b"{}\n"))
     }
 }
 
@@ -1013,7 +1032,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ProjectRegistry, append_managed_groups, handler_hashes, install_codex_hooks,
+        MutationLock, ProjectRegistry, append_managed_groups, handler_hashes, install_codex_hooks,
         managed_handlers, observed_managed_hashes, read_json, remove_managed_handlers,
         stable_launcher_path,
     };
@@ -1124,6 +1143,18 @@ mod tests {
         let path = root.join("value.json");
         fs::write(&path, "not json").unwrap();
         assert!(read_json::<Value>(&path).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mutation_lock_survives_persistent_lock_file_and_releases_on_drop() {
+        let root = temp_root("mutation-lock");
+        let path = root.join("state.lock");
+        let first = MutationLock::acquire(&path).unwrap();
+        assert!(MutationLock::acquire(&path).is_err());
+        drop(first);
+        assert!(path.is_file());
+        assert!(MutationLock::acquire(&path).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 }

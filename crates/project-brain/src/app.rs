@@ -127,16 +127,18 @@ impl App {
         install_root: Option<&Path>,
         codex_home: Option<&Path>,
     ) -> Result<(), AppError> {
-        println!(
-            "{}",
-            pretty_json(&setup::doctor(
-                install_root,
-                codex_home,
-                &self.root,
-                &self.config.project_key,
-            ))?
+        let report = setup::doctor(
+            install_root,
+            codex_home,
+            &self.root,
+            &self.config.project_key,
         );
-        Ok(())
+        println!("{}", pretty_json(&report)?);
+        if report.is_ready() {
+            Ok(())
+        } else {
+            Err(AppError::DoctorDegraded(report.issues.join("；")))
+        }
     }
 
     pub fn dispatch_hook(

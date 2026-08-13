@@ -49,6 +49,9 @@ pub enum AppError {
     #[error("机器级安装或项目 bootstrap 失败：{0}")]
     Setup(String),
 
+    #[error("Project Brain doctor 检查未通过：{0}")]
+    DoctorDegraded(String),
+
     #[error("Codex Hook 集成发生漂移，拒绝覆盖：{0}")]
     IntegrationDrift(PathBuf),
 

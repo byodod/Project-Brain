@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  verify:
+    name: Verify release metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.92.0
+      - name: Require tag to match workspace version
+        run: python scripts/verify_release_tag.py "${GITHUB_REF_NAME}"
+      - name: Verify source gate
+        run: |
+          cargo fmt --all -- --check
+          cargo test --workspace --all-targets --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  build:
+    name: Package ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            executable: project-brain
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            executable: project-brain.exe
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            executable: project-brain
+          - os: macos-15
+            target: aarch64-apple-darwin
+            executable: project-brain
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.92.0 --profile minimal --target ${{ matrix.target }}
+      - name: Select pinned Rust toolchain
+        run: rustup default 1.92.0
+      - name: Build release CLI
+        run: cargo build --release --locked --target ${{ matrix.target }} -p project-brain
+      - name: Self-check release CLI
+        shell: bash
+        run: target/${{ matrix.target }}/release/${{ matrix.executable }} capabilities codex
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          bundle="project-brain-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${bundle}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "dist/${bundle}/"
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "dist/${bundle}/"
+          chmod 755 "dist/${bundle}/${{ matrix.executable }}"
+          tar -C dist -czf "dist/project-brain-${version}-${{ matrix.target }}.tar.gz" "${bundle}"
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $bundle = "project-brain-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.executable }}" "dist/$bundle/"
+          Copy-Item README.md,CHANGELOG.md,LICENSE-MIT,LICENSE-APACHE "dist/$bundle/"
+          Compress-Archive -Path "dist/$bundle" -DestinationPath "dist/project-brain-$version-${{ matrix.target }}.zip"
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/project-brain-*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: cd dist && sha256sum project-brain-* > SHA256SUMS
+      - name: Publish immutable tag assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes --title "Project Brain ${GITHUB_REF_NAME}"

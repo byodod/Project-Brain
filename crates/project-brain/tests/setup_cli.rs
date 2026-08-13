@@ -289,5 +289,24 @@ fn install_bootstrap_dispatch_doctor_and_uninstall_are_end_to_end() {
         "user-stop"
     );
 
+    let degraded_doctor = run(
+        &launcher,
+        &[
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--codex-home",
+            codex_home.to_str().unwrap(),
+            "--project-root",
+            project.to_str().unwrap(),
+            "doctor",
+        ],
+        &project,
+        None,
+    );
+    assert!(!degraded_doctor.status.success());
+    let degraded: Value = serde_json::from_slice(&degraded_doctor.stdout).unwrap();
+    assert_eq!(degraded["status"], "degraded");
+    assert_eq!(degraded["codex_hooks"], "fail");
+
     fs::remove_dir_all(root).unwrap();
 }

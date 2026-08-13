@@ -46,6 +46,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release --locked -p project-brain
 ```
 
+正式标签会在 Linux x86-64、Windows x86-64、macOS Intel 与 Apple Silicon 上分别构建、
+自检并打包，同时发布 `SHA256SUMS`。完整流程见 [docs/RELEASING.md](docs/RELEASING.md)。
+源码以 MIT 或 Apache-2.0 双许可证发布；安全问题请按 [SECURITY.md](SECURITY.md) 私密报告。
+
 ## 机器级安装
 
 生产使用先执行：
@@ -148,6 +152,9 @@ Codex 会按 Hook 精确定义哈希要求审核非托管命令 Hook。安装后
 project-brain doctor
 project-brain uninstall-hooks codex
 ```
+
+`doctor` 总会先把结构化报告写到标准输出；只要状态不是 `ready`，进程同时返回非零退出码，
+因此既适合人工诊断，也可以作为 CI/bootstrap 的硬门禁。
 
 卸载只删除 manifest 中精确记录的 Project Brain handler，保留用户后来增加的 Hook。检测到
 人工修改或重复 handler 时默认返回 Integration Drift，不覆盖用户配置。
