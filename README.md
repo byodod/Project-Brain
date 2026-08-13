@@ -16,7 +16,7 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - 按项目显式配置的 SCIP 导入与机器级安全 Runner，首批契约覆盖 rust-analyzer、scip-dotnet 与 scip-python；
 - 开放 language ID、逐文档语言映射和四态语义能力声明；
 - Project-scoped semantic lineage ledger、不可变证据与 append-only 显式裁决；
-- SQLite schema v1→v7 迁移、按项目隔离的符号 removed 历史与幂等增量更新；
+- SQLite schema v1→v8 迁移、按项目隔离的符号 removed 历史与幂等增量更新；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
 ## 核心原则
@@ -379,7 +379,7 @@ Hook 硬阻断权。只有 `provider index` 通过当前机器已登记且哈希
 才追加 `trusted_provider` attestation；证明同时固定 registration ID、executable SHA-256、SCIP
 artifact SHA-256、Git HEAD 与完整 worktree 指纹。
 
-`doctor` 会读取 SQLite v7 中与快照同事务保存的 source manifest，并按当前 worktree/HEAD 重新计算
+`doctor` 会读取 SQLite v8 中与快照同事务保存的 source manifest，并按当前 worktree/HEAD 重新计算
 覆盖率。已有索引若为 `partial`、`stale`、损坏或来自未保存 manifest 的旧库，doctor 会降级并返回
 非零；尚未运行过索引只报告 `not_indexed` warning，不阻断首次 bootstrap。旧库迁移不会从符号表
 猜测文档清单；必须真实重跑一次 `provider index` 或 `index-scip` 才能补录 manifest。
@@ -401,9 +401,25 @@ Python 的空 `Document.language` 只有在 profile 显式声明 `raw_language: 
 
 ## Semantic lineage ledger
 
-连续导入同一 semantic provider 的新快照时，Project Brain 只对相邻快照中真正消失和新增的
-symbol 生成 lineage 候选。稳定 ID 不会生成“自己指向自己”的候选，本地 symbol 不参与跨快照
-lineage。候选默认永远是 `proposed`；高置信、唯一匹配或 raw SCIP symbol 相同都不能自动确认。
+连续导入同一 semantic provider 的新快照时，Project Brain 先按 provider/language/kind/定义证据形成
+lineage group。只有 1×1 group 自动物化一个 `proposed` candidate；1×N、M×1、M×N 只保存成员集合
+和潜在 pair 计数，不生成笛卡尔积。稳定 ID 不生成 self-lineage，本地 symbol 不参与跨快照 lineage。
+任何候选都不会自动确认；SCIP 定义 token 不冒充定义正文，producer 缺少完整签名时不产生跨快照匹配。
+
+查看 group 与成员，并显式选择一个潜在 pair：
+
+```text
+project-brain lineage groups
+project-brain lineage group --group <group-id>
+project-brain lineage materialize \
+  --group <group-id> \
+  --from <old-symbol-id> \
+  --to <new-symbol-id> \
+  --human-confirmed
+```
+
+`materialize` 仍只产生 `proposed` candidate；随后必须单独 confirm。超过单侧 4096 members 的恶意或
+病态 group 仅保存计数和成员集摘要，不能直接物化。
 
 查看候选：
 

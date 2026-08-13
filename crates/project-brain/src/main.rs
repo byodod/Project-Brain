@@ -205,6 +205,30 @@ enum ProviderCommand {
 
 #[derive(Debug, Subcommand)]
 enum LineageCommand {
+    /// 查询 group-first lineage 摘要，不展开潜在笛卡尔积
+    Groups {
+        #[arg(long, default_value_t = 200)]
+        limit: u32,
+    },
+
+    /// 查看一个 lineage group 的完整成员集合
+    Group {
+        #[arg(long)]
+        group: String,
+    },
+
+    /// 从 ambiguity group 显式物化一个 proposed pair；不会自动确认
+    Materialize {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        human_confirmed: bool,
+    },
+
     /// 查询项目级 lineage 候选 ledger
     Candidates {
         #[arg(long)]
@@ -425,6 +449,14 @@ fn main() -> ExitCode {
             })
         }
         Command::Lineage { command } => App::open(cli.project_root).and_then(|app| match command {
+            LineageCommand::Groups { limit } => app.lineage_groups(limit),
+            LineageCommand::Group { group } => app.lineage_group(&group),
+            LineageCommand::Materialize {
+                group,
+                from,
+                to,
+                human_confirmed,
+            } => app.materialize_lineage_group_pair(&group, &from, &to, human_confirmed),
             LineageCommand::Candidates {
                 state,
                 snapshot,

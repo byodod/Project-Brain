@@ -702,6 +702,50 @@ impl App {
         Ok(())
     }
 
+    pub fn lineage_groups(&self, limit: u32) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "project_key": self.config.project_key,
+                "groups": self.store.list_lineage_groups(&self.config.project_key, limit)?,
+            }))?
+        );
+        Ok(())
+    }
+
+    pub fn lineage_group(&self, group_id: &str) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "project_key": self.config.project_key,
+                "detail": self.store.lineage_group(&self.config.project_key, group_id)?,
+            }))?
+        );
+        Ok(())
+    }
+
+    pub fn materialize_lineage_group_pair(
+        &self,
+        group_id: &str,
+        from_symbol_id: &str,
+        to_symbol_id: &str,
+        human_confirmed: bool,
+    ) -> Result<(), AppError> {
+        require_human_confirmation(human_confirmed, "materialize lineage group pair")?;
+        println!(
+            "{}",
+            pretty_json(&self.store.materialize_lineage_group_pair(
+                &self.config.project_key,
+                group_id,
+                from_symbol_id,
+                to_symbol_id,
+            )?)?
+        );
+        Ok(())
+    }
+
     pub fn confirm_lineage(
         &self,
         candidate_id: &str,

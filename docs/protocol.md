@@ -278,7 +278,9 @@ Lineage 连接两个历史 observation，而不是合并或重命名 `SymbolNode
 - `semantic_source_manifests`：每个 v7+ 快照的完整 Document 清单计数与摘要；
 - `semantic_source_observations`：清单内路径、language、内容摘要和语法状态；
 - `semantic_symbol_observations`：某次快照实际看到的 symbol；
-- `semantic_lineage_candidates`：endpoint 唯一、当前状态 materialization；
+- `semantic_lineage_groups` / `semantic_lineage_group_members`：相邻快照的兼容等价类与成员集合；
+- `semantic_lineage_generation_runs`：算法版本、group manifest、潜在 pair 与实际物化数；
+- `semantic_lineage_candidates`：只有 1×1 自动生成或人工从 group 选择的 endpoint materialization；
 - `semantic_lineage_evidence`：算法 ID、版本、输入摘要、结构化证据与置信度的 append-only 观察；
 - `semantic_lineage_decisions`：显式用户裁决的 append-only 日志。
 
@@ -288,7 +290,8 @@ Lineage 连接两个历史 observation，而不是合并或重命名 `SymbolNode
 proposed | confirmed | rejected | superseded | invalidated
 ```
 
-`ambiguity_group_id` 保存生成时的竞争集合；ambiguous 不属于生命周期。允许
+V8 的 ambiguity 属于 `semantic_lineage_groups`；candidate 的旧 `ambiguity_group_id` 只保留 V7
+历史语义。ambiguous 不属于 candidate 生命周期。允许
 `rejected -> confirmed`，但必须是新的显式请求并保留两条 decision。禁止
 `confirmed -> rejected`；纠错使用原子 `confirmed -> superseded` 加替代候选确认，结构性损坏才使用
 `invalidated`。
@@ -296,18 +299,21 @@ proposed | confirmed | rejected | superseded | invalidated
 硬不变量：
 
 1. 只比较同 project、provider profile、provider contract、language 的相邻 semantic snapshot；
-2. 只为旧快照 removed 与新快照 inserted symbol 生成候选；稳定 symbol ID 不产生 self-lineage；
-3. 新快照和算法重跑不改变旧 candidate state；只可追加去重后的 evidence；
-4. confirm/reject 只能来自带 `--human-confirmed` 的显式用户命令，必须携带 request ID；同 request 同 payload 重放首次结果，
+2. 只比较旧快照 removed 与新快照 inserted symbol；稳定 symbol ID 不产生 self-lineage；
+3. 只有 1×1 group 自动产生 `proposed`；歧义 group 自动 pair 数恒为 0，人工选择后仍不确认；
+4. 单侧超过 4096 members 的 group 为 `summary_only`，必须从 immutable snapshots 用同算法重算并
+   验证成员摘要后才能物化；
+5. 新快照和算法重跑不改变旧 candidate state；只可追加去重后的 evidence；
+6. confirm/reject 只能来自带 `--human-confirmed` 的显式用户命令，必须携带 request ID；同 request 同 payload 重放首次结果，
    同 request 不同 payload 拒绝；
-5. 一次裁决在单个事务内写 decision、执行 revision CAS、更新 materialized state；
-6. 同 snapshot pair 的 confirmed predecessor/successor 都是一对一；split/merge 留待独立协议；
-7. 不自动确认、拒绝竞争项、supersede、延伸传递 lineage、修改 symbol ID、恢复 tombstone、改写
+7. 一次裁决在单个事务内写 decision、执行 revision CAS、更新 materialized state；
+8. 同 snapshot pair 的 confirmed predecessor/successor 都是一对一；split/merge 留待独立协议；
+9. 不自动确认、拒绝竞争项、supersede、延伸传递 lineage、修改 symbol ID、恢复 tombstone、改写
    snapshot 或跨 provider 建 equivalence；
-8. 已导入但不是当前最新的历史 snapshot 不能重新应用为当前符号图。
+10. 已导入但不是当前最新的历史 snapshot 不能重新应用为当前符号图。
 
-SQLite schema v7 保存 semantic snapshots、source attestations、source manifests、symbol observations、
-candidate、evidence 和 decision。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升
+SQLite schema v8 保存 semantic snapshots、source attestations、source manifests、symbol observations、
+lineage groups/members/generation runs 与 candidate/evidence/decision。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升
 为硬证据，也不会从现存 symbol 反推缺失 Document。真实重跑相同 snapshot 时可以首次补录 manifest；
 可信重跑只追加 attestation，不改写 symbol observations 或人工 lineage 状态。
 

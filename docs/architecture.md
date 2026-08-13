@@ -108,7 +108,7 @@ SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照�
 进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
 符号 ID、快照 revision、节点/边主键、查询和墓碑更新都包含 `project_key`。数据库 schema v4
 首次建立这组项目隔离约束；对应迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与
-adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v7，并在这些约束上
+adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v8，并在这些约束上
 增加独立的语义血缘账本、append-only 来源证明和不可伪造的源码 Document manifest。
 数据库迁移拒绝缺失或非整数的已有 `schema_version`，不会把损坏元数据静默当作 v1。
 Adapter 审计依赖 SQLite 唯一约束和 busy timeout，使并发连接对同一项目事件收敛到首次 outcome；
@@ -129,7 +129,7 @@ confirmed / rejected / superseded / invalidated
            └── never rewrites SymbolNode / tombstone / snapshot
 ```
 
-SQLite schema v7 保存 semantic snapshots、append-only source attestations、source manifests、
+SQLite schema v8 保存 semantic snapshots、append-only source attestations、source manifests、
 symbol observations、candidate、evidence 和 decision。
 Candidate endpoint 唯一键负责算法重跑幂等，算法版本只产生新的 evidence observation；人工状态
 永远不会被 generator 恢复或覆盖。Partial unique indexes 约束同 snapshot pair 中 predecessor 与
@@ -184,8 +184,9 @@ Prime Agent 是独立 runtime，当前已确认的 Extension `agent_end` 不具�
 
 1. Internal Hook Protocol v1 与 Codex adapter 已加入文件和 symbol scope；继续在真实项目验证项目
    隔离、重放、并发交错、Provider 漂移降级、Stop 防循环与长会话延迟。
-2. 已接入机器级 SCIP Runner、complete-only commit 与重复运行稳定性证明；下一步先验证包含已知 SCIP
-   顺序修复的 rust-analyzer，再决定是否启用显式 package-shard fallback。.NET/Python 继续用符合
+2. 已接入机器级 SCIP Runner、complete-only commit 与重复运行稳定性证明；真实 rust-analyzer
+   workspace 结果已证明非确定，且 package root 会重新提升到 workspace root，因此不启用假的
+   package-shard fallback。.NET/Python 继续用符合
    producer 行为的合成 fixture 固定 C#/VB、空 Python language、未指定 kind 与 implementation 契约。
 3. Semantic lineage 裁决与 symbol-scoped rules 已实现；下一步扩展 symbol set、split/merge 和调用图
    影响面，但仍不允许自动确认或 LLM hard block。
@@ -201,4 +202,7 @@ Prime Agent 是独立 runtime，当前已确认的 Extension `agent_end` 不具�
 [ADR-0006](adr/0006-semantic-lineage-ledger.md)、
 [ADR-0007](adr/0007-machine-bootstrap-and-codex-dispatcher.md) 与
 [ADR-0008](adr/0008-machine-provider-runner.md) 与
-[ADR-0009](adr/0009-symbol-scoped-hard-gates.md)。
+[ADR-0009](adr/0009-symbol-scoped-hard-gates.md)、
+[ADR-0010](adr/0010-semantic-source-coverage.md)、
+[ADR-0011](adr/0011-complete-only-and-provider-stability.md) 与
+[ADR-0012](adr/0012-group-first-lineage-and-signature-evidence.md)。

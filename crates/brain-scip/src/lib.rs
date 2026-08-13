@@ -649,6 +649,15 @@ fn collect_definitions(
                     content: content.as_bytes(),
                 },
             );
+            let normalized_definition_fingerprint =
+                semantic_definition_fingerprint(info, &display_name).unwrap_or_else(|| {
+                    // SCIP definition occurrence 常常只覆盖名称 token。缺少 producer 签名时，
+                    // 不能把该 token 冒充定义正文；使用节点身份做不可跨快照匹配的占位指纹。
+                    format!(
+                        "sha256_{}",
+                        sha256(format!("no-lineage:{}", node.id).as_bytes())
+                    )
+                });
             definitions.push(DefinitionRecord {
                 document_path: document.relative_path.clone(),
                 raw_symbol: occurrence.symbol.clone(),
@@ -656,10 +665,7 @@ fn collect_definitions(
                 node,
                 relationships: info.relationships.clone(),
                 enclosing_symbol: info.enclosing_symbol.clone(),
-                normalized_definition_fingerprint: normalized_definition_fingerprint(
-                    &content,
-                    &display_name,
-                ),
+                normalized_definition_fingerprint,
                 is_local,
             });
         }
@@ -942,17 +948,25 @@ fn camel_to_snake(value: &str) -> String {
     result
 }
 
-fn normalized_definition_fingerprint(content: &str, display_name: &str) -> String {
+fn semantic_definition_fingerprint(
+    information: &SymbolInformation,
+    display_name: &str,
+) -> Option<String> {
+    let signature = information.signature_documentation.as_ref()?;
+    let text = signature.text.trim();
+    if text.is_empty() {
+        return None;
+    }
     let without_name = if display_name.is_empty() {
-        content.to_owned()
+        text.to_owned()
     } else {
-        content.replace(display_name, "<symbol>")
+        text.replace(display_name, "<symbol>")
     };
     let normalized = without_name
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    format!("sha256_{}", sha256(normalized.as_bytes()))
+    Some(format!("sha256_{}", sha256(normalized.as_bytes())))
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -1041,13 +1055,13 @@ mod tests {
     use brain_symbols::{EdgeKind, propose_lineage_candidates};
     use protobuf::{EnumOrUnknown, Message, MessageField};
     use scip::types::{
-        Document, Index, Metadata, Occurrence, PositionEncoding, Relationship, SingleLineRange,
-        SymbolInformation, SymbolRole, ToolInfo, symbol_information,
+        Document, Index, Metadata, Occurrence, PositionEncoding, Relationship, Signature,
+        SingleLineRange, SymbolInformation, SymbolRole, ToolInfo, symbol_information,
     };
 
     use super::{
         CapabilitySupport, ScipError, ScipImport, ScipImportProfile, ScipLanguageMapping,
-        import_bytes,
+        import_bytes, semantic_definition_fingerprint,
     };
 
     const PROJECT_KEY: &str = "project_fixture";
@@ -1102,6 +1116,11 @@ mod tests {
             symbol: symbol.to_owned(),
             display_name: display_name.to_owned(),
             kind: EnumOrUnknown::new(kind),
+            signature_documentation: MessageField::some(Signature {
+                language: "rust".to_owned(),
+                text: format!("fn {display_name}()"),
+                ..Signature::default()
+            }),
             ..SymbolInformation::default()
         }
     }
@@ -1129,6 +1148,27 @@ mod tests {
             ..SingleLineRange::default()
         });
         occurrence
+    }
+
+    #[test]
+    fn lineage_fingerprint_requires_a_nonempty_producer_signature() {
+        let with_signature = info(
+            "rust-analyzer cargo demo 0.1.0 run().",
+            "run",
+            symbol_information::Kind::Function,
+        );
+        assert!(semantic_definition_fingerprint(&with_signature, "run").is_some());
+
+        let without_signature = SymbolInformation {
+            symbol: "rust-analyzer cargo demo 0.1.0 run().".to_owned(),
+            display_name: "run".to_owned(),
+            kind: EnumOrUnknown::new(symbol_information::Kind::Function),
+            ..SymbolInformation::default()
+        };
+        assert_eq!(
+            semantic_definition_fingerprint(&without_signature, "run"),
+            None
+        );
     }
 
     fn fixture(root: &Path) -> Vec<u8> {

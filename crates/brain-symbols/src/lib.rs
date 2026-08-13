@@ -349,9 +349,10 @@ pub struct GraphDelta {
     pub removed: u64,
 }
 
-pub const LINEAGE_ALGORITHM_ID: &str = "project-brain-lineage";
-pub const LINEAGE_ALGORITHM_VERSION: &str = "1";
+pub const LINEAGE_ALGORITHM_ID: &str = "project-brain-lineage-groups";
+pub const LINEAGE_ALGORITHM_VERSION: &str = "2";
 pub const LINEAGE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+pub const MAX_LINEAGE_GROUP_MEMBERS_PER_SIDE: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -462,6 +463,8 @@ pub struct LineageCandidateProposal {
     pub to_snapshot: String,
     pub to_symbol: String,
     pub ambiguity_group_id: Option<String>,
+    pub origin_group_id: Option<String>,
+    pub proposal_origin: String,
     pub algorithm_id: String,
     pub algorithm_version: String,
     pub confidence: LineageConfidence,
@@ -469,6 +472,81 @@ pub struct LineageCandidateProposal {
     pub evidence_fingerprint: String,
     pub evidence: Vec<LineageEvidence>,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageGroupReviewClass {
+    Unique,
+    Ambiguous,
+    Oversized,
+}
+
+impl LineageGroupReviewClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unique => "unique",
+            Self::Ambiguous => "ambiguous",
+            Self::Oversized => "oversized",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageGroupStorageMode {
+    Members,
+    SummaryOnly,
+}
+
+impl LineageGroupStorageMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Members => "members",
+            Self::SummaryOnly => "summary_only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LineageGroupProposal {
+    pub group_id: String,
+    pub project_key: String,
+    pub provider_profile_id: String,
+    pub provider_contract_id: String,
+    pub language: SourceLanguage,
+    pub from_snapshot: String,
+    pub to_snapshot: String,
+    pub symbol_kind: String,
+    pub definition_fingerprint: String,
+    pub algorithm_id: String,
+    pub algorithm_version: String,
+    pub from_count: u64,
+    pub to_count: u64,
+    pub potential_pair_count: u64,
+    pub review_class: LineageGroupReviewClass,
+    pub storage_mode: LineageGroupStorageMode,
+    pub from_members_hash: String,
+    pub to_members_hash: String,
+    pub from_members: Vec<String>,
+    pub to_members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LineageProposalSet {
+    pub groups: Vec<LineageGroupProposal>,
+    pub candidates: Vec<LineageCandidateProposal>,
+}
+
+type LineageGroupKey = (
+    String,
+    String,
+    String,
+    SourceLanguage,
+    String,
+    String,
+    String,
+    String,
+);
 
 /// 对相邻快照的 removed/inserted 观察生成可审计 lineage 候选。
 ///
@@ -478,6 +556,21 @@ pub fn propose_lineage_candidates(
     current: &[LineageSymbolObservation],
     path_renames: &[PathRenameEvidence],
 ) -> Vec<LineageCandidateProposal> {
+    propose_lineage(previous, current, path_renames).candidates
+}
+
+/// 先按确定性兼容条件形成 lineage group；只有 1x1 group 会产生 proposed candidate。
+///
+/// 歧义 group 不物化笛卡尔积 pair，因此存储规模受成员数线性约束。
+#[allow(
+    clippy::too_many_lines,
+    reason = "group-first 生成器在一个确定性流程中计算成员、摘要、容量等级和唯一候选"
+)]
+pub fn propose_lineage(
+    previous: &[LineageSymbolObservation],
+    current: &[LineageSymbolObservation],
+    path_renames: &[PathRenameEvidence],
+) -> LineageProposalSet {
     let previous_ids = previous
         .iter()
         .map(|observation| observation.symbol_id.as_str())
@@ -486,64 +579,158 @@ pub fn propose_lineage_candidates(
         .iter()
         .map(|observation| observation.symbol_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    let mut pairs = Vec::new();
-    for (old_index, old) in previous.iter().enumerate() {
-        if current_ids.contains(old.symbol_id.as_str()) {
-            continue;
-        }
-        for (new_index, new) in current.iter().enumerate() {
-            if !previous_ids.contains(new.symbol_id.as_str())
-                && !old.is_local
-                && !new.is_local
-                && old.project_key == new.project_key
-                && old.provider_profile_id == new.provider_profile_id
-                && old.provider_contract_id == new.provider_contract_id
-                && old.language == new.language
-                && old.kind == new.kind
-                && old.normalized_definition_fingerprint == new.normalized_definition_fingerprint
-            {
-                pairs.push((old_index, new_index));
-            }
+    let from_snapshot = previous
+        .first()
+        .map_or_else(String::new, |item| item.snapshot_revision.clone());
+    let to_snapshot = current
+        .first()
+        .map_or_else(String::new, |item| item.snapshot_revision.clone());
+    let mut old_groups =
+        std::collections::BTreeMap::<LineageGroupKey, Vec<&LineageSymbolObservation>>::new();
+    let mut new_groups =
+        std::collections::BTreeMap::<LineageGroupKey, Vec<&LineageSymbolObservation>>::new();
+    for old in previous {
+        if !old.is_local && !current_ids.contains(old.symbol_id.as_str()) {
+            old_groups
+                .entry(lineage_group_key(old, &from_snapshot, &to_snapshot))
+                .or_default()
+                .push(old);
         }
     }
-    let old_matches = match_counts(&pairs, true);
-    let new_matches = match_counts(&pairs, false);
-    let mut candidates = pairs
-        .into_iter()
-        .map(|(old_index, new_index)| {
-            build_lineage_candidate_proposal(
-                &previous[old_index],
-                &current[new_index],
+    for new in current {
+        if !new.is_local && !previous_ids.contains(new.symbol_id.as_str()) {
+            new_groups
+                .entry(lineage_group_key(new, &from_snapshot, &to_snapshot))
+                .or_default()
+                .push(new);
+        }
+    }
+    let mut groups = Vec::new();
+    let mut candidates = Vec::new();
+    for (key, mut old_members) in old_groups {
+        let Some(mut new_members) = new_groups.remove(&key) else {
+            continue;
+        };
+        old_members.sort_by_key(|item| item.symbol_id.as_str());
+        new_members.sort_by_key(|item| item.symbol_id.as_str());
+        let from_count = u64::try_from(old_members.len()).unwrap_or(u64::MAX);
+        let to_count = u64::try_from(new_members.len()).unwrap_or(u64::MAX);
+        let potential_pair_count = from_count.saturating_mul(to_count);
+        let oversized = old_members.len() > MAX_LINEAGE_GROUP_MEMBERS_PER_SIDE
+            || new_members.len() > MAX_LINEAGE_GROUP_MEMBERS_PER_SIDE;
+        let unique = old_members.len() == 1 && new_members.len() == 1;
+        let group_id = format!(
+            "lineage_group_v2_{}",
+            stable_digest(&[
+                key.0.as_bytes(),
+                key.1.as_bytes(),
+                key.2.as_bytes(),
+                key.3.as_str().as_bytes(),
+                key.4.as_bytes(),
+                key.5.as_bytes(),
+                key.6.as_bytes(),
+                key.7.as_bytes(),
+                LINEAGE_ALGORITHM_ID.as_bytes(),
+                LINEAGE_ALGORITHM_VERSION.as_bytes(),
+            ])
+        );
+        let all_from = old_members
+            .iter()
+            .map(|item| item.symbol_id.clone())
+            .collect::<Vec<_>>();
+        let all_to = new_members
+            .iter()
+            .map(|item| item.symbol_id.clone())
+            .collect::<Vec<_>>();
+        let from_members_hash = member_set_hash(&all_from);
+        let to_members_hash = member_set_hash(&all_to);
+        if unique {
+            candidates.push(build_lineage_candidate_proposal(
+                old_members[0],
+                new_members[0],
                 path_renames,
-                old_matches.get(&old_index).copied().unwrap_or_default() > 1
-                    || new_matches.get(&new_index).copied().unwrap_or_default() > 1,
-            )
-        })
-        .collect::<Vec<_>>();
+                &group_id,
+            ));
+        }
+        groups.push(LineageGroupProposal {
+            group_id,
+            project_key: key.0,
+            provider_profile_id: key.1,
+            provider_contract_id: key.2,
+            language: key.3,
+            from_snapshot: key.4,
+            to_snapshot: key.5,
+            symbol_kind: key.6,
+            definition_fingerprint: key.7,
+            algorithm_id: LINEAGE_ALGORITHM_ID.to_owned(),
+            algorithm_version: LINEAGE_ALGORITHM_VERSION.to_owned(),
+            from_count,
+            to_count,
+            potential_pair_count,
+            review_class: if oversized {
+                LineageGroupReviewClass::Oversized
+            } else if unique {
+                LineageGroupReviewClass::Unique
+            } else {
+                LineageGroupReviewClass::Ambiguous
+            },
+            storage_mode: if oversized {
+                LineageGroupStorageMode::SummaryOnly
+            } else {
+                LineageGroupStorageMode::Members
+            },
+            from_members_hash,
+            to_members_hash,
+            from_members: if oversized { Vec::new() } else { all_from },
+            to_members: if oversized { Vec::new() } else { all_to },
+        });
+    }
     candidates.sort_by(|left, right| {
         (&left.from_symbol, &left.to_symbol).cmp(&(&right.from_symbol, &right.to_symbol))
     });
-    candidates
+    groups.sort_by(|left, right| left.group_id.cmp(&right.group_id));
+    LineageProposalSet { groups, candidates }
 }
 
-fn match_counts(
-    pairs: &[(usize, usize)],
-    use_old_index: bool,
-) -> std::collections::BTreeMap<usize, usize> {
-    let mut counts = std::collections::BTreeMap::new();
-    for &(old_index, new_index) in pairs {
-        *counts
-            .entry(if use_old_index { old_index } else { new_index })
-            .or_default() += 1;
+fn lineage_group_key(
+    observation: &LineageSymbolObservation,
+    from_snapshot: &str,
+    to_snapshot: &str,
+) -> (
+    String,
+    String,
+    String,
+    SourceLanguage,
+    String,
+    String,
+    String,
+    String,
+) {
+    (
+        observation.project_key.clone(),
+        observation.provider_profile_id.clone(),
+        observation.provider_contract_id.clone(),
+        observation.language.clone(),
+        from_snapshot.to_owned(),
+        to_snapshot.to_owned(),
+        observation.kind.clone(),
+        observation.normalized_definition_fingerprint.clone(),
+    )
+}
+
+fn member_set_hash(members: &[String]) -> String {
+    let mut bytes = Vec::new();
+    for member in members {
+        append_digest_part(&mut bytes, member.as_bytes());
     }
-    counts
+    format!("sha256_{}", stable_digest(&[&bytes]))
 }
 
 fn build_lineage_candidate_proposal(
     old: &LineageSymbolObservation,
     new: &LineageSymbolObservation,
     path_renames: &[PathRenameEvidence],
-    ambiguous: bool,
+    origin_group_id: &str,
 ) -> LineageCandidateProposal {
     let mut evidence = vec![
         LineageEvidence::KindEqual,
@@ -578,9 +765,7 @@ fn build_lineage_candidate_proposal(
             similarity_basis_points: rename.similarity_basis_points,
         });
     }
-    let confidence = if ambiguous {
-        LineageConfidence::Low
-    } else if git_rename
+    let confidence = if git_rename
         .is_some_and(|rename| rename.similarity_basis_points >= HIGH_CONFIDENCE_RENAME_BASIS_POINTS)
         || evidence
             .iter()
@@ -606,19 +791,6 @@ fn build_lineage_candidate_proposal(
     );
     let evidence_json = serde_json::to_vec(&evidence).expect("lineage evidence is serializable");
     let evidence_fingerprint = format!("sha256_{}", stable_digest(&[&evidence_json]));
-    let ambiguity_group_id = ambiguous.then(|| {
-        format!(
-            "ambiguity_v1_{}",
-            stable_digest(&[
-                old.project_key.as_bytes(),
-                old.provider_profile_id.as_bytes(),
-                old.provider_contract_id.as_bytes(),
-                old.language.as_str().as_bytes(),
-                old.snapshot_revision.as_bytes(),
-                new.snapshot_revision.as_bytes(),
-            ])
-        )
-    });
     LineageCandidateProposal {
         project_key: old.project_key.clone(),
         provider_profile_id: old.provider_profile_id.clone(),
@@ -628,7 +800,9 @@ fn build_lineage_candidate_proposal(
         from_symbol: old.symbol_id.clone(),
         to_snapshot: new.snapshot_revision.clone(),
         to_symbol: new.symbol_id.clone(),
-        ambiguity_group_id,
+        ambiguity_group_id: None,
+        origin_group_id: Some(origin_group_id.to_owned()),
+        proposal_origin: "auto_unique".to_owned(),
         algorithm_id: LINEAGE_ALGORITHM_ID.to_owned(),
         algorithm_version: LINEAGE_ALGORITHM_VERSION.to_owned(),
         confidence,
@@ -661,7 +835,8 @@ mod tests {
     use super::{
         IdentityQuality, LineageConfidence, LineageEvidence, LineageSymbolObservation,
         PathRenameEvidence, ProviderDescriptor, SourceFileState, SourceLanguage, SymbolNode,
-        SymbolNodeInput, SymbolStatus, encode_provider_key, propose_lineage_candidates,
+        SymbolNodeInput, SymbolStatus, encode_provider_key, propose_lineage,
+        propose_lineage_candidates,
     };
 
     const PROJECT_KEY: &str = "project_alpha";
@@ -941,16 +1116,37 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_matches_share_a_group_but_remain_proposals() {
+    fn ambiguous_matches_create_one_group_and_no_cartesian_candidates() {
         let old = lineage_observation("old", "old-id", "run", "src/lib.rs");
         let first = lineage_observation("new", "new-a", "run_a", "src/a.rs");
         let second = lineage_observation("new", "new-b", "run_b", "src/b.rs");
-        let candidates = propose_lineage_candidates(&[old], &[first, second], &[]);
+        let proposals = propose_lineage(&[old], &[first, second], &[]);
 
-        assert_eq!(candidates.len(), 2);
-        assert!(candidates.iter().all(|candidate| {
-            candidate.ambiguity_group_id.is_some() && candidate.confidence == LineageConfidence::Low
-        }));
+        assert!(proposals.candidates.is_empty());
+        assert_eq!(proposals.groups.len(), 1);
+        assert_eq!(proposals.groups[0].from_count, 1);
+        assert_eq!(proposals.groups[0].to_count, 2);
+        assert_eq!(proposals.groups[0].potential_pair_count, 2);
+        assert_eq!(proposals.groups[0].from_members.len(), 1);
+        assert_eq!(proposals.groups[0].to_members.len(), 2);
+    }
+
+    #[test]
+    fn large_ambiguous_bucket_is_linear_not_cartesian() {
+        let previous = (0..590)
+            .map(|index| lineage_observation("old", &format!("old-{index}"), "run", "src/old.rs"))
+            .collect::<Vec<_>>();
+        let current = (0..1_162)
+            .map(|index| lineage_observation("new", &format!("new-{index}"), "run", "src/new.rs"))
+            .collect::<Vec<_>>();
+
+        let proposals = propose_lineage(&previous, &current, &[]);
+
+        assert!(proposals.candidates.is_empty());
+        assert_eq!(proposals.groups.len(), 1);
+        assert_eq!(proposals.groups[0].potential_pair_count, 685_580);
+        assert_eq!(proposals.groups[0].from_members.len(), 590);
+        assert_eq!(proposals.groups[0].to_members.len(), 1_162);
     }
 
     #[test]

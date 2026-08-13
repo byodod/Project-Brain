@@ -8,16 +8,16 @@ use brain_core::{
 };
 use brain_symbols::{
     GraphDelta, IdentityQuality, LINEAGE_EVIDENCE_SCHEMA_VERSION, LineageCandidateProposal,
-    LineageState, LineageSymbolObservation, PathRenameEvidence, SYMBOL_PROTOCOL_VERSION,
-    SourceFileState, SourceLanguage, SymbolNode, SymbolSnapshot, SymbolStatus,
-    propose_lineage_candidates, symbol_id,
+    LineageConfidence, LineageEvidence, LineageGroupProposal, LineageProposalSet, LineageState,
+    LineageSymbolObservation, PathRenameEvidence, SYMBOL_PROTOCOL_VERSION, SourceFileState,
+    SourceLanguage, SymbolNode, SymbolSnapshot, SymbolStatus, propose_lineage, symbol_id,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const DATABASE_SCHEMA_VERSION: i64 = 7;
+const DATABASE_SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -94,6 +94,9 @@ pub struct SemanticApplyResult {
     pub snapshot_inserted: bool,
     pub candidates_inserted: u64,
     pub evidence_inserted: u64,
+    pub lineage_groups_inserted: u64,
+    pub lineage_group_members_inserted: u64,
+    pub potential_lineage_pairs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -215,6 +218,36 @@ pub struct LineageCandidateRecord {
     pub evidence_count: u64,
     pub created_at_unix_seconds: i64,
     pub updated_at_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LineageGroupRecord {
+    pub group_id: String,
+    pub project_key: String,
+    pub provider_profile_id: String,
+    pub provider_contract_id: String,
+    pub language_id: String,
+    pub from_snapshot_fingerprint: String,
+    pub to_snapshot_fingerprint: String,
+    pub symbol_kind: String,
+    pub definition_fingerprint: String,
+    pub algorithm_id: String,
+    pub algorithm_version: String,
+    pub from_count: u64,
+    pub to_count: u64,
+    pub potential_pair_count: u64,
+    pub review_class: String,
+    pub storage_mode: String,
+    pub from_members_hash: String,
+    pub to_members_hash: String,
+    pub created_at_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LineageGroupDetail {
+    pub group: LineageGroupRecord,
+    pub from_members: Vec<String>,
+    pub to_members: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -385,6 +418,7 @@ impl BrainStore {
                  ON symbol_edges(project_key, target_id, status, kind);",
         )?;
         self.initialize_lineage_schema()?;
+        self.ensure_lineage_v8_schema()?;
         self.ensure_semantic_snapshot_source_columns()?;
         self.initialize_adapter_audit_schema()?;
         self.connection.execute(
@@ -618,6 +652,82 @@ impl BrainStore {
         Ok(())
     }
 
+    fn ensure_lineage_v8_schema(&self) -> Result<(), StoreError> {
+        let columns = self
+            .connection
+            .prepare("PRAGMA table_info(semantic_lineage_candidates)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        if !columns.contains("origin_group_id") {
+            self.connection.execute_batch(
+                "ALTER TABLE semantic_lineage_candidates ADD COLUMN origin_group_id TEXT;",
+            )?;
+        }
+        if !columns.contains("proposal_origin") {
+            self.connection.execute_batch(
+                "ALTER TABLE semantic_lineage_candidates ADD COLUMN proposal_origin TEXT NOT NULL DEFAULT 'legacy_v7' CHECK(proposal_origin IN ('auto_unique', 'human_group_pair', 'legacy_v7'));",
+            )?;
+        }
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS semantic_lineage_groups (
+                 group_id TEXT PRIMARY KEY,
+                 project_key TEXT NOT NULL,
+                 provider_profile_id TEXT NOT NULL,
+                 provider_contract_id TEXT NOT NULL,
+                 language_id TEXT NOT NULL,
+                 from_snapshot_fingerprint TEXT NOT NULL,
+                 to_snapshot_fingerprint TEXT NOT NULL,
+                 symbol_kind TEXT NOT NULL,
+                 definition_fingerprint TEXT NOT NULL,
+                 algorithm_id TEXT NOT NULL,
+                 algorithm_version TEXT NOT NULL,
+                 from_count INTEGER NOT NULL CHECK(from_count > 0),
+                 to_count INTEGER NOT NULL CHECK(to_count > 0),
+                 potential_pair_count INTEGER NOT NULL CHECK(potential_pair_count > 0),
+                 review_class TEXT NOT NULL CHECK(review_class IN ('unique', 'ambiguous', 'oversized')),
+                 storage_mode TEXT NOT NULL CHECK(storage_mode IN ('members', 'summary_only')),
+                 from_members_hash TEXT NOT NULL,
+                 to_members_hash TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 UNIQUE(project_key, provider_profile_id, provider_contract_id, language_id,
+                        from_snapshot_fingerprint, to_snapshot_fingerprint, symbol_kind,
+                        definition_fingerprint, algorithm_id, algorithm_version)
+             );
+             CREATE INDEX IF NOT EXISTS idx_lineage_group_query
+                 ON semantic_lineage_groups(project_key, review_class, created_at_unix_seconds DESC);
+             CREATE TABLE IF NOT EXISTS semantic_lineage_group_members (
+                 group_id TEXT NOT NULL,
+                 side TEXT NOT NULL CHECK(side IN ('from', 'to')),
+                 symbol_id TEXT NOT NULL,
+                 PRIMARY KEY(group_id, side, symbol_id),
+                 FOREIGN KEY(group_id) REFERENCES semantic_lineage_groups(group_id) ON DELETE RESTRICT
+             );
+             CREATE TABLE IF NOT EXISTS semantic_lineage_generation_runs (
+                 run_id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+                 project_key TEXT NOT NULL,
+                 provider_profile_id TEXT NOT NULL,
+                 provider_contract_id TEXT NOT NULL,
+                 language_id TEXT NOT NULL,
+                 from_snapshot_fingerprint TEXT NOT NULL,
+                 to_snapshot_fingerprint TEXT NOT NULL,
+                 algorithm_id TEXT NOT NULL,
+                 algorithm_version TEXT NOT NULL,
+                 group_count INTEGER NOT NULL,
+                 unique_group_count INTEGER NOT NULL,
+                 ambiguous_group_count INTEGER NOT NULL,
+                 oversized_group_count INTEGER NOT NULL,
+                 potential_pair_count INTEGER NOT NULL,
+                 materialized_candidate_count INTEGER NOT NULL,
+                 group_manifest_hash TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 UNIQUE(project_key, provider_profile_id, provider_contract_id, language_id,
+                        from_snapshot_fingerprint, to_snapshot_fingerprint,
+                        algorithm_id, algorithm_version)
+             );",
+        )?;
+        Ok(())
+    }
+
     fn ensure_semantic_snapshot_source_columns(&self) -> Result<(), StoreError> {
         let mut statement = self
             .connection
@@ -681,6 +791,10 @@ impl BrainStore {
     /// # Errors
     ///
     /// 快照、观察或 provider 边界不一致，或 `SQLite` 事务失败时返回错误。
+    #[allow(
+        clippy::too_many_lines,
+        reason = "单个事务必须线性地提交快照、group、唯一候选、manifest 与 attestation"
+    )]
     pub fn apply_semantic_snapshot(
         &self,
         snapshot: &SymbolSnapshot,
@@ -741,13 +855,24 @@ impl BrainStore {
             )?
         };
         let proposals = if existing {
-            Vec::new()
+            LineageProposalSet::default()
         } else {
-            propose_lineage_candidates(&previous, observations, path_renames)
+            propose_lineage(&previous, observations, path_renames)
         };
         let graph = apply_snapshot_transaction(&transaction, snapshot)?;
         let mut candidates_inserted = 0_u64;
         let mut evidence_inserted = 0_u64;
+        let mut lineage_groups_inserted = 0_u64;
+        let mut lineage_group_members_inserted = 0_u64;
+        let potential_lineage_pairs = proposals
+            .groups
+            .iter()
+            .try_fold(0_u64, |total, group| {
+                total.checked_add(group.potential_pair_count)
+            })
+            .ok_or_else(|| {
+                StoreError::InvalidLineage("potential lineage pair 计数溢出".to_owned())
+            })?;
         if !existing {
             transaction.execute(
                 "INSERT INTO semantic_snapshots(
@@ -772,8 +897,11 @@ impl BrainStore {
                 ],
             )?;
             persist_semantic_observations(&transaction, observations)?;
+            (lineage_groups_inserted, lineage_group_members_inserted) =
+                persist_lineage_groups(&transaction, &proposals.groups, now)?;
             (candidates_inserted, evidence_inserted) =
-                persist_lineage_proposals(&transaction, &proposals, now)?;
+                persist_lineage_proposals(&transaction, &proposals.candidates, now)?;
+            persist_lineage_generation_runs(&transaction, &proposals, now)?;
         }
         if !source_manifest_recorded {
             // v6 及更早快照只有在真实 Provider/离线导入再次提交同一完整快照时才补录，
@@ -787,6 +915,9 @@ impl BrainStore {
             snapshot_inserted: !existing,
             candidates_inserted,
             evidence_inserted,
+            lineage_groups_inserted,
+            lineage_group_members_inserted,
+            potential_lineage_pairs,
         })
     }
 
@@ -908,6 +1039,187 @@ impl BrainStore {
             )?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    /// 查询 group-first lineage 摘要；不会展开潜在 pair。
+    ///
+    /// # Errors
+    ///
+    /// `SQLite` 查询失败或持久化字段无法解码时返回错误。
+    pub fn list_lineage_groups(
+        &self,
+        project_key: &str,
+        limit: u32,
+    ) -> Result<Vec<LineageGroupRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT group_id, project_key, provider_profile_id, provider_contract_id, language_id,
+                    from_snapshot_fingerprint, to_snapshot_fingerprint, symbol_kind,
+                    definition_fingerprint, algorithm_id, algorithm_version, from_count, to_count,
+                    potential_pair_count, review_class, storage_mode, from_members_hash,
+                    to_members_hash, created_at_unix_seconds
+             FROM semantic_lineage_groups WHERE project_key = ?1
+             ORDER BY created_at_unix_seconds DESC, group_id LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![project_key, limit], decode_lineage_group_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// 读取一个 lineage group 的成员集合；summary-only 超大组只返回空成员与已存摘要。
+    ///
+    /// # Errors
+    ///
+    /// `SQLite` 查询失败或持久化字段无法解码时返回错误。
+    pub fn lineage_group(
+        &self,
+        project_key: &str,
+        group_id: &str,
+    ) -> Result<Option<LineageGroupDetail>, StoreError> {
+        let group = self
+            .connection
+            .query_row(
+                "SELECT group_id, project_key, provider_profile_id, provider_contract_id, language_id,
+                        from_snapshot_fingerprint, to_snapshot_fingerprint, symbol_kind,
+                        definition_fingerprint, algorithm_id, algorithm_version, from_count, to_count,
+                        potential_pair_count, review_class, storage_mode, from_members_hash,
+                        to_members_hash, created_at_unix_seconds
+                 FROM semantic_lineage_groups WHERE project_key = ?1 AND group_id = ?2",
+                params![project_key, group_id],
+                decode_lineage_group_row,
+            )
+            .optional()?;
+        let Some(group) = group else {
+            return Ok(None);
+        };
+        let members = |side: &str| -> Result<Vec<String>, StoreError> {
+            self.connection
+                .prepare(
+                    "SELECT symbol_id FROM semantic_lineage_group_members
+                     WHERE group_id = ?1 AND side = ?2 ORDER BY symbol_id",
+                )?
+                .query_map(params![group_id, side], |row| row.get(0))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        };
+        Ok(Some(LineageGroupDetail {
+            group,
+            from_members: members("from")?,
+            to_members: members("to")?,
+        }))
+    }
+
+    /// 从一个已持久化的非超大 ambiguity group 中显式物化单个 proposed pair。
+    ///
+    /// 该操作只创建可审计候选，不会自动确认。重复物化同一 pair 幂等返回现有候选。
+    ///
+    /// # Errors
+    ///
+    /// group/member 边界无效、group 为 summary-only、或事务写入失败时返回错误。
+    pub fn materialize_lineage_group_pair(
+        &self,
+        project_key: &str,
+        group_id: &str,
+        from_symbol_id: &str,
+        to_symbol_id: &str,
+    ) -> Result<LineageCandidateRecord, StoreError> {
+        let group = self
+            .connection
+            .query_row(
+                "SELECT project_key, provider_profile_id, provider_contract_id, language_id,
+                    from_snapshot_fingerprint, to_snapshot_fingerprint, symbol_kind,
+                    definition_fingerprint, algorithm_id, algorithm_version, storage_mode
+             FROM semantic_lineage_groups WHERE group_id = ?1",
+                [group_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StoreError::InvalidLineage(format!("lineage group 不存在：{group_id}"))
+            })?;
+        if group.0 != project_key {
+            return Err(StoreError::LineageConflict(
+                "lineage group 不属于当前项目".to_owned(),
+            ));
+        }
+        if group.10 != "members" {
+            return Err(StoreError::InvalidLineage(
+                "summary_only 超大 group 必须先从 immutable snapshots 重新验证成员".to_owned(),
+            ));
+        }
+        for (side, symbol_id) in [("from", from_symbol_id), ("to", to_symbol_id)] {
+            let exists: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM semantic_lineage_group_members
+                 WHERE group_id = ?1 AND side = ?2 AND symbol_id = ?3)",
+                params![group_id, side, symbol_id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(StoreError::InvalidLineage(format!(
+                    "symbol={symbol_id} 不是 group={group_id} 的 {side} member"
+                )));
+            }
+        }
+        let language = SourceLanguage::parse(&group.3).ok_or_else(|| {
+            StoreError::InvalidLineage(format!("group language_id 无效：{:?}", group.3))
+        })?;
+        let evidence = vec![
+            LineageEvidence::KindEqual,
+            LineageEvidence::NormalizedDefinitionEqual,
+        ];
+        let evidence_json = serde_json::to_vec(&evidence)?;
+        let input_fingerprint = format!(
+            "sha256_{:x}",
+            Sha256::digest(format!(
+                "{}\0{}\0{}\0{}",
+                group_id, group.4, from_symbol_id, to_symbol_id
+            ))
+        );
+        let proposal = LineageCandidateProposal {
+            project_key: group.0,
+            provider_profile_id: group.1,
+            provider_contract_id: group.2,
+            language,
+            from_snapshot: group.4.clone(),
+            from_symbol: from_symbol_id.to_owned(),
+            to_snapshot: group.5.clone(),
+            to_symbol: to_symbol_id.to_owned(),
+            ambiguity_group_id: None,
+            origin_group_id: Some(group_id.to_owned()),
+            proposal_origin: "human_group_pair".to_owned(),
+            algorithm_id: group.8,
+            algorithm_version: group.9,
+            confidence: LineageConfidence::Low,
+            input_fingerprint,
+            evidence_fingerprint: format!("sha256_{:x}", Sha256::digest(&evidence_json)),
+            evidence,
+        };
+        let transaction = self.connection.unchecked_transaction()?;
+        persist_lineage_proposals(&transaction, &[proposal], unix_seconds()?)?;
+        transaction.commit()?;
+        self.list_lineage_candidates(project_key, None, None, None, u32::MAX)?
+            .into_iter()
+            .find(|candidate| {
+                candidate.from_snapshot_fingerprint == group.4
+                    && candidate.from_symbol_id == from_symbol_id
+                    && candidate.to_snapshot_fingerprint == group.5
+                    && candidate.to_symbol_id == to_symbol_id
+            })
+            .ok_or_else(|| StoreError::Integrity("已物化 lineage candidate 无法回读".to_owned()))
     }
 
     /// 验证 semantic 锚点，并只沿相邻快照中的直接身份或 confirmed lineage 解析到最新符号。
@@ -2212,6 +2524,202 @@ fn persist_semantic_observations(
     Ok(())
 }
 
+fn persist_lineage_groups(
+    transaction: &Transaction<'_>,
+    groups: &[LineageGroupProposal],
+    now: i64,
+) -> Result<(u64, u64), StoreError> {
+    let mut groups_inserted = 0_u64;
+    let mut members_inserted = 0_u64;
+    for group in groups {
+        let from_count = i64::try_from(group.from_count)
+            .map_err(|_| StoreError::InvalidLineage("from_count 超出 SQLite INTEGER".to_owned()))?;
+        let to_count = i64::try_from(group.to_count)
+            .map_err(|_| StoreError::InvalidLineage("to_count 超出 SQLite INTEGER".to_owned()))?;
+        let potential_pair_count = i64::try_from(group.potential_pair_count).map_err(|_| {
+            StoreError::InvalidLineage("potential_pair_count 超出 SQLite INTEGER".to_owned())
+        })?;
+        groups_inserted += u64::try_from(transaction.execute(
+            "INSERT INTO semantic_lineage_groups(
+                 group_id, project_key, provider_profile_id, provider_contract_id, language_id,
+                 from_snapshot_fingerprint, to_snapshot_fingerprint, symbol_kind,
+                 definition_fingerprint, algorithm_id, algorithm_version,
+                 from_count, to_count, potential_pair_count, review_class, storage_mode,
+                 from_members_hash, to_members_hash, created_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                       ?14, ?15, ?16, ?17, ?18, ?19)
+             ON CONFLICT(group_id) DO NOTHING",
+            params![
+                group.group_id,
+                group.project_key,
+                group.provider_profile_id,
+                group.provider_contract_id,
+                group.language.as_str(),
+                group.from_snapshot,
+                group.to_snapshot,
+                group.symbol_kind,
+                group.definition_fingerprint,
+                group.algorithm_id,
+                group.algorithm_version,
+                from_count,
+                to_count,
+                potential_pair_count,
+                group.review_class.as_str(),
+                group.storage_mode.as_str(),
+                group.from_members_hash,
+                group.to_members_hash,
+                now,
+            ],
+        )?)
+        .unwrap_or(u64::MAX);
+        let stored = transaction.query_row(
+            "SELECT from_count, to_count, potential_pair_count, review_class, storage_mode,
+                    from_members_hash, to_members_hash
+             FROM semantic_lineage_groups WHERE group_id = ?1",
+            [&group.group_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )?;
+        if stored
+            != (
+                from_count,
+                to_count,
+                potential_pair_count,
+                group.review_class.as_str().to_owned(),
+                group.storage_mode.as_str().to_owned(),
+                group.from_members_hash.clone(),
+                group.to_members_hash.clone(),
+            )
+        {
+            return Err(StoreError::InvalidLineage(format!(
+                "同一 immutable lineage group 重算结果不同：{}",
+                group.group_id
+            )));
+        }
+        for (side, members) in [("from", &group.from_members), ("to", &group.to_members)] {
+            for symbol_id in members {
+                members_inserted += u64::try_from(transaction.execute(
+                    "INSERT INTO semantic_lineage_group_members(group_id, side, symbol_id)
+                     VALUES (?1, ?2, ?3) ON CONFLICT(group_id, side, symbol_id) DO NOTHING",
+                    params![group.group_id, side, symbol_id],
+                )?)
+                .unwrap_or(u64::MAX);
+            }
+        }
+    }
+    Ok((groups_inserted, members_inserted))
+}
+
+fn persist_lineage_generation_runs(
+    transaction: &Transaction<'_>,
+    proposals: &LineageProposalSet,
+    now: i64,
+) -> Result<(), StoreError> {
+    type Boundary = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    );
+    let mut by_boundary = std::collections::BTreeMap::<Boundary, Vec<&LineageGroupProposal>>::new();
+    for group in &proposals.groups {
+        by_boundary
+            .entry((
+                group.project_key.clone(),
+                group.provider_profile_id.clone(),
+                group.provider_contract_id.clone(),
+                group.language.as_str().to_owned(),
+                group.from_snapshot.clone(),
+                group.to_snapshot.clone(),
+                group.algorithm_id.clone(),
+                group.algorithm_version.clone(),
+            ))
+            .or_default()
+            .push(group);
+    }
+    for (boundary, mut groups) in by_boundary {
+        groups.sort_by_key(|group| group.group_id.as_str());
+        let unique = groups
+            .iter()
+            .filter(|group| group.review_class.as_str() == "unique")
+            .count();
+        let ambiguous = groups
+            .iter()
+            .filter(|group| group.review_class.as_str() == "ambiguous")
+            .count();
+        let oversized = groups
+            .iter()
+            .filter(|group| group.review_class.as_str() == "oversized")
+            .count();
+        let potential = groups
+            .iter()
+            .try_fold(0_u64, |total, group| {
+                total.checked_add(group.potential_pair_count)
+            })
+            .ok_or_else(|| StoreError::InvalidLineage("generation run pair 计数溢出".to_owned()))?;
+        let manifest = serde_json::to_vec(&groups)?;
+        let manifest_hash = format!("sha256_{:x}", Sha256::digest(&manifest));
+        let candidate_count = proposals
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.project_key == boundary.0
+                    && candidate.provider_profile_id == boundary.1
+                    && candidate.provider_contract_id == boundary.2
+                    && candidate.language.as_str() == boundary.3
+                    && candidate.from_snapshot == boundary.4
+                    && candidate.to_snapshot == boundary.5
+            })
+            .count();
+        transaction.execute(
+            "INSERT INTO semantic_lineage_generation_runs(
+                 project_key, provider_profile_id, provider_contract_id, language_id,
+                 from_snapshot_fingerprint, to_snapshot_fingerprint, algorithm_id,
+                 algorithm_version, group_count, unique_group_count, ambiguous_group_count,
+                 oversized_group_count, potential_pair_count, materialized_candidate_count,
+                 group_manifest_hash, created_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             ON CONFLICT(project_key, provider_profile_id, provider_contract_id, language_id,
+                         from_snapshot_fingerprint, to_snapshot_fingerprint,
+                         algorithm_id, algorithm_version) DO NOTHING",
+            params![
+                boundary.0,
+                boundary.1,
+                boundary.2,
+                boundary.3,
+                boundary.4,
+                boundary.5,
+                boundary.6,
+                boundary.7,
+                i64::try_from(groups.len()).unwrap_or(i64::MAX),
+                i64::try_from(unique).unwrap_or(i64::MAX),
+                i64::try_from(ambiguous).unwrap_or(i64::MAX),
+                i64::try_from(oversized).unwrap_or(i64::MAX),
+                i64::try_from(potential).map_err(|_| StoreError::InvalidLineage(
+                    "generation run potential pair 超出 SQLite INTEGER".to_owned()
+                ))?,
+                i64::try_from(candidate_count).unwrap_or(i64::MAX),
+                manifest_hash,
+                now,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn persist_lineage_proposals(
     transaction: &Transaction<'_>,
     proposals: &[LineageCandidateProposal],
@@ -2230,8 +2738,9 @@ fn persist_lineage_proposals(
                  project_key, provider_profile_id, provider_contract_id, language_id,
                  from_snapshot_fingerprint, from_symbol_id,
                  to_snapshot_fingerprint, to_symbol_id, state,
-                 ambiguity_group_id, created_at_unix_seconds, updated_at_unix_seconds
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'proposed', ?9, ?10, ?10)
+                 ambiguity_group_id, origin_group_id, proposal_origin,
+                 created_at_unix_seconds, updated_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'proposed', ?9, ?10, ?11, ?12, ?12)
              ON CONFLICT(project_key, provider_profile_id, provider_contract_id, language_id,
                          from_snapshot_fingerprint, from_symbol_id,
                          to_snapshot_fingerprint, to_symbol_id) DO NOTHING",
@@ -2245,6 +2754,8 @@ fn persist_lineage_proposals(
                 proposal.to_snapshot,
                 proposal.to_symbol,
                 proposal.ambiguity_group_id,
+                proposal.origin_group_id,
+                proposal.proposal_origin,
                 now,
             ],
         )?)
@@ -2312,6 +2823,39 @@ fn decode_lineage_observation_row(
         display_name: row.get(9)?,
         path: row.get(10)?,
         normalized_definition_fingerprint: row.get(11)?,
+    })
+}
+
+fn decode_lineage_group_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<LineageGroupRecord, rusqlite::Error> {
+    let from_count = row.get::<_, i64>(11)?;
+    let to_count = row.get::<_, i64>(12)?;
+    let potential_pair_count = row.get::<_, i64>(13)?;
+    Ok(LineageGroupRecord {
+        group_id: row.get(0)?,
+        project_key: row.get(1)?,
+        provider_profile_id: row.get(2)?,
+        provider_contract_id: row.get(3)?,
+        language_id: row.get(4)?,
+        from_snapshot_fingerprint: row.get(5)?,
+        to_snapshot_fingerprint: row.get(6)?,
+        symbol_kind: row.get(7)?,
+        definition_fingerprint: row.get(8)?,
+        algorithm_id: row.get(9)?,
+        algorithm_version: row.get(10)?,
+        from_count: u64::try_from(from_count)
+            .map_err(|_| invalid_lineage_sql(11, format!("from_count={from_count}")))?,
+        to_count: u64::try_from(to_count)
+            .map_err(|_| invalid_lineage_sql(12, format!("to_count={to_count}")))?,
+        potential_pair_count: u64::try_from(potential_pair_count).map_err(|_| {
+            invalid_lineage_sql(13, format!("potential_pair_count={potential_pair_count}"))
+        })?,
+        review_class: row.get(14)?,
+        storage_mode: row.get(15)?,
+        from_members_hash: row.get(16)?,
+        to_members_hash: row.get(17)?,
+        created_at_unix_seconds: row.get(18)?,
     })
 }
 
@@ -2940,11 +3484,11 @@ mod tests {
         SYMBOL_PROTOCOL_VERSION, SourceFileState, SourceLanguage, SymbolNode, SymbolNodeInput,
         SymbolSnapshot, SymbolStatus, encode_provider_key,
     };
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
 
     use super::{
-        AdapterRecordResult, BrainStore, SemanticSnapshotSource, StoreError,
-        semantic_source_manifest_hash,
+        AdapterRecordResult, BrainStore, LineageCandidateRecord, SemanticSnapshotSource,
+        StoreError, semantic_source_manifest_hash,
     };
 
     const PROJECT_KEY: &str = "project_test";
@@ -3079,6 +3623,43 @@ mod tests {
                 &SemanticSnapshotSource::offline("b".repeat(64), "test-head".to_owned(), true),
             )
             .unwrap()
+    }
+
+    fn materialize_all_group_pairs(store: &BrainStore) -> Vec<LineageCandidateRecord> {
+        let group_id: String = store
+            .connection
+            .query_row(
+                "SELECT group_id FROM semantic_lineage_groups ORDER BY created_at_unix_seconds DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let members = |side: &str| {
+            store
+                .connection
+                .prepare(
+                    "SELECT symbol_id FROM semantic_lineage_group_members
+                     WHERE group_id = ?1 AND side = ?2 ORDER BY symbol_id",
+                )
+                .unwrap()
+                .query_map(params![group_id, side], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let from_members = members("from");
+        let to_members = members("to");
+        let mut candidates = Vec::new();
+        for from in &from_members {
+            for to in &to_members {
+                candidates.push(
+                    store
+                        .materialize_lineage_group_pair(PROJECT_KEY, &group_id, from, to)
+                        .unwrap(),
+                );
+            }
+        }
+        candidates
     }
 
     fn hook_event(project_key: &str, event_id: &str) -> InternalHookEvent {
@@ -3402,7 +3983,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 7);
+        assert_eq!(store.database_schema_version().unwrap(), 8);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, false, 10)
@@ -3487,7 +4068,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 7);
+        assert_eq!(store.database_schema_version().unwrap(), 8);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, true, 10)
@@ -3527,7 +4108,7 @@ mod tests {
         drop(connection);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 7);
+        assert_eq!(migrated.database_schema_version().unwrap(), 8);
         let legacy_source = migrated
             .connection
             .query_row(
@@ -3951,7 +4532,7 @@ mod tests {
             &[],
         );
         assert_eq!(proposals.len(), 1);
-        proposals[0].algorithm_version = "2".to_owned();
+        proposals[0].algorithm_version = "3".to_owned();
         let transaction = store.connection.unchecked_transaction().unwrap();
         let persisted = super::persist_lineage_proposals(
             &transaction,
@@ -4088,14 +4669,12 @@ mod tests {
         );
         apply_semantic(&store, &first);
         apply_semantic(&store, &second);
-        let candidates = store
-            .list_lineage_candidates(PROJECT_KEY, None, None, None, 10)
-            .unwrap();
+        let candidates = materialize_all_group_pairs(&store);
         assert_eq!(candidates.len(), 2);
         assert!(
             candidates
                 .iter()
-                .all(|candidate| candidate.ambiguity_group_id.is_some())
+                .all(|candidate| candidate.ambiguity_group_id.is_none())
         );
         let first_id = &candidates[0].candidate_id;
         let second_id = &candidates[1].candidate_id;
@@ -4135,6 +4714,66 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_group_stays_linear_and_requires_explicit_pair_materialization() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let first = semantic_snapshot(
+            "semantic-1",
+            vec![semantic_symbol("before", "src/a.rs", "stable-old")],
+        );
+        let second = semantic_snapshot(
+            "semantic-2",
+            vec![
+                semantic_symbol("after_a", "src/b.rs", "stable-new-a"),
+                semantic_symbol("after_b", "src/c.rs", "stable-new-b"),
+            ],
+        );
+        apply_semantic(&store, &first);
+        let applied = apply_semantic(&store, &second);
+
+        assert_eq!(applied.lineage_groups_inserted, 1);
+        assert_eq!(applied.lineage_group_members_inserted, 3);
+        assert_eq!(applied.potential_lineage_pairs, 2);
+        assert_eq!(applied.candidates_inserted, 0);
+        let group = store
+            .list_lineage_groups(PROJECT_KEY, 10)
+            .unwrap()
+            .remove(0);
+        let detail = store
+            .lineage_group(PROJECT_KEY, &group.group_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.from_members.len(), 1);
+        assert_eq!(detail.to_members.len(), 2);
+        assert!(matches!(
+            store.materialize_lineage_group_pair(
+                PROJECT_KEY,
+                &group.group_id,
+                "not-a-member",
+                &detail.to_members[0],
+            ),
+            Err(StoreError::InvalidLineage(_))
+        ));
+        let first_candidate = store
+            .materialize_lineage_group_pair(
+                PROJECT_KEY,
+                &group.group_id,
+                &detail.from_members[0],
+                &detail.to_members[0],
+            )
+            .unwrap();
+        let replay = store
+            .materialize_lineage_group_pair(
+                PROJECT_KEY,
+                &group.group_id,
+                &detail.from_members[0],
+                &detail.to_members[0],
+            )
+            .unwrap();
+        assert_eq!(first_candidate.candidate_id, replay.candidate_id);
+        assert_eq!(replay.state, LineageState::Proposed);
+    }
+
+    #[test]
     fn v4_migration_preserves_project_scoped_graph_and_adds_lineage_ledger() {
         let (root, database) = temporary_database("v4-lineage-migration");
         let store = BrainStore::open(&database).unwrap();
@@ -4155,7 +4794,7 @@ mod tests {
         drop(store);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 7);
+        assert_eq!(migrated.database_schema_version().unwrap(), 8);
         assert_eq!(
             migrated
                 .list_symbols(PROJECT_KEY, None, false, 10)
@@ -4190,9 +4829,7 @@ mod tests {
         );
         apply_semantic(&store, &first);
         apply_semantic(&store, &second);
-        let ids = store
-            .list_lineage_candidates(PROJECT_KEY, None, None, None, 10)
-            .unwrap()
+        let ids = materialize_all_group_pairs(&store)
             .into_iter()
             .map(|candidate| candidate.candidate_id)
             .collect::<Vec<_>>();
