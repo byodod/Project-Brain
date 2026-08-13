@@ -3,6 +3,7 @@ members = [
     "crates/brain-analyzer",
     "crates/brain-core",
     "crates/brain-evidence",
+    "crates/brain-godot",
     "crates/brain-scip",
     "crates/brain-store",
     "crates/brain-symbols",

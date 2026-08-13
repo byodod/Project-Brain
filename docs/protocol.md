@@ -196,6 +196,15 @@ Artifact ID 绑定 `project_key + provider_id + provider_key`，边的两端必�
 只有 deterministic provider 产生的 complete、fresh、error finding 才具有 hard-block 资格；
 资格仍不等于自动阻断，最终必须继续经过规则 authority/strength/effect 判定。
 
+Godot probe schema v1 返回 `before/after` 两份 `ProbeProjectState`。每份状态包含
+`project_sha256`、main scene、autoloads，以及所有 `.tscn/.tres` 的 UID、SHA-256、load result 与
+`ResourceLoader.get_dependencies()` 解析结果。转换层会规范排序并忽略 before/after 的 `loaded`
+差异；其余字段必须完全一致，且 after 哈希必须与 Rust 再次读取的项目文件一致。
+
+Godot Engine Snapshot 使用固定 provider ID `godot-engine-resolver`；provider version 同时携带实际
+Godot version 与 executable SHA-256。Engine 导出的 diagnostics、load failure、missing dependency、
+unresolved UID 和 cache reference 都成为明确 finding，而不是依赖自由文本猜测。
+
 ## AnalysisReport
 
 `project-brain analyze` 输出版本化报告。每个受支持文件包含：

@@ -20,7 +20,7 @@ use crate::{
     claude::{self, ClaudeHookInput},
     codex::{self, CodexHookInput},
     error::AppError,
-    git, index,
+    git, godot, index,
     prime::{self, PrimeHookInput},
     provider, reconcile, scip_index, setup,
 };
@@ -555,6 +555,23 @@ impl App {
 
     pub fn reconcile(&self, base: &str, envelope: &Path) -> Result<(), AppError> {
         let report = reconcile::evaluate_from_path(&self.root, base, envelope)?;
+        println!("{}", pretty_json(&report)?);
+        Ok(())
+    }
+
+    pub fn evidence_godot(
+        &self,
+        executable: &Path,
+        trust_local_executable: bool,
+        timeout_seconds: u64,
+    ) -> Result<(), AppError> {
+        let report = godot::run(
+            &self.root,
+            &self.config.project_key,
+            executable,
+            trust_local_executable,
+            timeout_seconds,
+        )?;
         println!("{}", pretty_json(&report)?);
         Ok(())
     }

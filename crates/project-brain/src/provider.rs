@@ -35,6 +35,11 @@ struct ProviderArtifact {
     sha256: String,
 }
 
+pub(crate) struct PinnedExternalExecutable {
+    pub canonical_path: PathBuf,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ProviderBinding {
     registration_id: String,
@@ -290,18 +295,18 @@ impl Drop for ProviderRun {
     }
 }
 
-struct ProcessResult {
-    status: ExitStatus,
-    duration: Duration,
-    stdout: CapturedOutput,
-    stderr: CapturedOutput,
+pub(crate) struct ProcessResult {
+    pub status: ExitStatus,
+    pub duration: Duration,
+    pub stdout: CapturedOutput,
+    pub stderr: CapturedOutput,
 }
 
-struct CapturedOutput {
-    bytes: Vec<u8>,
-    total_bytes: usize,
-    sha256: String,
-    truncated: bool,
+pub(crate) struct CapturedOutput {
+    pub bytes: Vec<u8>,
+    pub total_bytes: usize,
+    pub sha256: String,
+    pub truncated: bool,
 }
 
 #[allow(
@@ -919,6 +924,20 @@ fn pinned_artifact(path: &Path, label: &str) -> Result<ProviderArtifact, AppErro
     })
 }
 
+pub(crate) fn pin_external_executable(
+    project_root: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<PinnedExternalExecutable, AppError> {
+    let artifact = pinned_artifact(path, label)?;
+    reject_repository_artifact(project_root, &artifact, label)?;
+    reject_windows_command_script(&artifact.canonical_path)?;
+    Ok(PinnedExternalExecutable {
+        canonical_path: artifact.canonical_path,
+        sha256: artifact.sha256,
+    })
+}
+
 fn scip_python_package_manifest(script: &ProviderArtifact) -> Result<String, AppError> {
     let package_root = script
         .canonical_path
@@ -1289,7 +1308,7 @@ fn provider_arguments(
     }
 }
 
-fn provider_cli_path(path: &Path) -> String {
+pub(crate) fn provider_cli_path(path: &Path) -> String {
     let value = path.to_string_lossy();
     if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
@@ -1360,13 +1379,34 @@ fn sanitized_path(repository_root: Option<&Path>) -> Result<Option<std::ffi::OsS
         .map_err(|error| AppError::Provider(format!("无法构造安全 Provider PATH：{error}")))
 }
 
-fn run_process(
+pub(crate) fn run_process(
     executable: &Path,
     launcher_script: Option<&Path>,
     arguments: &[String],
     cwd: &Path,
     repository_root: Option<&Path>,
     timeout: Duration,
+) -> Result<ProcessResult, AppError> {
+    run_process_with_environment(
+        executable,
+        launcher_script,
+        arguments,
+        cwd,
+        repository_root,
+        timeout,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_process_with_environment(
+    executable: &Path,
+    launcher_script: Option<&Path>,
+    arguments: &[String],
+    cwd: &Path,
+    repository_root: Option<&Path>,
+    timeout: Duration,
+    environment: &[(&str, &Path)],
 ) -> Result<ProcessResult, AppError> {
     let mut command = Command::new(executable);
     if let Some(script) = launcher_script {
@@ -1379,6 +1419,9 @@ fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_provider_environment(&mut command, repository_root)?;
+    for (name, value) in environment {
+        command.env(name, value);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1487,7 +1530,7 @@ fn terminate_process_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
-fn version_text(process: &ProcessResult) -> Result<String, AppError> {
+pub(crate) fn version_text(process: &ProcessResult) -> Result<String, AppError> {
     let text = if process
         .stdout
         .bytes
@@ -1557,7 +1600,7 @@ fn secure_file(_path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn hash_file(path: &Path) -> Result<String, AppError> {
+pub(crate) fn hash_file(path: &Path) -> Result<String, AppError> {
     let mut file = fs::File::open(path)?;
     let mut digest = Sha256::new();
     let mut chunk = vec![0_u8; 64 * 1024];

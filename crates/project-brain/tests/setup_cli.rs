@@ -80,6 +80,44 @@ fn assert_success(output: &Output) {
 }
 
 #[test]
+fn godot_evidence_requires_explicit_machine_executable_trust() {
+    let root = temp_root("godot-trust");
+    let project = root.join("repo");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("project.godot"), b"[application]\n").unwrap();
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_project-brain"));
+    assert_success(&run(
+        &executable,
+        &["--project-root", project.to_str().unwrap(), "init"],
+        &root,
+        None,
+    ));
+    let fake_engine = root.join("fake-godot");
+    fs::write(&fake_engine, b"not executable").unwrap();
+    let output = run(
+        &executable,
+        &[
+            "--project-root",
+            project.to_str().unwrap(),
+            "evidence",
+            "godot",
+            "--executable",
+            fake_engine.to_str().unwrap(),
+        ],
+        &project,
+        None,
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--trust-local-executable"),
+        "unexpected stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn prime_direct_adapter_blocks_without_claiming_stop_continuation() {
     let root = temp_root("prime-direct");
     let project = root.join("repo");

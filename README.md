@@ -237,6 +237,26 @@ project-brain dispatch prime-agent pre-tool-use
 因此 `continue_after_stop` 必须保持 `unsupported`。本阶段尚未开放
 `install-hooks prime-agent`，不会向 `~/.prime/agent/extensions/` 写入未经原子安装测试的文件。
 
+## Godot Engine Evidence Provider
+
+对已初始化的 Godot 4 项目，可以显式信任机器上的 editor/console binary，并让真实引擎执行导入、
+UID 解析、主场景与 autoload 解析，以及 `.tscn/.tres` 全量加载：
+
+```text
+project-brain evidence godot \
+  --executable /absolute/path/to/godot \
+  --trust-local-executable
+```
+
+Windows 必须直接指向 `.exe`，不接受 `.cmd/.bat` shell shim。Provider 会固定 executable SHA-256，
+验证 Godot 4 的 `--headless/--script/--import` 能力，在机器私有临时目录运行 Project Brain 自带的
+GDScript probe，并隔离 HOME/APPDATA/XDG。该命令只做 import/load evidence，**不会执行任何 export**。
+
+Engine Snapshot 记录 `project.godot`、main scene、autoload、scene/resource、script/source asset 与
+实际依赖边。探针会在加载前后各采集一次引擎解析状态及文件 SHA-256；任一变化都拒绝提交结果。
+`.godot/` 始终被排除在 ArtifactGraph 之外，只是可删除的引擎执行缓存。当前 CLI 输出已验证快照，
+持久化与 Hook 新鲜度联动仍属于下一阶段。
+
 手工验证适配器：
 
 ```text
@@ -565,6 +585,7 @@ crates/
 ├── brain-analyzer/   # Tree-sitter changed-symbol 提取
 ├── brain-core/       # 协议、规则验证、确定性决策
 ├── brain-evidence/   # Source/Semantic/Engine/Build/Runtime 证据与 ArtifactGraph 协议
+├── brain-godot/      # Godot 4 真实加载探针到 Engine Evidence 的确定性转换
 ├── brain-scip/       # 离线 SCIP protobuf、项目 profile 与语义快照
 ├── brain-store/      # SQLite schema 与审计
 ├── brain-symbols/    # Provider-neutral 符号、边、快照与身份协议
@@ -580,8 +601,8 @@ crates/
 
 - Codex 与 Claude Code 已提供直接适配器、用户级 Hook 安装器和按 adapter 选择的 `doctor`；
   Prime Agent 已有独立 direct adapter，但用户级 Extension 安装器与 doctor 尚未实现。
-- `brain-evidence` 已定义分层证据与 ArtifactGraph 协议，但 Godot Engine Provider、持久化与 Hook
-  新鲜度联动尚未完成，不能据此声称已具备引擎项目完整真相。
+- Godot Engine Provider v1 已能运行真实 import/load 探针并生成 Engine Snapshot，但持久化与 Hook
+  新鲜度联动尚未完成，不能据此声称已具备引擎项目完整治理闭环。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。

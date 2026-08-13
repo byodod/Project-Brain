@@ -4,6 +4,7 @@ mod claude;
 mod codex;
 mod error;
 mod git;
+mod godot;
 mod index;
 mod prime;
 mod protocol;
@@ -125,6 +126,12 @@ enum Command {
         command: ProviderCommand,
     },
 
+    /// 生成分层项目证据；不会导出或发布项目
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
+    },
+
     /// 查看或显式裁决 semantic lineage 候选
     Lineage {
         #[command(subcommand)]
@@ -209,6 +216,21 @@ enum ProviderCommand {
         /// 同时要求每个 profile 已索引且覆盖率可验证为 complete
         #[arg(long)]
         require_indexed: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EvidenceCommand {
+    /// 使用锁定的 Godot 4 editor 实际导入并加载项目资源
+    Godot {
+        /// Godot 4 editor/console binary 的机器绝对路径
+        #[arg(long)]
+        executable: PathBuf,
+        /// 确认信任此机器本地 executable；Hook 不会自动提供此参数
+        #[arg(long)]
+        trust_local_executable: bool,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
     },
 }
 
@@ -482,6 +504,15 @@ fn main() -> ExitCode {
                 ProviderCommand::Coverage { require_indexed } => {
                     app.provider_coverage(require_indexed)
                 }
+            })
+        }
+        Command::Evidence { command } => {
+            App::open(cli.project_root).and_then(|app| match command {
+                EvidenceCommand::Godot {
+                    executable,
+                    trust_local_executable,
+                    timeout_seconds,
+                } => app.evidence_godot(&executable, trust_local_executable, timeout_seconds),
             })
         }
         Command::Lineage { command } => App::open(cli.project_root).and_then(|app| match command {

@@ -116,6 +116,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "brain-godot"
+version = "0.1.0"
+dependencies = [
+ "brain-evidence",
+ "serde",
+ "sha2",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "brain-scip"
 version = "0.1.0"
 dependencies = [
@@ -447,6 +457,7 @@ dependencies = [
  "atomic-write-file",
  "brain-analyzer",
  "brain-core",
+ "brain-godot",
  "brain-scip",
  "brain-store",
  "brain-symbols",
