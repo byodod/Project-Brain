@@ -17,13 +17,24 @@ pub enum EvidencePlane {
 }
 
 impl EvidencePlane {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Source => "source",
             Self::Semantic => "semantic",
             Self::Engine => "engine",
             Self::Build => "build",
             Self::Runtime => "runtime",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "source" => Some(Self::Source),
+            "semantic" => Some(Self::Semantic),
+            "engine" => Some(Self::Engine),
+            "build" => Some(Self::Build),
+            "runtime" => Some(Self::Runtime),
+            _ => None,
         }
     }
 
@@ -46,10 +57,18 @@ pub enum EvidenceAuthority {
 }
 
 impl EvidenceAuthority {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Deterministic => "deterministic",
             Self::Heuristic => "heuristic",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "deterministic" => Some(Self::Deterministic),
+            "heuristic" => Some(Self::Heuristic),
+            _ => None,
         }
     }
 }
@@ -62,10 +81,18 @@ pub enum EvidenceCoverage {
 }
 
 impl EvidenceCoverage {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Complete => "complete",
             Self::Partial => "partial",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "complete" => Some(Self::Complete),
+            "partial" => Some(Self::Partial),
+            _ => None,
         }
     }
 }
@@ -76,6 +103,25 @@ pub enum EvidenceFreshness {
     Fresh,
     Stale,
     Unknown,
+}
+
+impl EvidenceFreshness {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "fresh" => Some(Self::Fresh),
+            "stale" => Some(Self::Stale),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]

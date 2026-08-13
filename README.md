@@ -255,7 +255,17 @@ GDScript probe，并隔离 HOME/APPDATA/XDG。该命令只做 import/load eviden
 Engine Snapshot 记录 `project.godot`、main scene、autoload、scene/resource、script/source asset 与
 实际依赖边。探针会在加载前后各采集一次引擎解析状态及文件 SHA-256；任一变化都拒绝提交结果。
 `.godot/` 始终被排除在 ArtifactGraph 之外，只是可删除的引擎执行缓存。当前 CLI 输出已验证快照，
-持久化与 Hook 新鲜度联动仍属于下一阶段。
+并原子写入项目隔离的 SQLite Evidence ledger。查看当前 head：
+
+```text
+project-brain evidence status
+```
+
+完整 ArtifactGraph 按 fingerprint 只保存一次；每次真实运行追加轻量 attestation。Codex、Claude Code
+或 Prime Agent 的 `PostToolUse` 一旦观察到明确的 Create/Modify/Delete，当前 Engine Evidence 就会变为
+`stale`，并在后续 Session/Intent/PreTool/Stop 注入提示；重新运行 Godot probe 才恢复 `fresh`。
+`stale` 证据永远没有硬阻断资格。即便是 `fresh + complete + deterministic + error` finding，也仍须
+仓库规则显式提供 authority/strength/effect，Provider 本身不能自动 block。
 
 手工验证适配器：
 

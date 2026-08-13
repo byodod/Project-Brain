@@ -109,7 +109,8 @@ profile/root 与工作区前后指纹全部通过后，才进入 semantic snapsh
         ├── audit_events 本地派生记录、不进入版本控制
         ├── adapter_audit_events 按项目/适配器隔离的事件、结果、延迟与失败
         ├── symbol graph 按 project_key 隔离、可从工作区完整重建的派生索引
-        └── semantic source manifest 快照实际覆盖的完整 Document 证据
+        ├── semantic source manifest 快照实际覆盖的完整 Document 证据
+        └── evidence snapshot/head/attestation/staleness 分层证据账本
 
 <ProjectBrainData>/state/providers.json
         │
@@ -123,8 +124,9 @@ SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照�
 进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
 符号 ID、快照 revision、节点/边主键、查询和墓碑更新都包含 `project_key`。数据库 schema v4
 首次建立这组项目隔离约束；对应迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与
-adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v11，并在这些约束上
-增加独立的语义血缘账本、append-only 来源证明和不可伪造的源码 Document manifest。
+adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v12，并在这些约束上
+增加独立的语义血缘账本、append-only 来源证明、不可伪造的源码 Document manifest，以及
+Evidence Plane 当前 head 与 staleness 事件。
 数据库迁移拒绝缺失或非整数的已有 `schema_version`，不会把损坏元数据静默当作 v1。
 Adapter 审计依赖 SQLite 唯一约束和 busy timeout，使并发连接对同一项目事件收敛到首次 outcome；
 失败记录可在重开数据库后由成功重试升级，后续重复成功不能覆盖首次成功。
@@ -144,7 +146,7 @@ confirmed / rejected / superseded / invalidated
            └── never rewrites SymbolNode / tombstone / snapshot
 ```
 
-SQLite schema v11 保存 semantic snapshots、append-only source attestations、source manifests、
+SQLite schema v12 保存 semantic snapshots、append-only source attestations、source manifests、
 symbol observations、group/member/generation run、candidate/evidence/decision，以及显式旧账压缩的
 run/group 审计和 append-only Provider qualification events。压缩默认只读；apply 必须携带人工确认与幂等 request ID，且逻辑删除与审计同事务。
 物理 `VACUUM` 不属于压缩事务，也不能替代候选资格证明。
@@ -168,6 +170,12 @@ workspace run 的 union 不构成一致的语义世界，因此协议明确禁�
 普通 `provider index` 即使偶然得到 complete 输出也不得提交；只有相同机器绑定的显式重复验证达到
 `stable_complete` 才恢复提交资格。资格存在后，Provider registration revision 或 executable hash
 变化会使它过期并要求重新验证。
+
+Engine/Build/Runtime 等跨语言证据使用独立 ledger：不可变 `evidence_snapshots` 只按 fingerprint 保存
+一次完整 JSON，重复真实运行只追加小型 `evidence_attestations`；`evidence_heads` 保存每个项目、plane、
+provider 当前指向及 fresh/stale 状态。明确的文件 Create/Modify/Delete 完成事件以 project + event ID
+幂等写入 `evidence_staleness_events`，并把当前 Engine head 标为 stale；重新执行真实 Provider 才能将
+head 恢复 fresh。这个结构避免重复保存大型 ArtifactGraph，也不把 stale finding 提升为硬阻断。
 
 ## 阻断权限
 
@@ -219,9 +227,9 @@ Extension 安装器仍留在后续阶段。
 4. Claude Code 已覆盖安装后 exec-form handler 的真实子进程 fixture；Prime Agent 独立 direct
    adapter 已完成，下一步增加原子 Extension 安装与真实 Prime runtime fixture。按 adapter 选择的
    doctor 已由 ADR-0016 完成。
-5. Source、Semantic、Engine、Build、Runtime 分层 Evidence Plane 与独立 ArtifactGraph 已由
-   `brain-evidence` 定义；Godot Engine Evidence Provider v1 已通过真实 Godot 4.6 项目验证，
-   下一阶段加入持久化、staleness 传播和 Hook 决策输入。
+5. Source、Semantic、Engine、Build、Runtime 分层 Evidence Plane、独立 ArtifactGraph、SQLite
+   快照/attestation/head/staleness ledger 与 Hook 新鲜度提示已经完成；Godot Engine Evidence Provider
+   v1 已通过真实 Godot 4.6 项目验证。下一阶段实现 Build/Runtime Provider 和规则到 finding 的显式映射。
 6. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
    直接 hard block。
 
@@ -238,4 +246,5 @@ Extension 安装器仍留在后续阶段。
 [ADR-0011](adr/0011-complete-only-and-provider-stability.md) 与
 [ADR-0012](adr/0012-group-first-lineage-and-signature-evidence.md)，以及
 [ADR-0019](adr/0019-evidence-planes-and-artifact-graph.md) 与
-[ADR-0020](adr/0020-godot-engine-evidence-provider.md)。
+[ADR-0020](adr/0020-godot-engine-evidence-provider.md) 与
+[ADR-0021](adr/0021-evidence-ledger-and-hook-staleness.md)。

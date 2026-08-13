@@ -1,11 +1,13 @@
 use std::{collections::BTreeMap, path::Path};
 
 use brain_core::{
-    ActionDescriptor, BrainConfig, CURRENT_SCHEMA_VERSION, ContextItem, Decision, DecisionKind,
-    Evidence, EvidenceGrade, FeedbackItem, FeedbackSeverity, GateDecision, HOOK_PROTOCOL_VERSION,
-    HookEventPayload, HookOutcomePayload, InternalHookEvent, InternalHookOutcome, MemoryStatus,
-    Rule, RuleEffect, RuleEngine, StopDecision, ToolAction, path_has_prefix,
+    ActionDescriptor, ActionKind, BrainConfig, CURRENT_SCHEMA_VERSION, ContextItem, Decision,
+    DecisionKind, Evidence, EvidenceGrade, FeedbackItem, FeedbackSeverity, GateDecision,
+    HOOK_PROTOCOL_VERSION, HookEventPayload, HookOutcomePayload, InternalHookEvent,
+    InternalHookOutcome, MemoryStatus, Rule, RuleEffect, RuleEngine, StopDecision, ToolAction,
+    path_has_prefix,
 };
+use brain_evidence::{EvidenceFreshness, EvidencePlane};
 use brain_store::{BrainStore, SemanticResolutionKind, SemanticSourceTrust};
 
 use crate::provider::ProviderTrustStatus;
@@ -20,14 +22,16 @@ pub fn process(
 ) -> Result<InternalHookOutcome, AppError> {
     event.validate()?;
     let payload = match &event.payload {
-        HookEventPayload::SessionOpened(_) => HookOutcomePayload::SessionOpened {
-            inject: vec![ContextItem {
+        HookEventPayload::SessionOpened(_) => {
+            let mut inject = vec![ContextItem {
                 text: session_context(config),
-            }],
-        },
+            }];
+            inject.extend(engine_evidence_context(store, &config.project_key, true)?);
+            HookOutcomePayload::SessionOpened { inject }
+        }
         HookEventPayload::IntentDeclared(_) => HookOutcomePayload::IntentDeclared {
             gate: GateDecision::NoVeto,
-            inject: Vec::new(),
+            inject: engine_evidence_context(store, &config.project_key, false)?,
         },
         HookEventPayload::ToolAboutToRun(tool) => {
             let decision = evaluate_action(
@@ -39,9 +43,11 @@ pub fn process(
                 &tool.action,
                 &tool.tool_name,
             )?;
+            let mut inject = context_from_decision(&decision);
+            inject.extend(engine_evidence_context(store, &config.project_key, false)?);
             HookOutcomePayload::ToolAboutToRun {
                 gate: gate_from_decision(&decision),
-                inject: context_from_decision(&decision),
+                inject,
             }
         }
         HookEventPayload::ToolFinished(tool) => {
@@ -54,18 +60,43 @@ pub fn process(
                 &tool.action,
                 &tool.tool_name,
             )?;
-            HookOutcomePayload::ToolFinished {
-                feedback: feedback_from_decision(&decision),
+            let mut feedback = feedback_from_decision(&decision);
+            if explicit_mutation(&tool.action)
+                && store
+                    .list_evidence_head_summaries(&config.project_key)?
+                    .iter()
+                    .any(|head| head.plane == EvidencePlane::Engine)
+            {
+                let changed_paths = mutation_paths(&tool.action);
+                let reason = format!(
+                    "PostToolUse observed {:?} {:?}; Engine Evidence must be refreshed",
+                    tool.status, tool.action.kind
+                );
+                let stale = store.mark_evidence_plane_stale(
+                    &config.project_key,
+                    EvidencePlane::Engine,
+                    &event.event_id,
+                    &reason,
+                    &changed_paths,
+                )?;
+                if stale.heads_marked > 0 {
+                    feedback.push(FeedbackItem {
+                        severity: FeedbackSeverity::Warning,
+                        text: "Project Brain：源码修改后 Engine Evidence 已标记为 stale；stale 证据没有硬阻断资格。请重新运行受信任的引擎探针恢复 fresh。".to_owned(),
+                    });
+                }
             }
+            HookOutcomePayload::ToolFinished { feedback }
         }
         HookEventPayload::TaskStopping(stopping) => {
-            let (stop, feedback) = stop_decision(
+            let (stop, mut feedback) = stop_decision(
                 root,
                 config,
                 store,
                 provider_trust,
                 stopping.vendor_loop_active,
             );
+            feedback.extend(engine_evidence_feedback(store, &config.project_key)?);
             HookOutcomePayload::TaskStopping { stop, feedback }
         }
     };
@@ -74,6 +105,84 @@ pub fn process(
         event_id: event.event_id.clone(),
         payload,
     })
+}
+
+fn explicit_mutation(action: &ToolAction) -> bool {
+    matches!(
+        action.kind,
+        ActionKind::Create | ActionKind::Modify | ActionKind::Delete
+    )
+}
+
+fn mutation_paths(action: &ToolAction) -> Vec<String> {
+    let mut paths = action.target_files.clone();
+    paths.extend(
+        action
+            .deterministic_impacts
+            .iter()
+            .map(|impact| impact.path.clone()),
+    );
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn engine_evidence_context(
+    store: &BrainStore,
+    project_key: &str,
+    include_fresh: bool,
+) -> Result<Vec<ContextItem>, AppError> {
+    Ok(store
+        .list_evidence_head_summaries(project_key)?
+        .into_iter()
+        .filter(|head| head.plane == EvidencePlane::Engine)
+        .filter(|head| include_fresh || head.freshness != EvidenceFreshness::Fresh)
+        .map(|head| ContextItem {
+            text: engine_evidence_message(
+                &head.provider_id,
+                head.freshness,
+                &head.snapshot_fingerprint,
+                head.stale_reason.as_deref(),
+            ),
+        })
+        .collect())
+}
+
+fn engine_evidence_feedback(
+    store: &BrainStore,
+    project_key: &str,
+) -> Result<Vec<FeedbackItem>, AppError> {
+    Ok(store
+        .list_evidence_head_summaries(project_key)?
+        .into_iter()
+        .filter(|head| {
+            head.plane == EvidencePlane::Engine && head.freshness != EvidenceFreshness::Fresh
+        })
+        .map(|head| FeedbackItem {
+            severity: FeedbackSeverity::Warning,
+            text: engine_evidence_message(
+                &head.provider_id,
+                head.freshness,
+                &head.snapshot_fingerprint,
+                head.stale_reason.as_deref(),
+            ),
+        })
+        .collect())
+}
+
+fn engine_evidence_message(
+    provider_id: &str,
+    freshness: EvidenceFreshness,
+    snapshot_fingerprint: &str,
+    stale_reason: Option<&str>,
+) -> String {
+    let reason = stale_reason
+        .map(|value| format!("；原因：{value}"))
+        .unwrap_or_default();
+    format!(
+        "Project Brain Engine Evidence：provider={provider_id}，freshness={}，snapshot={snapshot_fingerprint}{reason}。只有 fresh + complete + deterministic 的具体 error finding 才可能具备硬阻断资格；仍需仓库规则显式授权。",
+        freshness.as_str()
+    )
 }
 
 fn evaluate_action(

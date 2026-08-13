@@ -10,6 +10,7 @@ authors.workspace = true
 atomic-write-file.workspace = true
 brain-analyzer = { path = "../brain-analyzer" }
 brain-core = { path = "../brain-core" }
+brain-evidence = { path = "../brain-evidence" }
 brain-godot = { path = "../brain-godot" }
 brain-scip = { path = "../brain-scip" }
 brain-store = { path = "../brain-store" }

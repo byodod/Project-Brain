@@ -24,8 +24,9 @@ Accepted
    文件 hash；两份状态除 load result 外必须完全相同。Rust 随后再次读取所有权威文件核对 hash。
 5. `.godot/`、`.git/` 不参与扫描。任何指向 `.godot/` 的依赖都产生错误 finding，绝不进入
    ArtifactGraph。
-6. v1 输出经过验证的 Engine Evidence Snapshot，但暂不写入 SQLite。持久化、下游 staleness 与
-   Hook hard-gate 需要后续独立 schema migration 和重放测试。
+6. v1 首次交付只输出经过验证的 Engine Evidence Snapshot，不在本 ADR 内定义持久化。后续
+   [ADR-0021](0021-evidence-ledger-and-hook-staleness.md) 已用独立 schema migration 和重放测试增加
+   SQLite ledger 与 Hook staleness 传播。
 
 ## 验证
 
@@ -38,7 +39,7 @@ Accepted
 
 ## 后果
 
-- Project Brain 首次拥有超出源码/SCIP 的真实引擎事实，但还不能声称完整治理闭环。
+- Project Brain 首次拥有超出源码/SCIP 的真实引擎事实；其后续治理闭环由 ADR-0021 定义。
 - 引擎执行会正常重建 `.godot/` cache；该目录仍是可删除派生物，不构成 evidence authority。
 - Build 与 Runtime Plane 后续可以引用本 Engine Snapshot，而不是把“编译通过”和“场景可加载”
   混成同一事实。

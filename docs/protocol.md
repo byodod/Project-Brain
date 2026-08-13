@@ -205,6 +205,18 @@ Godot Engine Snapshot 使用固定 provider ID `godot-engine-resolver`；provide
 Godot version 与 executable SHA-256。Engine 导出的 diagnostics、load failure、missing dependency、
 unresolved UID 和 cache reference 都成为明确 finding，而不是依赖自由文本猜测。
 
+SQLite schema v12 为 Evidence Protocol 增加四类项目隔离记录：
+
+- `evidence_snapshots`：不可变完整快照；相同 project/plane/provider/fingerprint 只保存一次 JSON；
+- `evidence_attestations`：每次真实 Provider 运行的轻量 append-only 证明；
+- `evidence_heads`：每个 project/plane/provider 的当前 fingerprint 与 fresh/stale 状态；
+- `evidence_staleness_events`：以 project + Hook event ID 幂等记录使 head 失效的源码修改事件。
+
+成功应用快照会原子追加 attestation、移动 head 并清除 stale 原因。三种 Agent adapter 共用的内部
+`PostToolUse` 路径在观察到明确 Create/Modify/Delete 后把当前 Engine head 标为 stale；Session、Intent、
+PreTool 与 Stop 只注入状态提示，不凭 stale 状态自动阻断。失败或未知状态的修改工具也可能已产生部分
+写入，因此同样保守失效。重复 delivery 复用 event ID，不会制造不同的 staleness 语义。
+
 ## AnalysisReport
 
 `project-brain analyze` 输出版本化报告。每个受支持文件包含：
@@ -353,7 +365,7 @@ V8 的 ambiguity 属于 `semantic_lineage_groups`；candidate 的旧 `ambiguity_
    snapshot 或跨 provider 建 equivalence；
 10. 已导入但不是当前最新的历史 snapshot 不能重新应用为当前符号图。
 
-SQLite schema v11 保存 semantic snapshots、source attestations、source manifests、symbol observations、
+SQLite schema v12 保存 semantic snapshots、source attestations、source manifests、symbol observations、
 lineage groups/members/generation runs、candidate/evidence/decision 与 legacy compaction audit。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升
 为硬证据，也不会从现存 symbol 反推缺失 Document。真实重跑相同 snapshot 时可以首次补录 manifest；
 可信重跑只追加 attestation，不改写 symbol observations 或人工 lineage 状态。attestation 的唯一身份

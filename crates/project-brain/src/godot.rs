@@ -4,6 +4,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use brain_evidence::EvidenceSnapshot;
 use brain_godot::{GodotEvidenceReport, GodotProbeResult, build_engine_evidence};
 use serde::Serialize;
 
@@ -24,6 +25,12 @@ pub struct GodotRunReport {
     import: GodotProcessSummary,
     probe: GodotProcessSummary,
     evidence: GodotEvidenceReport,
+}
+
+impl GodotRunReport {
+    pub fn evidence_snapshot(&self) -> &EvidenceSnapshot {
+        &self.evidence.snapshot
+    }
 }
 
 #[derive(Debug, Serialize)]

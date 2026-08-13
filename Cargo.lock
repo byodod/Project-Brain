@@ -142,6 +142,7 @@ name = "brain-store"
 version = "0.1.0"
 dependencies = [
  "brain-core",
+ "brain-evidence",
  "brain-symbols",
  "rusqlite",
  "serde",
@@ -457,6 +458,7 @@ dependencies = [
  "atomic-write-file",
  "brain-analyzer",
  "brain-core",
+ "brain-evidence",
  "brain-godot",
  "brain-scip",
  "brain-store",

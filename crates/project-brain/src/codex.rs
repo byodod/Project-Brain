@@ -694,6 +694,10 @@ mod tests {
         InternalHookEvent, MemoryStatus, Rule, RuleEffect, RuleStrength, StopReconcileConfig,
         ToolStatus,
     };
+    use brain_evidence::{
+        EvidenceAuthority, EvidenceCoverage, EvidenceFreshness, EvidencePlane, EvidenceProvider,
+        EvidenceSnapshot,
+    };
     use brain_store::BrainStore;
     use serde_json::json;
 
@@ -741,6 +745,26 @@ mod tests {
             }),
             ..CodexHookInput::default()
         }
+    }
+
+    fn engine_snapshot(project_key: &str) -> EvidenceSnapshot {
+        EvidenceSnapshot::new(
+            project_key,
+            EvidencePlane::Engine,
+            EvidenceProvider {
+                id: "godot-engine-resolver".to_owned(),
+                version: "4.6+sha256.test".to_owned(),
+                contract_version: 1,
+                authority: EvidenceAuthority::Deterministic,
+            },
+            "sha256_source-test",
+            EvidenceCoverage::Complete,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -867,6 +891,64 @@ mod tests {
             panic!("期望 ToolFinished")
         };
         assert_eq!(finished.status, ToolStatus::Failed);
+    }
+
+    #[test]
+    fn successful_post_tool_mutation_marks_engine_evidence_stale_and_reports_it() {
+        let store = BrainStore::open_in_memory().unwrap();
+        store
+            .apply_evidence_snapshot(&engine_snapshot("project_a"))
+            .unwrap();
+        let input = CodexHookInput {
+            session_id: "session".to_owned(),
+            cwd: "C:/repo".to_owned(),
+            turn_id: "turn".to_owned(),
+            tool_name: "Write".to_owned(),
+            tool_use_id: "write-tool".to_owned(),
+            tool_input: json!({ "path": "src/main.rs" }),
+            tool_response: json!({ "success": true }),
+            ..CodexHookInput::default()
+        };
+
+        let output = handle(
+            Path::new("C:/repo"),
+            &config("project_a"),
+            &store,
+            HookEvent::PostToolUse,
+            &input,
+        )
+        .unwrap();
+        assert!(
+            output.0["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("已标记为 stale")
+        );
+        let head = store
+            .list_evidence_heads("project_a")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(head.freshness, EvidenceFreshness::Stale);
+
+        let session = handle(
+            Path::new("C:/repo"),
+            &config("project_a"),
+            &store,
+            HookEvent::SessionStart,
+            &CodexHookInput {
+                session_id: "next-session".to_owned(),
+                source: "startup".to_owned(),
+                ..CodexHookInput::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            session.0["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("freshness=stale")
+        );
     }
 
     #[test]

@@ -221,6 +221,9 @@ enum ProviderCommand {
 
 #[derive(Debug, Subcommand)]
 enum EvidenceCommand {
+    /// 查看当前项目已持久化 Evidence heads 及 fresh/stale 状态
+    Status,
+
     /// 使用锁定的 Godot 4 editor 实际导入并加载项目资源
     Godot {
         /// Godot 4 editor/console binary 的机器绝对路径
@@ -508,6 +511,7 @@ fn main() -> ExitCode {
         }
         Command::Evidence { command } => {
             App::open(cli.project_root).and_then(|app| match command {
+                EvidenceCommand::Status => app.evidence_status(),
                 EvidenceCommand::Godot {
                     executable,
                     trust_local_executable,

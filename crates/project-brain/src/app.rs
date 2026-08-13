@@ -572,7 +572,29 @@ impl App {
             trust_local_executable,
             timeout_seconds,
         )?;
-        println!("{}", pretty_json(&report)?);
+        let persistence = self
+            .store
+            .apply_evidence_snapshot(report.evidence_snapshot())?;
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": 1,
+                "run": report,
+                "persistence": persistence,
+            }))?
+        );
+        Ok(())
+    }
+
+    pub fn evidence_status(&self) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(
+                &self
+                    .store
+                    .list_evidence_head_summaries(&self.config.project_key)?
+            )?
+        );
         Ok(())
     }
 

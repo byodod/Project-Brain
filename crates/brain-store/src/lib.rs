@@ -6,6 +6,9 @@ use std::{
 use brain_core::{
     ActionDescriptor, Decision, HOOK_PROTOCOL_VERSION, InternalHookEvent, InternalHookOutcome,
 };
+use brain_evidence::{
+    EvidenceAuthority, EvidenceCoverage, EvidenceFreshness, EvidencePlane, EvidenceSnapshot,
+};
 use brain_symbols::{
     GraphDelta, IdentityQuality, LINEAGE_EVIDENCE_SCHEMA_VERSION, LineageCandidateProposal,
     LineageConfidence, LineageEvidence, LineageGroupProposal, LineageGroupReviewClass,
@@ -19,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const DATABASE_SCHEMA_VERSION: i64 = 11;
+const DATABASE_SCHEMA_VERSION: i64 = 12;
 const LEGACY_LINEAGE_ALGORITHM_ID: &str = "project-brain-lineage";
 const LEGACY_LINEAGE_ALGORITHM_VERSION: &str = "1";
 const LEGACY_COMPACTION_ALGORITHM_ID: &str = "project-brain-lineage-legacy-compaction";
@@ -62,6 +65,12 @@ pub enum StoreError {
 
     #[error("Provider 资格状态无效：{0}")]
     InvalidProviderQualification(String),
+
+    #[error("Evidence Snapshot 或状态无效：{0}")]
+    InvalidEvidence(String),
+
+    #[error("Evidence staleness event_id 已用于不同事件：{0}")]
+    EvidenceIdempotencyConflict(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +115,53 @@ pub struct SemanticApplyResult {
     pub lineage_groups_inserted: u64,
     pub lineage_group_members_inserted: u64,
     pub potential_lineage_pairs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceApplyResult {
+    pub snapshot_fingerprint: String,
+    pub snapshot_inserted: bool,
+    pub attestation_sequence: u64,
+    pub freshness: EvidenceFreshness,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceHeadRecord {
+    pub project_key: String,
+    pub plane: EvidencePlane,
+    pub provider_id: String,
+    pub snapshot_fingerprint: String,
+    pub freshness: EvidenceFreshness,
+    pub stale_event_id: Option<String>,
+    pub stale_reason: Option<String>,
+    pub updated_at_unix_seconds: i64,
+    pub last_attestation_sequence: u64,
+    pub snapshot: EvidenceSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceHeadSummary {
+    pub project_key: String,
+    pub plane: EvidencePlane,
+    pub provider_id: String,
+    pub provider_version: String,
+    pub provider_contract_version: u16,
+    pub snapshot_fingerprint: String,
+    pub source_fingerprint: String,
+    pub coverage: EvidenceCoverage,
+    pub authority: EvidenceAuthority,
+    pub freshness: EvidenceFreshness,
+    pub stale_event_id: Option<String>,
+    pub stale_reason: Option<String>,
+    pub updated_at_unix_seconds: i64,
+    pub last_attestation_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceStaleResult {
+    pub event_id: String,
+    pub heads_marked: u64,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -399,6 +455,10 @@ impl BrainStore {
         Ok(store)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "schema 初始化按版本顺序集中执行，避免迁移步骤次序漂移"
+    )]
     fn initialize(&self) -> Result<(), StoreError> {
         let metadata_table_existed: bool = self.connection.query_row(
             "SELECT EXISTS(
@@ -489,6 +549,7 @@ impl BrainStore {
         self.ensure_provider_qualification_v10_schema()?;
         self.ensure_semantic_attestation_v11_schema(metadata_table_existed, schema_version)?;
         self.ensure_semantic_snapshot_source_columns()?;
+        self.initialize_evidence_v12_schema()?;
         self.initialize_adapter_audit_schema()?;
         self.connection.execute(
             "INSERT INTO metadata(key, value) VALUES('schema_version', ?1)
@@ -543,6 +604,72 @@ impl BrainStore {
              );
              CREATE INDEX IF NOT EXISTS idx_adapter_audit_project_session
                  ON adapter_audit_events(project_key, adapter_kind, session_key, id);",
+        )?;
+        Ok(())
+    }
+
+    fn initialize_evidence_v12_schema(&self) -> Result<(), StoreError> {
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS evidence_snapshots (
+                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                 project_key TEXT NOT NULL,
+                 plane TEXT NOT NULL CHECK(plane IN ('source', 'semantic', 'engine', 'build', 'runtime')),
+                 provider_id TEXT NOT NULL,
+                 provider_version TEXT NOT NULL,
+                 provider_contract_version INTEGER NOT NULL,
+                 snapshot_fingerprint TEXT NOT NULL,
+                 source_fingerprint TEXT NOT NULL,
+                 coverage TEXT NOT NULL CHECK(coverage IN ('complete', 'partial')),
+                 authority TEXT NOT NULL CHECK(authority IN ('deterministic', 'heuristic')),
+                 snapshot_json TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 UNIQUE(project_key, plane, provider_id, snapshot_fingerprint)
+             );
+             CREATE INDEX IF NOT EXISTS idx_evidence_snapshot_latest
+                 ON evidence_snapshots(project_key, plane, provider_id, sequence DESC);
+             CREATE TABLE IF NOT EXISTS evidence_attestations (
+                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                 project_key TEXT NOT NULL,
+                 plane TEXT NOT NULL,
+                 provider_id TEXT NOT NULL,
+                 snapshot_fingerprint TEXT NOT NULL,
+                 observed_at_unix_seconds INTEGER NOT NULL,
+                 FOREIGN KEY(project_key, plane, provider_id, snapshot_fingerprint)
+                     REFERENCES evidence_snapshots(project_key, plane, provider_id, snapshot_fingerprint)
+                     ON DELETE RESTRICT
+             );
+             CREATE INDEX IF NOT EXISTS idx_evidence_attestation_latest
+                 ON evidence_attestations(project_key, plane, provider_id, sequence DESC);
+             CREATE TABLE IF NOT EXISTS evidence_heads (
+                 project_key TEXT NOT NULL,
+                 plane TEXT NOT NULL,
+                 provider_id TEXT NOT NULL,
+                 snapshot_fingerprint TEXT NOT NULL,
+                 freshness TEXT NOT NULL CHECK(freshness IN ('fresh', 'stale', 'unknown')),
+                 stale_event_id TEXT,
+                 stale_reason TEXT,
+                 updated_at_unix_seconds INTEGER NOT NULL,
+                 last_attestation_sequence INTEGER NOT NULL,
+                 PRIMARY KEY(project_key, plane, provider_id),
+                 FOREIGN KEY(project_key, plane, provider_id, snapshot_fingerprint)
+                     REFERENCES evidence_snapshots(project_key, plane, provider_id, snapshot_fingerprint)
+                     ON DELETE RESTRICT,
+                 FOREIGN KEY(last_attestation_sequence)
+                     REFERENCES evidence_attestations(sequence) ON DELETE RESTRICT
+             );
+             CREATE TABLE IF NOT EXISTS evidence_staleness_events (
+                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                 project_key TEXT NOT NULL,
+                 event_id TEXT NOT NULL,
+                 plane TEXT NOT NULL,
+                 reason TEXT NOT NULL,
+                 changed_paths_json TEXT NOT NULL,
+                 event_hash TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 UNIQUE(project_key, event_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_evidence_staleness_project
+                 ON evidence_staleness_events(project_key, sequence DESC);",
         )?;
         Ok(())
     }
@@ -960,6 +1087,393 @@ impl BrainStore {
             }
         }
         Ok(())
+    }
+
+    /// 原子保存一份不可变 Evidence Snapshot，追加轻量运行证明，并把该 provider 的当前 head 恢复为 fresh。
+    /// 相同 fingerprint 的完整 JSON 只保存一次；每次真实运行只追加一行 attestation。
+    ///
+    /// # Errors
+    ///
+    /// 当快照协议无效、数据库中的同 fingerprint 内容不一致，或事务失败时返回错误。
+    pub fn apply_evidence_snapshot(
+        &self,
+        snapshot: &EvidenceSnapshot,
+    ) -> Result<EvidenceApplyResult, StoreError> {
+        snapshot
+            .validate()
+            .map_err(|error| StoreError::InvalidEvidence(error.to_string()))?;
+        let snapshot_json = serde_json::to_string(snapshot)?;
+        let now = unix_seconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing_json = transaction
+            .query_row(
+                "SELECT snapshot_json FROM evidence_snapshots
+                 WHERE project_key = ?1 AND plane = ?2 AND provider_id = ?3
+                   AND snapshot_fingerprint = ?4",
+                params![
+                    snapshot.project_key,
+                    snapshot.plane.as_str(),
+                    snapshot.provider.id,
+                    snapshot.snapshot_fingerprint
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing_json) = existing_json.as_deref()
+            && existing_json != snapshot_json
+        {
+            return Err(StoreError::InvalidEvidence(format!(
+                "snapshot fingerprint={} 对应的不可变内容发生冲突",
+                snapshot.snapshot_fingerprint
+            )));
+        }
+        let snapshot_inserted = existing_json.is_none();
+        if snapshot_inserted {
+            transaction.execute(
+                "INSERT INTO evidence_snapshots(
+                     project_key, plane, provider_id, provider_version,
+                     provider_contract_version, snapshot_fingerprint, source_fingerprint,
+                     coverage, authority, snapshot_json, created_at_unix_seconds
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    snapshot.project_key,
+                    snapshot.plane.as_str(),
+                    snapshot.provider.id,
+                    snapshot.provider.version,
+                    snapshot.provider.contract_version,
+                    snapshot.snapshot_fingerprint,
+                    snapshot.source_fingerprint,
+                    snapshot.coverage.as_str(),
+                    snapshot.provider.authority.as_str(),
+                    snapshot_json,
+                    now,
+                ],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO evidence_attestations(
+                 project_key, plane, provider_id, snapshot_fingerprint, observed_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                snapshot.project_key,
+                snapshot.plane.as_str(),
+                snapshot.provider.id,
+                snapshot.snapshot_fingerprint,
+                now,
+            ],
+        )?;
+        let attestation_rowid = transaction.last_insert_rowid();
+        let attestation_sequence = u64::try_from(attestation_rowid).map_err(|_| {
+            StoreError::Integrity("Evidence attestation sequence 超出 u64".to_owned())
+        })?;
+        transaction.execute(
+            "INSERT INTO evidence_heads(
+                 project_key, plane, provider_id, snapshot_fingerprint, freshness,
+                 stale_event_id, stale_reason, updated_at_unix_seconds, last_attestation_sequence
+             ) VALUES (?1, ?2, ?3, ?4, 'fresh', NULL, NULL, ?5, ?6)
+             ON CONFLICT(project_key, plane, provider_id) DO UPDATE SET
+                 snapshot_fingerprint = excluded.snapshot_fingerprint,
+                 freshness = 'fresh',
+                 stale_event_id = NULL,
+                 stale_reason = NULL,
+                 updated_at_unix_seconds = excluded.updated_at_unix_seconds,
+                 last_attestation_sequence = excluded.last_attestation_sequence",
+            params![
+                snapshot.project_key,
+                snapshot.plane.as_str(),
+                snapshot.provider.id,
+                snapshot.snapshot_fingerprint,
+                now,
+                attestation_rowid,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(EvidenceApplyResult {
+            snapshot_fingerprint: snapshot.snapshot_fingerprint.clone(),
+            snapshot_inserted,
+            attestation_sequence,
+            freshness: EvidenceFreshness::Fresh,
+        })
+    }
+
+    /// 查询项目当前的 Evidence heads。返回的不可变快照会再次执行协议校验。
+    ///
+    /// # Errors
+    ///
+    /// 当数据库记录无法反序列化、违反 Evidence Protocol，或查询失败时返回错误。
+    pub fn list_evidence_heads(
+        &self,
+        project_key: &str,
+    ) -> Result<Vec<EvidenceHeadRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT h.project_key, h.plane, h.provider_id, h.snapshot_fingerprint,
+                    h.freshness, h.stale_event_id, h.stale_reason,
+                    h.updated_at_unix_seconds, h.last_attestation_sequence, s.snapshot_json
+             FROM evidence_heads h
+             JOIN evidence_snapshots s
+               ON s.project_key = h.project_key AND s.plane = h.plane
+              AND s.provider_id = h.provider_id
+              AND s.snapshot_fingerprint = h.snapshot_fingerprint
+             WHERE h.project_key = ?1
+             ORDER BY h.plane, h.provider_id",
+        )?;
+        let rows = statement.query_map([project_key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+                row.get::<_, String>(9)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (
+                stored_project_key,
+                plane,
+                provider_id,
+                snapshot_fingerprint,
+                freshness,
+                stale_event_id,
+                stale_reason,
+                updated_at_unix_seconds,
+                last_attestation_sequence,
+                snapshot_json,
+            ) = row?;
+            let plane = EvidencePlane::parse(&plane).ok_or_else(|| {
+                StoreError::InvalidEvidence(format!("无法识别 evidence plane={plane:?}"))
+            })?;
+            let freshness = EvidenceFreshness::parse(&freshness).ok_or_else(|| {
+                StoreError::InvalidEvidence(format!("无法识别 evidence freshness={freshness:?}"))
+            })?;
+            let snapshot: EvidenceSnapshot = serde_json::from_str(&snapshot_json)?;
+            snapshot
+                .validate()
+                .map_err(|error| StoreError::InvalidEvidence(error.to_string()))?;
+            if snapshot.project_key != stored_project_key
+                || snapshot.plane != plane
+                || snapshot.provider.id != provider_id
+                || snapshot.snapshot_fingerprint != snapshot_fingerprint
+            {
+                return Err(StoreError::InvalidEvidence(
+                    "Evidence head 与不可变 snapshot 的身份字段不一致".to_owned(),
+                ));
+            }
+            records.push(EvidenceHeadRecord {
+                project_key: stored_project_key,
+                plane,
+                provider_id,
+                snapshot_fingerprint,
+                freshness,
+                stale_event_id,
+                stale_reason,
+                updated_at_unix_seconds,
+                last_attestation_sequence: u64::try_from(last_attestation_sequence).map_err(
+                    |_| StoreError::Integrity("Evidence attestation sequence 为负数".to_owned()),
+                )?,
+                snapshot,
+            });
+        }
+        Ok(records)
+    }
+
+    /// 查询当前 Evidence heads 的轻量状态，不加载完整 `ArtifactGraph` JSON。
+    ///
+    /// # Errors
+    ///
+    /// 当数据库包含未知枚举、负数序列，或查询失败时返回错误。
+    pub fn list_evidence_head_summaries(
+        &self,
+        project_key: &str,
+    ) -> Result<Vec<EvidenceHeadSummary>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT h.project_key, h.plane, h.provider_id, s.provider_version,
+                    s.provider_contract_version, h.snapshot_fingerprint,
+                    s.source_fingerprint, s.coverage, s.authority, h.freshness,
+                    h.stale_event_id, h.stale_reason, h.updated_at_unix_seconds,
+                    h.last_attestation_sequence
+             FROM evidence_heads h
+             JOIN evidence_snapshots s
+               ON s.project_key = h.project_key AND s.plane = h.plane
+              AND s.provider_id = h.provider_id
+              AND s.snapshot_fingerprint = h.snapshot_fingerprint
+             WHERE h.project_key = ?1
+             ORDER BY h.plane, h.provider_id",
+        )?;
+        let rows = statement.query_map([project_key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, i64>(12)?,
+                row.get::<_, i64>(13)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (
+                stored_project_key,
+                plane,
+                provider_id,
+                provider_version,
+                provider_contract_version,
+                snapshot_fingerprint,
+                source_fingerprint,
+                coverage,
+                authority,
+                freshness,
+                stale_event_id,
+                stale_reason,
+                updated_at_unix_seconds,
+                last_attestation_sequence,
+            ) = row?;
+            records.push(EvidenceHeadSummary {
+                project_key: stored_project_key,
+                plane: EvidencePlane::parse(&plane).ok_or_else(|| {
+                    StoreError::InvalidEvidence(format!("无法识别 evidence plane={plane:?}"))
+                })?,
+                provider_id,
+                provider_version,
+                provider_contract_version: u16::try_from(provider_contract_version).map_err(
+                    |_| {
+                        StoreError::InvalidEvidence("provider contract version 超出 u16".to_owned())
+                    },
+                )?,
+                snapshot_fingerprint,
+                source_fingerprint,
+                coverage: EvidenceCoverage::parse(&coverage).ok_or_else(|| {
+                    StoreError::InvalidEvidence(format!("无法识别 evidence coverage={coverage:?}"))
+                })?,
+                authority: EvidenceAuthority::parse(&authority).ok_or_else(|| {
+                    StoreError::InvalidEvidence(format!(
+                        "无法识别 evidence authority={authority:?}"
+                    ))
+                })?,
+                freshness: EvidenceFreshness::parse(&freshness).ok_or_else(|| {
+                    StoreError::InvalidEvidence(format!(
+                        "无法识别 evidence freshness={freshness:?}"
+                    ))
+                })?,
+                stale_event_id,
+                stale_reason,
+                updated_at_unix_seconds,
+                last_attestation_sequence: u64::try_from(last_attestation_sequence).map_err(
+                    |_| StoreError::Integrity("Evidence attestation sequence 为负数".to_owned()),
+                )?,
+            });
+        }
+        Ok(records)
+    }
+
+    /// 以幂等事件把项目某个 Evidence Plane 的所有当前 heads 标记为 stale。
+    ///
+    /// # Errors
+    ///
+    /// 当事件标识/原因非法、同一 `event_id` 被复用于不同内容，或事务失败时返回错误。
+    pub fn mark_evidence_plane_stale(
+        &self,
+        project_key: &str,
+        plane: EvidencePlane,
+        event_id: &str,
+        reason: &str,
+        changed_paths: &[String],
+    ) -> Result<EvidenceStaleResult, StoreError> {
+        if !is_valid_project_key(project_key)
+            || event_id.trim().is_empty()
+            || reason.trim().is_empty()
+            || event_id.len() > 256
+            || reason.len() > 2048
+            || event_id.contains(['\0', '\n', '\r'])
+            || reason.contains('\0')
+        {
+            return Err(StoreError::InvalidEvidence(
+                "staleness event 缺少合法 project_key/event_id/reason".to_owned(),
+            ));
+        }
+        let mut paths = changed_paths.to_vec();
+        paths.sort();
+        paths.dedup();
+        if paths.len() > 4_096
+            || paths.iter().any(|path| {
+                path.trim().is_empty() || path.len() > 4_096 || path.contains(['\0', '\n', '\r'])
+            })
+        {
+            return Err(StoreError::InvalidEvidence(
+                "staleness event 的 changed path 数量或格式无效".to_owned(),
+            ));
+        }
+        let changed_paths_json = serde_json::to_string(&paths)?;
+        let event_hash = fingerprint_parts(&[
+            project_key.as_bytes(),
+            plane.as_str().as_bytes(),
+            event_id.as_bytes(),
+            reason.as_bytes(),
+            changed_paths_json.as_bytes(),
+        ]);
+        let now = unix_seconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing_hash = transaction
+            .query_row(
+                "SELECT event_hash FROM evidence_staleness_events
+                 WHERE project_key = ?1 AND event_id = ?2",
+                params![project_key, event_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing_hash) = existing_hash {
+            if existing_hash != event_hash {
+                return Err(StoreError::EvidenceIdempotencyConflict(event_id.to_owned()));
+            }
+            transaction.commit()?;
+            return Ok(EvidenceStaleResult {
+                event_id: event_id.to_owned(),
+                heads_marked: 0,
+                replayed: true,
+            });
+        }
+        transaction.execute(
+            "INSERT INTO evidence_staleness_events(
+                 project_key, event_id, plane, reason, changed_paths_json,
+                 event_hash, created_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                project_key,
+                event_id,
+                plane.as_str(),
+                reason,
+                changed_paths_json,
+                event_hash,
+                now,
+            ],
+        )?;
+        let heads_marked = u64::try_from(transaction.execute(
+            "UPDATE evidence_heads
+             SET freshness = 'stale', stale_event_id = ?1, stale_reason = ?2,
+                 updated_at_unix_seconds = ?3
+             WHERE project_key = ?4 AND plane = ?5 AND freshness != 'stale'",
+            params![event_id, reason, now, project_key, plane.as_str()],
+        )?)
+        .map_err(|_| StoreError::Integrity("stale head 数量超出 u64".to_owned()))?;
+        transaction.commit()?;
+        Ok(EvidenceStaleResult {
+            event_id: event_id.to_owned(),
+            heads_marked,
+            replayed: false,
+        })
     }
 
     /// 原子应用一个 Provider 的完整符号快照，并把快照中消失的旧节点标记为 removed。
@@ -3246,6 +3760,15 @@ fn unix_seconds() -> Result<i64, StoreError> {
     Ok(i64::try_from(seconds).unwrap_or(i64::MAX))
 }
 
+fn fingerprint_parts(parts: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part);
+    }
+    format!("sha256_{:x}", digest.finalize())
+}
+
 fn validate_semantic_snapshot_source(source: &SemanticSnapshotSource) -> Result<(), StoreError> {
     if source.worktree_fingerprint.len() != 64
         || !source
@@ -4386,6 +4909,10 @@ mod tests {
         HookEventPayload, HookOutcomePayload, IdempotencyMetadata, InternalHookEvent,
         InternalHookOutcome, SessionOpenReason, SessionOpened,
     };
+    use brain_evidence::{
+        EvidenceAuthority, EvidenceCoverage, EvidenceFreshness, EvidencePlane, EvidenceProvider,
+        EvidenceSnapshot,
+    };
 
     use brain_symbols::{
         GraphDelta, IdentityQuality, LineageState, LineageSymbolObservation, ProviderDescriptor,
@@ -4400,6 +4927,116 @@ mod tests {
     };
 
     const PROJECT_KEY: &str = "project_test";
+
+    fn evidence_snapshot(project_key: &str) -> EvidenceSnapshot {
+        EvidenceSnapshot::new(
+            project_key,
+            EvidencePlane::Engine,
+            EvidenceProvider {
+                id: "test-engine".to_owned(),
+                version: "4.6+sha256.test".to_owned(),
+                contract_version: 1,
+                authority: EvidenceAuthority::Deterministic,
+            },
+            "sha256_source-test",
+            EvidenceCoverage::Complete,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn evidence_snapshots_are_deduplicated_while_attestations_and_staleness_are_audited() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let snapshot = evidence_snapshot(PROJECT_KEY);
+
+        let first = store.apply_evidence_snapshot(&snapshot).unwrap();
+        let second = store.apply_evidence_snapshot(&snapshot).unwrap();
+        assert!(first.snapshot_inserted);
+        assert!(!second.snapshot_inserted);
+        assert!(second.attestation_sequence > first.attestation_sequence);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM evidence_snapshots", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM evidence_attestations", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            2
+        );
+        store
+            .apply_evidence_snapshot(&evidence_snapshot("project_other"))
+            .unwrap();
+
+        let stale = store
+            .mark_evidence_plane_stale(
+                PROJECT_KEY,
+                EvidencePlane::Engine,
+                "event-1",
+                "successful source mutation",
+                &["src/main.rs".to_owned(), "src/main.rs".to_owned()],
+            )
+            .unwrap();
+        assert_eq!(stale.heads_marked, 1);
+        assert!(!stale.replayed);
+        let head = store
+            .list_evidence_heads(PROJECT_KEY)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(head.freshness, EvidenceFreshness::Stale);
+        assert_eq!(head.stale_event_id.as_deref(), Some("event-1"));
+        let other = store
+            .list_evidence_head_summaries("project_other")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(other.freshness, EvidenceFreshness::Fresh);
+        assert_eq!(other.provider_id, "test-engine");
+
+        let replay = store
+            .mark_evidence_plane_stale(
+                PROJECT_KEY,
+                EvidencePlane::Engine,
+                "event-1",
+                "successful source mutation",
+                &["src/main.rs".to_owned()],
+            )
+            .unwrap();
+        assert!(replay.replayed);
+        assert!(matches!(
+            store.mark_evidence_plane_stale(
+                PROJECT_KEY,
+                EvidencePlane::Engine,
+                "event-1",
+                "different event",
+                &[]
+            ),
+            Err(StoreError::EvidenceIdempotencyConflict(_))
+        ));
+
+        store.apply_evidence_snapshot(&snapshot).unwrap();
+        let head = store
+            .list_evidence_heads(PROJECT_KEY)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(head.freshness, EvidenceFreshness::Fresh);
+        assert!(head.stale_event_id.is_none());
+        assert_eq!(head.snapshot, snapshot);
+    }
 
     #[test]
     fn semantic_source_manifest_hash_is_independent_of_input_order() {
@@ -5029,7 +5666,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 11);
+        assert_eq!(store.database_schema_version().unwrap(), 12);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, false, 10)
@@ -5114,7 +5751,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 11);
+        assert_eq!(store.database_schema_version().unwrap(), 12);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, true, 10)
@@ -5154,7 +5791,7 @@ mod tests {
         drop(connection);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 11);
+        assert_eq!(migrated.database_schema_version().unwrap(), 12);
         let legacy_source = migrated
             .connection
             .query_row(
@@ -5542,7 +6179,7 @@ mod tests {
         drop(legacy);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 11);
+        assert_eq!(migrated.database_schema_version().unwrap(), 12);
         let refreshed = SemanticSnapshotSource::trusted_provider(
             "d".repeat(64),
             "same-head".to_owned(),
@@ -6145,7 +6782,7 @@ mod tests {
         drop(store);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 11);
+        assert_eq!(migrated.database_schema_version().unwrap(), 12);
         assert_eq!(
             migrated
                 .list_symbols(PROJECT_KEY, None, false, 10)
