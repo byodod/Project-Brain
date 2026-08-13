@@ -1,6 +1,6 @@
 # 协议说明
 
-## Schema 版本
+## 规则 Schema 版本
 
 所有跨边界对象必须包含：
 
@@ -11,6 +11,87 @@
 ```
 
 当前 Runtime 对未知版本 fail closed，避免把新字段静默解释成旧语义。
+
+`ActionDescriptor` 是 preflight/规则引擎的兼容输入，不再作为 Agent adapter 的公共边界。
+
+## Internal Hook Protocol v1
+
+所有 Agent adapter 先转换成内部强类型事件，再调用确定性内核。信封示例：
+
+```json
+{
+  "protocol_version": 1,
+  "project_key": "pb_0123456789abcdef0123456789abcdef",
+  "event_id": "codex_event_<sha256>",
+  "idempotency": {
+    "identity_quality": "vendor_stable"
+  },
+  "adapter": {
+    "kind": "codex",
+    "adapter_version": 1
+  },
+  "session_key": "agent-session-id",
+  "cwd": "D:/repo",
+  "turn_key": "turn-id",
+  "payload": {
+    "event": "tool_about_to_run",
+    "data": {
+      "operation_id": "codex_operation_<sha256>",
+      "tool_name": "apply_patch",
+      "action": {
+        "kind": "modify",
+        "target_files": ["src/domain/order.rs"]
+      }
+    }
+  }
+}
+```
+
+公共事件只有：
+
+```text
+SessionOpened
+IntentDeclared
+ToolAboutToRun
+ToolFinished
+TaskStopping
+```
+
+`project_key` 由项目配置持久化，是事件、幂等键和审计查询的项目边界。`cwd` 只是本次
+delivery 的位置证据，不能代替项目身份。旧配置首次打开时会生成并写回 `project_key`；
+迁移键只由旧配置稳定内容派生，不依赖 checkout 绝对路径；同一份受版本控制配置在移动或
+clone 后仍保持项目身份。新项目初始化时直接生成并持久化独立 key。
+
+`event_id` 是 delivery 身份，`operation_id` 是一次工具调用的因果身份。Pre/Post 可以交错，
+Runtime 不建立全局顺序，也不假设最后一个 Pre 必然对应下一个 Post。
+Codex operation ID 的派生域包含 `project_key`、规范化 `session_key` 与 vendor tool ID，
+不能跨项目或会话复用。
+
+`identity_quality` 明确 adapter 能提供的重放保证：
+
+- `vendor_stable`：vendor 提供稳定调用 ID；
+- `derived_stable`：从稳定 turn 等字段派生；
+- `per_delivery`：vendor 没有稳定键，每次 delivery 只能生成新 ID，不能声称跨进程去重。
+
+SQLite 以 `(project_key, adapter_kind, event_id)` 唯一约束处理 at-least-once 重放；重复事件
+返回首次持久化 outcome。不同项目即使 vendor session/event ID 完全相同也不会串审计。
+关键 gate 的治理计算或审计写入失败时，Codex `PreToolUse` 显式 deny；`Stop` 显式要求继续，
+但 `stop_hook_active=true` 时仍直接放行以避免自触发循环。不能依赖 hook 进程异常退出实现阻断。
+
+## Internal Hook Outcome
+
+Outcome 与事件一一对应，不存在通用 `block`：
+
+```text
+SessionOpened    -> inject
+IntentDeclared  -> NoVeto | Deny + inject
+ToolAboutToRun  -> NoVeto | Deny + inject
+ToolFinished    -> post feedback
+TaskStopping    -> AllowStop | ContinueWork + feedback
+```
+
+`NoVeto` 只表示 Project Brain 没有治理异议。Adapter 不得把它映射成 vendor 的显式权限批准；
+例如 Codex PreToolUse 的 `NoVeto` 输出空对象，让 Codex 自己继续正常权限流程。
 
 ## ActionDescriptor
 
@@ -71,12 +152,21 @@ block > escalate > allow_with_context > allow
 
 Adapter 只负责：
 
-1. 把外部 Hook 输入转换为 `ActionDescriptor`；
-2. 调用确定性内核；
-3. 把 `Decision` 转换回外部协议；
-4. 记录审计事件。
+1. 把外部 Hook 输入转换为 `InternalHookEvent`；
+2. 生成非空 event/session/operation 身份并如实标注幂等质量；
+3. 调用确定性内核；
+4. 把事件专属 `InternalHookOutcome` 转换回外部协议；
+5. 记录按项目隔离的 adapter、延迟、outcome 和 failure 审计。
 
 Adapter 不得自行重新解释某条项目规则。
+
+当前 Codex adapter 覆盖 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`
+和 `Stop`。能力矩阵通过 `project-brain capabilities codex` 输出。能力模型明确保留 Prime Agent
+的 `continue_after_stop=unsupported`，不把独立 runtime 的 `agent_end` 假装成 Codex Stop。
+当前 `IntentDeclared` 只进入审计，尚未接入独立的意图规则模型，因此 Codex 有效能力如实报告
+`deny_intent=unsupported`；核心协议保留 `Deny` 类型供后续 adapter/rule 实现使用。
+`PostToolUse.tool_response` 只有存在可识别的 success、exit code、error 或 status 证据时才映射
+为 succeeded/failed，否则记录 unknown，不从事件名称猜测成功。
 
 ## AnalysisReport
 

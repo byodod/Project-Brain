@@ -5,11 +5,12 @@ use std::{
 };
 
 use brain_core::{
-    ActionDescriptor, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, DecisionKind, MemoryStatus,
-    Rule, RuleEffect, RuleEngine, RuleStrength, StopReconcileConfig, normalize_project_path,
+    ActionDescriptor, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, MemoryStatus, Rule,
+    RuleEffect, RuleEngine, RuleStrength, StopReconcileConfig, normalize_project_path,
 };
 use brain_store::BrainStore;
 use clap::ValueEnum;
+use sha2::{Digest, Sha256};
 
 use crate::{
     analyze,
@@ -30,6 +31,7 @@ pub enum AgentKind {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum HookEvent {
     SessionStart,
+    UserPromptSubmit,
     PreToolUse,
     PostToolUse,
     Stop,
@@ -42,6 +44,14 @@ pub struct App {
 }
 
 impl App {
+    pub fn capabilities(agent: AgentKind) -> Result<(), AppError> {
+        let capabilities = match agent {
+            AgentKind::Codex => codex::capabilities(),
+        };
+        println!("{}", pretty_json(&capabilities)?);
+        Ok(())
+    }
+
     pub fn init(explicit_root: Option<PathBuf>) -> Result<(), AppError> {
         let root = explicit_root.unwrap_or(env::current_dir()?);
         let brain_dir = root.join(BRAIN_DIRECTORY);
@@ -56,7 +66,7 @@ impl App {
             .and_then(|name| name.to_str())
             .unwrap_or("project")
             .to_owned();
-        let config = initial_config(project_name);
+        let config = initial_config(project_name, generate_project_key(&root)?);
         config.validate()?;
         fs::write(&config_path, pretty_json(&config)?)?;
         fs::write(
@@ -77,8 +87,17 @@ impl App {
         let start = explicit_root.unwrap_or(env::current_dir()?);
         let root = discover_root(&start).ok_or(AppError::ProjectNotInitialized)?;
         let brain_dir = root.join(BRAIN_DIRECTORY);
-        let config: BrainConfig = serde_json::from_slice(&fs::read(brain_dir.join(CONFIG_FILE))?)?;
+        let config_path = brain_dir.join(CONFIG_FILE);
+        let config_bytes = fs::read(&config_path)?;
+        let mut config: BrainConfig = serde_json::from_slice(&config_bytes)?;
+        let migrated_project_key = config.project_key.is_empty();
+        if migrated_project_key {
+            config.project_key = legacy_project_key(&config)?;
+        }
         config.validate()?;
+        if migrated_project_key {
+            fs::write(&config_path, pretty_json(&config)?)?;
+        }
         let store = BrainStore::open(&brain_dir.join(DATABASE_FILE))?;
         Ok(Self {
             root,
@@ -95,11 +114,40 @@ impl App {
         Ok(())
     }
 
-    pub fn hook(&self, agent: AgentKind, event: HookEvent) -> Result<(), AppError> {
+    pub fn run_hook(
+        explicit_root: Option<PathBuf>,
+        agent: AgentKind,
+        event: HookEvent,
+    ) -> Result<(), AppError> {
         match agent {
             AgentKind::Codex => {
-                let input: CodexHookInput = read_stdin_json()?;
-                let output = codex::handle(&self.root, &self.config, &self.store, event, &input)?;
+                let input: CodexHookInput = match read_stdin_json() {
+                    Ok(input) => input,
+                    Err(error) => {
+                        if let Some(output) = codex::failure_output(
+                            event,
+                            &CodexHookInput::default(),
+                            &error.to_string(),
+                        ) {
+                            println!("{}", pretty_json(&output)?);
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
+                };
+                let app = match Self::open(explicit_root) {
+                    Ok(app) => app,
+                    Err(error) => {
+                        if let Some(output) =
+                            codex::failure_output(event, &input, &error.to_string())
+                        {
+                            println!("{}", pretty_json(&output)?);
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
+                };
+                let output = codex::handle(&app.root, &app.config, &app.store, event, &input)?;
                 println!("{}", pretty_json(&output)?);
                 Ok(())
             }
@@ -144,14 +192,24 @@ impl App {
     }
 
     pub fn audit(&self, limit: u32) -> Result<(), AppError> {
-        println!("{}", pretty_json(&self.store.recent_audit(limit)?)?);
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "project_key": self.config.project_key,
+                "adapter_events": self
+                    .store
+                    .recent_adapter_audit(&self.config.project_key, limit)?,
+                "legacy_actions": self.store.recent_audit(limit)?,
+            }))?
+        );
         Ok(())
     }
 }
 
-fn initial_config(project_name: String) -> BrainConfig {
+fn initial_config(project_name: String, project_key: String) -> BrainConfig {
     BrainConfig {
         schema_version: CURRENT_SCHEMA_VERSION,
+        project_key,
         project_name,
         stop_reconcile: StopReconcileConfig {
             enabled: true,
@@ -213,6 +271,27 @@ fn initial_config(project_name: String) -> BrainConfig {
     }
 }
 
+fn generate_project_key(root: &Path) -> Result<String, std::time::SystemTimeError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let mut digest = Sha256::new();
+    digest.update(b"project-brain/project-key/v1\0");
+    digest.update(root.as_os_str().to_string_lossy().as_bytes());
+    digest.update(nonce.to_le_bytes());
+    digest.update(std::process::id().to_le_bytes());
+    let encoded = format!("{:x}", digest.finalize());
+    Ok(format!("pb_{}", &encoded[..32]))
+}
+
+fn legacy_project_key(config: &BrainConfig) -> Result<String, serde_json::Error> {
+    let mut digest = Sha256::new();
+    digest.update(b"project-brain/legacy-project-key/v1\0");
+    digest.update(serde_json::to_vec(config)?);
+    let encoded = format!("{:x}", digest.finalize());
+    Ok(format!("pb_{}", &encoded[..32]))
+}
+
 fn discover_root(start: &Path) -> Option<PathBuf> {
     start.ancestors().find_map(|candidate| {
         candidate
@@ -250,13 +329,6 @@ pub fn decision_reason(decision: &brain_core::Decision) -> String {
         .join("\n")
 }
 
-pub fn should_deny(decision: &brain_core::Decision) -> bool {
-    matches!(
-        decision.decision,
-        DecisionKind::Block | DecisionKind::Escalate
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -265,7 +337,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{App, discover_root};
+    use super::{App, discover_root, initial_config, legacy_project_key, pretty_json};
 
     #[test]
     fn missing_marker_does_not_guess_a_project_root() {
@@ -294,8 +366,50 @@ mod tests {
         assert!(root.join(".project-brain/brain.db").is_file());
         let ignore = fs::read_to_string(root.join(".project-brain/.gitignore")).unwrap();
         assert!(ignore.lines().any(|line| line == "brain.db"));
-        assert!(App::open(Some(root.clone())).is_ok());
+        let app = App::open(Some(root.clone())).unwrap();
+        assert!(app.config.project_key.starts_with("pb_"));
+        drop(app);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_a_legacy_config_persists_a_project_key() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "project-brain-config-migration-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let brain_dir = root.join(".project-brain");
+        fs::create_dir_all(&brain_dir).unwrap();
+        let legacy = initial_config("legacy".to_owned(), String::new());
+        fs::write(brain_dir.join("config.json"), pretty_json(&legacy).unwrap()).unwrap();
+
+        let app = App::open(Some(root.clone())).unwrap();
+        let generated = app.config.project_key.clone();
+        drop(app);
+        let persisted: brain_core::BrainConfig =
+            serde_json::from_slice(&fs::read(brain_dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(persisted.project_key, generated);
+        assert!(generated.starts_with("pb_"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_project_key_depends_on_project_config_not_checkout_path() {
+        let first = initial_config("same".to_owned(), String::new());
+        let second = initial_config("other".to_owned(), String::new());
+        assert_eq!(
+            legacy_project_key(&first).unwrap(),
+            legacy_project_key(&first).unwrap()
+        );
+        assert_ne!(
+            legacy_project_key(&first).unwrap(),
+            legacy_project_key(&second).unwrap()
+        );
     }
 }

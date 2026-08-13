@@ -3,7 +3,9 @@ use std::{
     time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
-use brain_core::{ActionDescriptor, Decision};
+use brain_core::{
+    ActionDescriptor, Decision, HOOK_PROTOCOL_VERSION, InternalHookEvent, InternalHookOutcome,
+};
 use brain_symbols::{
     GraphDelta, IdentityQuality, SYMBOL_PROTOCOL_VERSION, SourceLanguage, SymbolNode,
     SymbolSnapshot, SymbolStatus, symbol_id,
@@ -12,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-const DATABASE_SCHEMA_VERSION: i64 = 2;
+const DATABASE_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -31,6 +33,9 @@ pub enum StoreError {
     #[error("符号快照无效：{0}")]
     InvalidSnapshot(String),
 
+    #[error("内部 Hook 事件无效：{0}")]
+    InvalidHookEvent(String),
+
     #[error("数据库完整性检查失败：{0}")]
     Integrity(String),
 
@@ -47,6 +52,28 @@ pub struct AuditRecord {
     pub action_json: String,
     pub decision_json: String,
     pub created_at_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdapterAuditRecord {
+    pub id: i64,
+    pub project_key: String,
+    pub adapter_kind: String,
+    pub adapter_version: u16,
+    pub event_id: String,
+    pub session_key: String,
+    pub event_kind: String,
+    pub event_json: String,
+    pub outcome_json: Option<String>,
+    pub latency_ms: u64,
+    pub failure: Option<String>,
+    pub created_at_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdapterRecordResult {
+    Inserted(i64),
+    Duplicate(InternalHookOutcome),
 }
 
 pub struct BrainStore {
@@ -79,8 +106,16 @@ impl BrainStore {
     }
 
     fn initialize(&self) -> Result<(), StoreError> {
+        let metadata_table_existed: bool = self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
         self.connection.execute_batch(
             "PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;
              PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS metadata (
                  key TEXT PRIMARY KEY,
@@ -98,17 +133,8 @@ impl BrainStore {
              CREATE INDEX IF NOT EXISTS idx_audit_events_session
                  ON audit_events(session_id, id);",
         )?;
-        let schema_version = self
-            .connection
-            .query_row(
-                "SELECT value FROM metadata WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(1);
-        if schema_version > DATABASE_SCHEMA_VERSION {
+        let schema_version = self.read_schema_version(metadata_table_existed)?;
+        if !(1..=DATABASE_SCHEMA_VERSION).contains(&schema_version) {
             return Err(StoreError::UnsupportedSchemaVersion {
                 actual: schema_version,
                 expected: DATABASE_SCHEMA_VERSION,
@@ -152,6 +178,7 @@ impl BrainStore {
              CREATE INDEX IF NOT EXISTS idx_symbol_edges_target
                  ON symbol_edges(target_id, status, kind);",
         )?;
+        self.initialize_adapter_audit_schema()?;
         self.connection.execute(
             "INSERT INTO metadata(key, value) VALUES('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -163,6 +190,49 @@ impl BrainStore {
         if integrity != "ok" {
             return Err(StoreError::Integrity(integrity));
         }
+        Ok(())
+    }
+
+    fn read_schema_version(&self, metadata_table_existed: bool) -> Result<i64, StoreError> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match stored {
+            Some(value) => value
+                .parse::<i64>()
+                .map_err(|_| StoreError::Integrity("schema_version 不是整数".to_owned())),
+            None if metadata_table_existed => Err(StoreError::Integrity(
+                "已有 metadata 表缺少 schema_version".to_owned(),
+            )),
+            None => Ok(1),
+        }
+    }
+
+    fn initialize_adapter_audit_schema(&self) -> Result<(), StoreError> {
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS adapter_audit_events (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 project_key TEXT NOT NULL,
+                 adapter_kind TEXT NOT NULL,
+                 adapter_version INTEGER NOT NULL,
+                 event_id TEXT NOT NULL,
+                 session_key TEXT NOT NULL,
+                 event_kind TEXT NOT NULL,
+                 event_json TEXT NOT NULL,
+                 outcome_json TEXT,
+                 latency_ms INTEGER NOT NULL,
+                 failure TEXT,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 UNIQUE(project_key, adapter_kind, event_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_adapter_audit_project_session
+                 ON adapter_audit_events(project_key, adapter_kind, session_key, id);",
+        )?;
         Ok(())
     }
 
@@ -301,6 +371,188 @@ impl BrainStore {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(records)
+    }
+
+    /// 原子记录内部 Hook 事件与结果；同一项目、适配器和 `event_id` 重放时返回首次结果。
+    ///
+    /// # Errors
+    ///
+    /// 事件无效，或 JSON/SQLite 操作失败时返回错误。
+    pub fn record_adapter_event(
+        &self,
+        event: &InternalHookEvent,
+        outcome: &InternalHookOutcome,
+        latency_ms: u64,
+    ) -> Result<AdapterRecordResult, StoreError> {
+        event
+            .validate()
+            .map_err(|error| StoreError::InvalidHookEvent(error.to_string()))?;
+        if outcome.protocol_version != HOOK_PROTOCOL_VERSION || outcome.event_id != event.event_id {
+            return Err(StoreError::InvalidHookEvent(
+                "outcome 与 event 的协议版本或 event_id 不一致".to_owned(),
+            ));
+        }
+        let event_json = serde_json::to_string(event)?;
+        let outcome_json = serde_json::to_string(outcome)?;
+        let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let created_at_unix_seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+        let latency_ms = i64::try_from(latency_ms).unwrap_or(i64::MAX);
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT outcome_json FROM adapter_audit_events
+                 WHERE project_key = ?1 AND adapter_kind = ?2 AND event_id = ?3",
+                params![
+                    event.project_key,
+                    event.adapter.kind.as_str(),
+                    event.event_id
+                ],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        if let Some(Some(existing)) = existing {
+            return Ok(AdapterRecordResult::Duplicate(serde_json::from_str(
+                &existing,
+            )?));
+        }
+        let changed = self.connection.execute(
+            "INSERT INTO adapter_audit_events(
+                 project_key, adapter_kind, adapter_version, event_id, session_key,
+                 event_kind, event_json, outcome_json, latency_ms, failure,
+                 created_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)
+             ON CONFLICT(project_key, adapter_kind, event_id) DO UPDATE SET
+                 event_json = excluded.event_json,
+                 outcome_json = excluded.outcome_json,
+                 latency_ms = excluded.latency_ms,
+                 failure = NULL,
+                 created_at_unix_seconds = excluded.created_at_unix_seconds
+             WHERE adapter_audit_events.outcome_json IS NULL",
+            params![
+                event.project_key,
+                event.adapter.kind.as_str(),
+                i64::from(event.adapter.adapter_version),
+                event.event_id,
+                event.session_key,
+                event.kind().as_str(),
+                event_json,
+                outcome_json,
+                latency_ms,
+                created_at_unix_seconds,
+            ],
+        )?;
+        if changed == 1 {
+            let id = self.connection.query_row(
+                "SELECT id FROM adapter_audit_events
+                 WHERE project_key = ?1 AND adapter_kind = ?2 AND event_id = ?3",
+                params![
+                    event.project_key,
+                    event.adapter.kind.as_str(),
+                    event.event_id
+                ],
+                |row| row.get(0),
+            )?;
+            return Ok(AdapterRecordResult::Inserted(id));
+        }
+        let existing: String = self.connection.query_row(
+            "SELECT outcome_json FROM adapter_audit_events
+             WHERE project_key = ?1 AND adapter_kind = ?2 AND event_id = ?3",
+            params![
+                event.project_key,
+                event.adapter.kind.as_str(),
+                event.event_id
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(AdapterRecordResult::Duplicate(serde_json::from_str(
+            &existing,
+        )?))
+    }
+
+    /// 记录已规范化但处理失败的适配器事件，供诊断和后续重放。
+    ///
+    /// # Errors
+    ///
+    /// 事件无效，或 JSON/SQLite 操作失败时返回错误。
+    pub fn record_adapter_failure(
+        &self,
+        event: &InternalHookEvent,
+        latency_ms: u64,
+        failure: &str,
+    ) -> Result<(), StoreError> {
+        event
+            .validate()
+            .map_err(|error| StoreError::InvalidHookEvent(error.to_string()))?;
+        let event_json = serde_json::to_string(event)?;
+        let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let created_at_unix_seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
+        self.connection.execute(
+            "INSERT INTO adapter_audit_events(
+                 project_key, adapter_kind, adapter_version, event_id, session_key,
+                 event_kind, event_json, outcome_json, latency_ms, failure,
+                 created_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10)
+             ON CONFLICT(project_key, adapter_kind, event_id) DO UPDATE SET
+                 latency_ms = excluded.latency_ms,
+                 failure = excluded.failure,
+                 created_at_unix_seconds = excluded.created_at_unix_seconds
+             WHERE adapter_audit_events.outcome_json IS NULL",
+            params![
+                event.project_key,
+                event.adapter.kind.as_str(),
+                i64::from(event.adapter.adapter_version),
+                event.event_id,
+                event.session_key,
+                event.kind().as_str(),
+                event_json,
+                i64::try_from(latency_ms).unwrap_or(i64::MAX),
+                failure,
+                created_at_unix_seconds,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 按项目返回最近的适配器审计记录。
+    ///
+    /// # Errors
+    ///
+    /// `SQLite` 查询或字段转换失败时返回错误。
+    pub fn recent_adapter_audit(
+        &self,
+        project_key: &str,
+        limit: u32,
+    ) -> Result<Vec<AdapterAuditRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, project_key, adapter_kind, adapter_version, event_id, session_key,
+                    event_kind, event_json, outcome_json, latency_ms, failure,
+                    created_at_unix_seconds
+             FROM adapter_audit_events
+             WHERE project_key = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![project_key, limit], |row| {
+                let adapter_version: i64 = row.get(3)?;
+                let latency_ms: i64 = row.get(9)?;
+                Ok(AdapterAuditRecord {
+                    id: row.get(0)?,
+                    project_key: row.get(1)?,
+                    adapter_kind: row.get(2)?,
+                    adapter_version: u16::try_from(adapter_version).unwrap_or_default(),
+                    event_id: row.get(4)?,
+                    session_key: row.get(5)?,
+                    event_kind: row.get(6)?,
+                    event_json: row.get(7)?,
+                    outcome_json: row.get(8)?,
+                    latency_ms: u64::try_from(latency_ms).unwrap_or_default(),
+                    failure: row.get(10)?,
+                    created_at_unix_seconds: row.get(11)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 }
 
@@ -580,11 +832,16 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
+        sync::{Arc, Barrier},
+        thread,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use brain_core::{
-        ActionDescriptor, ActionKind, CURRENT_SCHEMA_VERSION, Decision, DecisionKind,
+        ActionDescriptor, ActionKind, AdapterIdentity, AdapterKind, CURRENT_SCHEMA_VERSION,
+        ContextItem, Decision, DecisionKind, EventIdentityQuality, HOOK_PROTOCOL_VERSION,
+        HookEventPayload, HookOutcomePayload, IdempotencyMetadata, InternalHookEvent,
+        InternalHookOutcome, SessionOpenReason, SessionOpened,
     };
 
     use brain_symbols::{
@@ -594,7 +851,7 @@ mod tests {
     };
     use rusqlite::Connection;
 
-    use super::BrainStore;
+    use super::{AdapterRecordResult, BrainStore, StoreError};
 
     fn provider() -> ProviderDescriptor {
         ProviderDescriptor {
@@ -642,6 +899,50 @@ mod tests {
         }
     }
 
+    fn hook_event(project_key: &str, event_id: &str) -> InternalHookEvent {
+        InternalHookEvent {
+            protocol_version: HOOK_PROTOCOL_VERSION,
+            project_key: project_key.to_owned(),
+            event_id: event_id.to_owned(),
+            idempotency: IdempotencyMetadata {
+                identity_quality: EventIdentityQuality::VendorStable,
+            },
+            adapter: AdapterIdentity {
+                kind: AdapterKind::Codex,
+                adapter_version: 1,
+            },
+            session_key: "session".to_owned(),
+            cwd: "/repo".to_owned(),
+            turn_key: None,
+            payload: HookEventPayload::SessionOpened(SessionOpened {
+                reason: SessionOpenReason::Startup,
+                previous_session_key: None,
+            }),
+        }
+    }
+
+    fn hook_outcome(event_id: &str) -> InternalHookOutcome {
+        InternalHookOutcome {
+            protocol_version: HOOK_PROTOCOL_VERSION,
+            event_id: event_id.to_owned(),
+            payload: HookOutcomePayload::SessionOpened { inject: Vec::new() },
+        }
+    }
+
+    fn temporary_database(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "project-brain-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let database = root.join("brain.db");
+        (root, database)
+    }
+
     #[test]
     fn records_and_reads_audit_events() {
         let store = BrainStore::open_in_memory().unwrap();
@@ -671,6 +972,147 @@ mod tests {
         let records = store.recent_audit(10).unwrap();
         assert_eq!(records[0].event_id, "event-1");
         assert_eq!(records[0].hook_event, "pre_tool_use");
+    }
+
+    #[test]
+    fn a_successful_retry_replaces_a_failure_for_the_same_project_event() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let event = hook_event("project_a", "event-1");
+        store
+            .record_adapter_failure(&event, 3, "temporary failure")
+            .unwrap();
+        store
+            .record_adapter_event(&event, &hook_outcome("event-1"), 4)
+            .unwrap();
+
+        let records = store.recent_adapter_audit("project_a", 10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].failure.is_none());
+        assert!(records[0].outcome_json.is_some());
+    }
+
+    #[test]
+    fn rejects_an_outcome_for_a_different_event() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let result = store.record_adapter_event(
+            &hook_event("project_a", "event-1"),
+            &hook_outcome("event-2"),
+            1,
+        );
+        assert!(matches!(
+            result,
+            Err(super::StoreError::InvalidHookEvent(_))
+        ));
+    }
+
+    #[test]
+    fn concurrent_connections_converge_on_one_project_event() {
+        let (root, database) = temporary_database("concurrent-audit-test");
+        drop(BrainStore::open(&database).unwrap());
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let database = database.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let store = BrainStore::open(&database).unwrap();
+                    barrier.wait();
+                    store
+                        .record_adapter_event(
+                            &hook_event("project_a", "event-1"),
+                            &hook_outcome("event-1"),
+                            1,
+                        )
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, AdapterRecordResult::Inserted(_)))
+                .count(),
+            1
+        );
+        let store = BrainStore::open(&database).unwrap();
+        assert_eq!(
+            store.recent_adapter_audit("project_a", 10).unwrap().len(),
+            1
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_database_recovers_failure_then_preserves_first_success() {
+        let (root, database) = temporary_database("audit-reopen-test");
+        let event = hook_event("project_a", "event-1");
+        let first = hook_outcome("event-1");
+        let store = BrainStore::open(&database).unwrap();
+        store
+            .record_adapter_failure(&event, 1, "interrupted")
+            .unwrap();
+        drop(store);
+
+        let store = BrainStore::open(&database).unwrap();
+        store.record_adapter_event(&event, &first, 2).unwrap();
+        drop(store);
+
+        let mut changed = first.clone();
+        changed.payload = HookOutcomePayload::SessionOpened {
+            inject: vec![ContextItem {
+                text: "later".to_owned(),
+            }],
+        };
+        let store = BrainStore::open(&database).unwrap();
+        assert_eq!(
+            store.record_adapter_event(&event, &changed, 3).unwrap(),
+            AdapterRecordResult::Duplicate(first)
+        );
+        let records = store.recent_adapter_audit("project_a", 10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].failure.is_none());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupted_schema_version_is_not_silently_upgraded() {
+        let (root, database) = temporary_database("corrupt-schema-test");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata(key, value) VALUES('schema_version', 'broken');",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            BrainStore::open(&database),
+            Err(StoreError::Integrity(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_metadata_without_schema_version_is_rejected() {
+        let (root, database) = temporary_database("missing-schema-test");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            BrainStore::open(&database),
+            Err(StoreError::Integrity(_))
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -741,8 +1183,14 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 2);
+        assert_eq!(store.database_schema_version().unwrap(), 3);
         assert!(store.list_symbols(None, false, 10).unwrap().is_empty());
+        assert!(
+            store
+                .recent_adapter_audit("project_a", 10)
+                .unwrap()
+                .is_empty()
+        );
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

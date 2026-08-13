@@ -1,34 +1,48 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use brain_core::{
-    ActionDescriptor, ActionKind, BrainConfig, CURRENT_SCHEMA_VERSION, DecisionKind, RuleEngine,
-    normalize_project_path,
+    AdapterCapabilities, AdapterIdentity, AdapterKind, BrainConfig, ContextItem,
+    EventIdentityQuality, FeedbackItem, GateDecision, HOOK_PROTOCOL_VERSION, HookEventPayload,
+    HookOutcomePayload, IdempotencyMetadata, IntentDeclared, IntentOrigin, InternalHookEvent,
+    InternalHookOutcome, SessionOpenReason, SessionOpened, StopDecision, TaskStopping,
+    ToolAboutToRun, ToolAction, ToolFinished, ToolStatus, normalize_project_path,
 };
-use brain_store::BrainStore;
+use brain_store::{AdapterRecordResult, BrainStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
-use crate::{
-    app::{HookEvent, decision_reason, should_deny},
-    error::AppError,
-};
+use crate::{app::HookEvent, error::AppError, protocol};
 
-#[derive(Debug, Deserialize)]
+const CODEX_ADAPTER_VERSION: u16 = 1;
+static DELIVERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Default, Deserialize)]
 pub struct CodexHookInput {
     #[serde(default)]
     session_id: String,
     #[serde(default)]
     cwd: String,
     #[serde(default)]
-    hook_event_name: String,
+    source: String,
     #[serde(default)]
     turn_id: String,
+    #[serde(default)]
+    prompt: String,
     #[serde(default)]
     tool_name: String,
     #[serde(default)]
     tool_use_id: String,
     #[serde(default)]
     tool_input: Value,
+    #[serde(default)]
+    tool_response: Value,
+    #[serde(default)]
+    last_assistant_message: Option<String>,
     #[serde(default)]
     stop_hook_active: bool,
 }
@@ -37,6 +51,10 @@ pub struct CodexHookInput {
 #[serde(transparent)]
 pub struct CodexHookOutput(Value);
 
+pub const fn capabilities() -> AdapterCapabilities {
+    AdapterCapabilities::codex()
+}
+
 pub fn handle(
     root: &Path,
     config: &BrainConfig,
@@ -44,165 +62,378 @@ pub fn handle(
     event: HookEvent,
     input: &CodexHookInput,
 ) -> Result<CodexHookOutput, AppError> {
-    match event {
-        HookEvent::SessionStart => Ok(session_start(config)),
-        HookEvent::PreToolUse | HookEvent::PostToolUse => {
-            evaluate_tool(root, config, store, event, input)
-        }
-        HookEvent::Stop => Ok(stop(root, config, input)),
-    }
-}
-
-fn stop(root: &Path, config: &BrainConfig, input: &CodexHookInput) -> CodexHookOutput {
-    if input.stop_hook_active || !config.stop_reconcile.enabled {
-        return CodexHookOutput(json!({ "continue": true }));
-    }
-
-    let result = crate::reconcile::evaluate_from_path(
-        root,
-        &config.stop_reconcile.base,
-        Path::new(&config.stop_reconcile.envelope),
-    );
-    let report = match result {
-        Ok(report) => report,
+    let started = Instant::now();
+    let internal_event = match to_internal_event(root, config, event, input) {
+        Ok(internal_event) => internal_event,
         Err(error) => {
-            return CodexHookOutput(json!({
-                "decision": "block",
-                "reason": format!("Project Brain Stop 对账失败：{error}")
-            }));
+            if let Some(output) = failure_output(event, input, &error.to_string()) {
+                return Ok(output);
+            }
+            return Err(error);
         }
     };
-
-    match report.decision {
-        crate::reconcile::ReconcileDecision::Allow => CodexHookOutput(json!({ "continue": true })),
-        crate::reconcile::ReconcileDecision::Block
-        | crate::reconcile::ReconcileDecision::Escalate => {
-            let details = if report.forbidden_files.is_empty() {
-                &report.unexpected_files
-            } else {
-                &report.forbidden_files
-            };
-            CodexHookOutput(json!({
-                "decision": "block",
-                "reason": format!(
-                    "Project Brain Stop 对账未通过：{}。涉及：{}",
-                    report.summary,
-                    details.join(", ")
-                )
-            }))
+    let outcome = match protocol::process(root, config, &internal_event) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = store.record_adapter_failure(
+                &internal_event,
+                elapsed_millis(started),
+                &error.to_string(),
+            );
+            if let Some(output) = failure_output(event, input, &error.to_string()) {
+                return Ok(output);
+            }
+            return Err(error);
         }
-    }
+    };
+    let outcome =
+        match store.record_adapter_event(&internal_event, &outcome, elapsed_millis(started)) {
+            Ok(result) => match result {
+                AdapterRecordResult::Inserted(_) => outcome,
+                AdapterRecordResult::Duplicate(first_outcome) => first_outcome,
+            },
+            Err(error) => {
+                if let Some(output) = failure_output(event, input, &error.to_string()) {
+                    return Ok(output);
+                }
+                return Err(error.into());
+            }
+        };
+    Ok(map_outcome(&outcome))
 }
 
-fn session_start(config: &BrainConfig) -> CodexHookOutput {
-    let active_rules = config
-        .rules
-        .iter()
-        .filter(|rule| rule.status == brain_core::MemoryStatus::Active)
-        .map(|rule| format!("- {}: {}", rule.id, rule.message))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let context = format!(
-        "Project Brain 已加载项目 {}。当前有效规则：\n{}",
-        config.project_name, active_rules
-    );
-    CodexHookOutput(json!({
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": context
-        }
-    }))
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn evaluate_tool(
+fn to_internal_event(
     root: &Path,
     config: &BrainConfig,
-    store: &BrainStore,
     event: HookEvent,
     input: &CodexHookInput,
-) -> Result<CodexHookOutput, AppError> {
-    let action = to_action(root, input);
-    let decision = RuleEngine::new(config)?.evaluate(&action)?;
-    let event_name = match event {
-        HookEvent::PreToolUse => "pre_tool_use",
-        HookEvent::PostToolUse => "post_tool_use",
-        _ => unreachable!("evaluate_tool 仅处理工具 Hook"),
+) -> Result<InternalHookEvent, AppError> {
+    let cwd = if input.cwd.trim().is_empty() {
+        root.to_string_lossy().into_owned()
+    } else {
+        input.cwd.clone()
     };
-    store.record(event_name, &action, &decision)?;
-    let reason = decision_reason(&decision);
-
-    let output = match event {
-        HookEvent::PreToolUse if should_deny(&decision) => json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason
-            }
-        }),
-        HookEvent::PreToolUse if decision.decision == DecisionKind::AllowWithContext => json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "additionalContext": reason
-            }
-        }),
-        HookEvent::PostToolUse if should_deny(&decision) => json!({
-            "decision": "block",
-            "reason": reason,
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": "该操作已经执行；Project Brain 正在阻止其结果被视为已完成。"
-            }
-        }),
-        HookEvent::PostToolUse if decision.decision == DecisionKind::AllowWithContext => json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": reason
-            }
-        }),
-        HookEvent::PreToolUse | HookEvent::PostToolUse => json!({}),
-        _ => unreachable!("evaluate_tool 仅处理工具 Hook"),
+    let session_key = if input.session_id.trim().is_empty() {
+        hash_id("codex_session", &[&config.project_key, &cwd])
+    } else {
+        input.session_id.clone()
     };
-
-    Ok(CodexHookOutput(output))
+    let turn_key = (!input.turn_id.trim().is_empty()).then(|| input.turn_id.clone());
+    let payload = match event {
+        HookEvent::SessionStart => HookEventPayload::SessionOpened(SessionOpened {
+            reason: session_reason(&input.source),
+            previous_session_key: None,
+        }),
+        HookEvent::UserPromptSubmit => HookEventPayload::IntentDeclared(IntentDeclared {
+            text: input.prompt.clone(),
+            origin: IntentOrigin::Interactive,
+        }),
+        HookEvent::PreToolUse => {
+            let (operation_id, tool_name, action) =
+                normalized_tool(root, &config.project_key, &session_key, input);
+            HookEventPayload::ToolAboutToRun(ToolAboutToRun {
+                operation_id,
+                tool_name,
+                action,
+            })
+        }
+        HookEvent::PostToolUse => {
+            let (operation_id, tool_name, action) =
+                normalized_tool(root, &config.project_key, &session_key, input);
+            HookEventPayload::ToolFinished(ToolFinished {
+                operation_id,
+                tool_name,
+                action,
+                status: tool_status(&input.tool_response),
+                duration_ms: None,
+            })
+        }
+        HookEvent::Stop => HookEventPayload::TaskStopping(TaskStopping {
+            last_assistant_message: input.last_assistant_message.clone(),
+            vendor_loop_active: input.stop_hook_active,
+        }),
+    };
+    let (event_id, identity_quality) =
+        event_identity(event, input, &config.project_key, &session_key)?;
+    let event = InternalHookEvent {
+        protocol_version: HOOK_PROTOCOL_VERSION,
+        project_key: config.project_key.clone(),
+        event_id,
+        idempotency: IdempotencyMetadata { identity_quality },
+        adapter: AdapterIdentity {
+            kind: AdapterKind::Codex,
+            adapter_version: CODEX_ADAPTER_VERSION,
+        },
+        session_key,
+        cwd,
+        turn_key,
+        payload,
+    };
+    event.validate()?;
+    Ok(event)
 }
 
-fn to_action(root: &Path, input: &CodexHookInput) -> ActionDescriptor {
+fn event_identity(
+    event: HookEvent,
+    input: &CodexHookInput,
+    project_key: &str,
+    session_key: &str,
+) -> Result<(String, EventIdentityQuality), AppError> {
+    let event_name = match event {
+        HookEvent::SessionStart => "session_opened",
+        HookEvent::UserPromptSubmit => "intent_declared",
+        HookEvent::PreToolUse => "tool_about_to_run",
+        HookEvent::PostToolUse => "tool_finished",
+        HookEvent::Stop => "task_stopping",
+    };
+    let stable_vendor_key = match event {
+        HookEvent::PreToolUse | HookEvent::PostToolUse if !input.tool_use_id.trim().is_empty() => {
+            Some((
+                input.tool_use_id.as_str(),
+                EventIdentityQuality::VendorStable,
+            ))
+        }
+        HookEvent::UserPromptSubmit if !input.turn_id.trim().is_empty() => {
+            Some((input.turn_id.as_str(), EventIdentityQuality::DerivedStable))
+        }
+        HookEvent::SessionStart
+        | HookEvent::UserPromptSubmit
+        | HookEvent::PreToolUse
+        | HookEvent::PostToolUse
+        | HookEvent::Stop => None,
+    };
+    if let Some((stable_key, quality)) = stable_vendor_key {
+        return Ok((
+            hash_id_bytes(
+                "codex_event",
+                &[
+                    project_key.as_bytes(),
+                    session_key.as_bytes(),
+                    event_name.as_bytes(),
+                    stable_key.as_bytes(),
+                ],
+            ),
+            quality,
+        ));
+    }
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let sequence = DELIVERY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    Ok((
+        hash_id_bytes(
+            "codex_event",
+            &[
+                project_key.as_bytes(),
+                session_key.as_bytes(),
+                event_name.as_bytes(),
+                &nonce.to_le_bytes(),
+                &sequence.to_le_bytes(),
+                &std::process::id().to_le_bytes(),
+            ],
+        ),
+        EventIdentityQuality::PerDelivery,
+    ))
+}
+
+fn normalized_tool(
+    root: &Path,
+    project_key: &str,
+    session_key: &str,
+    input: &CodexHookInput,
+) -> (String, String, ToolAction) {
     let command = input
         .tool_input
         .get("command")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let action = classify_action(&input.tool_name, command.as_deref());
+    let kind = classify_action(&input.tool_name, command.as_deref());
     let mut target_files = extract_target_files(&input.tool_input);
     target_files.sort();
     target_files.dedup();
     let target_files = target_files
         .into_iter()
         .map(|target| make_project_relative(root, &target))
-        .collect();
-
-    let metadata = BTreeMap::from([
-        ("turn_id".to_owned(), Value::String(input.turn_id.clone())),
-        (
-            "hook_event_name".to_owned(),
-            Value::String(input.hook_event_name.clone()),
-        ),
-    ]);
-
-    ActionDescriptor {
-        schema_version: CURRENT_SCHEMA_VERSION,
-        event_id: input.tool_use_id.clone(),
-        session_id: input.session_id.clone(),
-        cwd: input.cwd.clone(),
-        action,
-        operation: input.tool_name.clone(),
+        .collect::<Vec<_>>();
+    let action = ToolAction {
+        kind,
         target_files,
         command,
-        metadata,
+    };
+    let operation_id = if input.tool_use_id.trim().is_empty() {
+        let action_json = serde_json::to_vec(&action).unwrap_or_default();
+        hash_id_bytes(
+            "codex_operation",
+            &[
+                input.session_id.as_bytes(),
+                project_key.as_bytes(),
+                session_key.as_bytes(),
+                input.turn_id.as_bytes(),
+                input.tool_name.as_bytes(),
+                &action_json,
+            ],
+        )
+    } else {
+        hash_id(
+            "codex_operation",
+            &[project_key, session_key, &input.tool_use_id],
+        )
+    };
+    (operation_id, input.tool_name.clone(), action)
+}
+
+fn session_reason(source: &str) -> SessionOpenReason {
+    match source.to_ascii_lowercase().as_str() {
+        "startup" => SessionOpenReason::Startup,
+        "resume" => SessionOpenReason::Resume,
+        "clear" => SessionOpenReason::Clear,
+        "compact" => SessionOpenReason::Compact,
+        _ => SessionOpenReason::Unknown,
     }
 }
 
-fn classify_action(tool_name: &str, command: Option<&str>) -> ActionKind {
+fn tool_status(response: &Value) -> ToolStatus {
+    let Some(object) = response.as_object() else {
+        return ToolStatus::Unknown;
+    };
+    if let Some(success) = object.get("success").and_then(Value::as_bool) {
+        return if success {
+            ToolStatus::Succeeded
+        } else {
+            ToolStatus::Failed
+        };
+    }
+    if let Some(exit_code) = object.get("exit_code").and_then(Value::as_i64) {
+        return if exit_code == 0 {
+            ToolStatus::Succeeded
+        } else {
+            ToolStatus::Failed
+        };
+    }
+    if object.get("error").is_some_and(|error| !error.is_null()) {
+        return ToolStatus::Failed;
+    }
+    match object
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("success" | "succeeded" | "completed" | "ok") => ToolStatus::Succeeded,
+        Some("error" | "failed" | "cancelled" | "timed_out") => ToolStatus::Failed,
+        _ => ToolStatus::Unknown,
+    }
+}
+
+fn map_outcome(outcome: &InternalHookOutcome) -> CodexHookOutput {
+    let output = match &outcome.payload {
+        HookOutcomePayload::SessionOpened { inject } => context_output("SessionStart", inject),
+        HookOutcomePayload::IntentDeclared { gate, inject } => match gate {
+            GateDecision::Deny { reason } => json!({
+                "decision": "block",
+                "reason": reason
+            }),
+            GateDecision::NoVeto if inject.is_empty() => json!({}),
+            GateDecision::NoVeto => context_output("UserPromptSubmit", inject),
+        },
+        HookOutcomePayload::ToolAboutToRun { gate, inject } => match gate {
+            GateDecision::Deny { reason } => json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason
+                }
+            }),
+            GateDecision::NoVeto if inject.is_empty() => json!({}),
+            GateDecision::NoVeto => context_output("PreToolUse", inject),
+        },
+        HookOutcomePayload::ToolFinished { feedback } if feedback.is_empty() => json!({}),
+        HookOutcomePayload::ToolFinished { feedback } => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": join_feedback(feedback)
+            }
+        }),
+        HookOutcomePayload::TaskStopping { stop, feedback: _ } => match stop {
+            StopDecision::AllowStop => json!({ "continue": true }),
+            StopDecision::ContinueWork { reason } => json!({
+                "decision": "block",
+                "reason": reason
+            }),
+        },
+    };
+    CodexHookOutput(output)
+}
+
+pub fn failure_output(
+    event: HookEvent,
+    input: &CodexHookInput,
+    error: &str,
+) -> Option<CodexHookOutput> {
+    let reason = format!("Project Brain 治理或审计失败，拒绝默认放行：{error}");
+    match event {
+        HookEvent::PreToolUse => Some(CodexHookOutput(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason
+            }
+        }))),
+        HookEvent::Stop if input.stop_hook_active => {
+            Some(CodexHookOutput(json!({ "continue": true })))
+        }
+        HookEvent::Stop => Some(CodexHookOutput(json!({
+            "decision": "block",
+            "reason": reason
+        }))),
+        HookEvent::SessionStart | HookEvent::UserPromptSubmit | HookEvent::PostToolUse => None,
+    }
+}
+
+fn context_output(hook_event_name: &str, items: &[ContextItem]) -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": hook_event_name,
+            "additionalContext": items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    })
+}
+
+fn join_feedback(items: &[FeedbackItem]) -> String {
+    items
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn hash_id(label: &str, parts: &[&str]) -> String {
+    hash_id_bytes(
+        label,
+        &parts.iter().map(|part| part.as_bytes()).collect::<Vec<_>>(),
+    )
+}
+
+fn hash_id_bytes(label: &str, parts: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"project-brain/internal-hook/v1\0");
+    digest.update(label.as_bytes());
+    for part in parts {
+        digest.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
+        digest.update(part);
+    }
+    format!("{label}_{:x}", digest.finalize())
+}
+
+fn classify_action(tool_name: &str, command: Option<&str>) -> brain_core::ActionKind {
+    use brain_core::ActionKind;
+
     let tool = tool_name.to_ascii_lowercase();
     if matches!(tool.as_str(), "apply_patch" | "edit" | "write") {
         let command = command.unwrap_or_default();
@@ -214,7 +445,7 @@ fn classify_action(tool_name: &str, command: Option<&str>) -> ActionKind {
         }
         return ActionKind::Modify;
     }
-    if tool == "bash" {
+    if tool == "bash" || tool == "shell_command" {
         let command = command.unwrap_or_default().to_ascii_lowercase();
         if command.contains("git ") || command.starts_with("git") {
             return ActionKind::GitOperation;
@@ -287,43 +518,20 @@ mod tests {
     use std::path::Path;
 
     use brain_core::{
-        Authority, BrainConfig, CURRENT_SCHEMA_VERSION, MemoryStatus, Rule, RuleEffect,
-        RuleStrength, StopReconcileConfig,
+        ActionKind, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, HookEventPayload,
+        InternalHookEvent, MemoryStatus, Rule, RuleEffect, RuleStrength, StopReconcileConfig,
+        ToolStatus,
     };
     use brain_store::BrainStore;
     use serde_json::json;
 
-    use super::{CodexHookInput, classify_action, extract_target_files, handle};
+    use super::{CodexHookInput, classify_action, extract_target_files, failure_output, handle};
     use crate::app::HookEvent;
-    use brain_core::ActionKind;
 
-    #[test]
-    fn extracts_all_apply_patch_file_markers() {
-        let input = json!({
-            "command": "*** Begin Patch\n*** Update File: src/main.rs\n*** Add File: src/new.rs\n*** End Patch"
-        });
-        assert_eq!(
-            extract_target_files(&input),
-            vec!["src/main.rs".to_owned(), "src/new.rs".to_owned()]
-        );
-    }
-
-    #[test]
-    fn classifies_destructive_shell_commands() {
-        assert_eq!(
-            classify_action("Bash", Some("Remove-Item file.txt")),
-            ActionKind::Delete
-        );
-        assert_eq!(
-            classify_action("Bash", Some("git status")),
-            ActionKind::GitOperation
-        );
-    }
-
-    #[test]
-    fn codex_pre_tool_hook_denies_deleting_a_protected_file() {
-        let config = BrainConfig {
+    fn config(project_key: &str) -> BrainConfig {
+        BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: project_key.to_owned(),
             project_name: "test".to_owned(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![Rule {
@@ -340,65 +548,341 @@ mod tests {
                 message: "protected".to_owned(),
                 rationale: String::new(),
             }],
-        };
-        let store = BrainStore::open_in_memory().unwrap();
-        let input = CodexHookInput {
+        }
+    }
+
+    fn delete_input() -> CodexHookInput {
+        CodexHookInput {
             session_id: "session".to_owned(),
             cwd: "C:/repo".to_owned(),
-            hook_event_name: "PreToolUse".to_owned(),
             turn_id: "turn".to_owned(),
             tool_name: "apply_patch".to_owned(),
             tool_use_id: "tool".to_owned(),
             tool_input: json!({
                 "command": "*** Begin Patch\n*** Delete File: .project-brain/config.json\n*** End Patch"
             }),
-            stop_hook_active: false,
-        };
+            ..CodexHookInput::default()
+        }
+    }
 
+    #[test]
+    fn extracts_all_apply_patch_file_markers() {
+        let input = json!({
+            "command": "*** Begin Patch\n*** Update File: src/main.rs\n*** Add File: src/new.rs\n*** End Patch"
+        });
+        assert_eq!(
+            extract_target_files(&input),
+            vec!["src/main.rs".to_owned(), "src/new.rs".to_owned()]
+        );
+    }
+
+    #[test]
+    fn classifies_destructive_shell_commands() {
+        assert_eq!(
+            classify_action("shell_command", Some("Remove-Item file.txt")),
+            ActionKind::Delete
+        );
+        assert_eq!(
+            classify_action("shell_command", Some("git status")),
+            ActionKind::GitOperation
+        );
+    }
+
+    #[test]
+    fn codex_pre_tool_hook_denies_without_approving_vendor_permissions() {
+        let store = BrainStore::open_in_memory().unwrap();
         let output = handle(
             Path::new("C:/repo"),
-            &config,
+            &config("project_a"),
+            &store,
+            HookEvent::PreToolUse,
+            &delete_input(),
+        )
+        .unwrap();
+
+        assert_eq!(output.0["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(
+            store.recent_adapter_audit("project_a", 10).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn codex_no_veto_emits_no_vendor_permission_approval() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let mut input = delete_input();
+        input.tool_use_id = "allowed-tool".to_owned();
+        input.tool_input = json!({ "path": "README.md" });
+        let output = handle(
+            Path::new("C:/repo"),
+            &config("project_a"),
             &store,
             HookEvent::PreToolUse,
             &input,
         )
         .unwrap();
 
-        assert_eq!(output.0["hookSpecificOutput"]["permissionDecision"], "deny");
-        assert_eq!(store.audit_count().unwrap(), 1);
+        assert_eq!(output.0, json!({}));
+    }
+
+    #[test]
+    fn codex_no_veto_with_context_does_not_approve_vendor_permissions() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let mut config = config("project_a");
+        config.rules[0].effect = RuleEffect::InjectContext;
+        let output = handle(
+            Path::new("C:/repo"),
+            &config,
+            &store,
+            HookEvent::PreToolUse,
+            &delete_input(),
+        )
+        .unwrap();
+
+        assert!(
+            output.0["hookSpecificOutput"]
+                .get("additionalContext")
+                .is_some()
+        );
+        assert!(
+            output.0["hookSpecificOutput"]
+                .get("permissionDecision")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn codex_post_tool_violation_is_feedback_not_a_retroactive_block() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let output = handle(
+            Path::new("C:/repo"),
+            &config("project_a"),
+            &store,
+            HookEvent::PostToolUse,
+            &delete_input(),
+        )
+        .unwrap();
+
+        assert!(output.0.get("decision").is_none());
+        assert_eq!(
+            output.0["hookSpecificOutput"]["hookEventName"],
+            "PostToolUse"
+        );
+    }
+
+    #[test]
+    fn codex_post_tool_records_failed_response_status() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let mut input = delete_input();
+        input.tool_response = json!({ "exit_code": 1 });
+        handle(
+            Path::new("C:/repo"),
+            &config("project_a"),
+            &store,
+            HookEvent::PostToolUse,
+            &input,
+        )
+        .unwrap();
+        let records = store.recent_adapter_audit("project_a", 10).unwrap();
+        let event: InternalHookEvent = serde_json::from_str(&records[0].event_json).unwrap();
+        let HookEventPayload::ToolFinished(finished) = event.payload else {
+            panic!("期望 ToolFinished")
+        };
+        assert_eq!(finished.status, ToolStatus::Failed);
+    }
+
+    #[test]
+    fn session_and_intent_outputs_follow_their_codex_contracts() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let session = handle(
+            Path::new("C:/repo"),
+            &config("project_a"),
+            &store,
+            HookEvent::SessionStart,
+            &CodexHookInput {
+                session_id: "session".to_owned(),
+                source: "startup".to_owned(),
+                ..CodexHookInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            session.0["hookSpecificOutput"]["hookEventName"],
+            "SessionStart"
+        );
+        assert!(
+            session.0["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("project_key=project_a")
+        );
+
+        let intent = handle(
+            Path::new("C:/repo"),
+            &config("project_a"),
+            &store,
+            HookEvent::UserPromptSubmit,
+            &CodexHookInput {
+                session_id: "session".to_owned(),
+                turn_id: "turn".to_owned(),
+                prompt: "修改 README".to_owned(),
+                ..CodexHookInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(intent.0, json!({}));
+        assert!(
+            store
+                .recent_adapter_audit("project_a", 10)
+                .unwrap()
+                .iter()
+                .any(|record| record.event_kind == "intent_declared")
+        );
+    }
+
+    #[test]
+    fn critical_hook_errors_have_explicit_fail_closed_outputs() {
+        let input = CodexHookInput::default();
+        let pre = failure_output(HookEvent::PreToolUse, &input, "database unavailable").unwrap();
+        assert_eq!(pre.0["hookSpecificOutput"]["permissionDecision"], "deny");
+        let stop = failure_output(HookEvent::Stop, &input, "database unavailable").unwrap();
+        assert_eq!(stop.0["decision"], "block");
+        assert!(failure_output(HookEvent::PostToolUse, &input, "failure").is_none());
+    }
+
+    #[test]
+    fn duplicate_delivery_reuses_the_first_outcome_and_audit_row() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let input = delete_input();
+        let first = handle(
+            Path::new("C:/repo"),
+            &config("project_a"),
+            &store,
+            HookEvent::PreToolUse,
+            &input,
+        )
+        .unwrap();
+        let second = handle(
+            Path::new("C:/repo"),
+            &config("project_a"),
+            &store,
+            HookEvent::PreToolUse,
+            &input,
+        )
+        .unwrap();
+        assert_eq!(first.0, second.0);
+        assert_eq!(
+            store.recent_adapter_audit("project_a", 10).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn vendor_tool_identity_wins_over_changed_retry_payload() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let first = delete_input();
+        let mut retry = delete_input();
+        retry.tool_input = json!({ "path": "README.md" });
+
+        let denied = handle(
+            Path::new("C:/repo"),
+            &config("project_a"),
+            &store,
+            HookEvent::PreToolUse,
+            &first,
+        )
+        .unwrap();
+        let replayed = handle(
+            Path::new("C:/repo"),
+            &config("project_a"),
+            &store,
+            HookEvent::PreToolUse,
+            &retry,
+        )
+        .unwrap();
+        assert_eq!(denied.0, replayed.0);
+        assert_eq!(
+            store.recent_adapter_audit("project_a", 10).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn identical_vendor_ids_are_isolated_by_project_key() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let input = delete_input();
+        for project_key in ["project_a", "project_b"] {
+            handle(
+                Path::new("C:/repo"),
+                &config(project_key),
+                &store,
+                HookEvent::PreToolUse,
+                &input,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store.recent_adapter_audit("project_a", 10).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store.recent_adapter_audit("project_b", 10).unwrap().len(),
+            1
+        );
+        let operation_ids = ["project_a", "project_b"].map(|project_key| {
+            let record = store
+                .recent_adapter_audit(project_key, 1)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let event: InternalHookEvent = serde_json::from_str(&record.event_json).unwrap();
+            let HookEventPayload::ToolAboutToRun(tool) = event.payload else {
+                panic!("期望 ToolAboutToRun")
+            };
+            tool.operation_id
+        });
+        assert_ne!(operation_ids[0], operation_ids[1]);
     }
 
     #[test]
     fn active_stop_hook_does_not_start_a_reconcile_loop() {
-        let config = BrainConfig {
-            schema_version: CURRENT_SCHEMA_VERSION,
-            project_name: "test".to_owned(),
-            rules: Vec::new(),
-            stop_reconcile: brain_core::StopReconcileConfig {
-                enabled: true,
-                base: "HEAD".to_owned(),
-                envelope: ".project-brain/envelope.json".to_owned(),
-            },
-        };
         let store = BrainStore::open_in_memory().unwrap();
         let input = CodexHookInput {
-            session_id: String::new(),
-            cwd: String::new(),
-            hook_event_name: "Stop".to_owned(),
-            turn_id: String::new(),
-            tool_name: String::new(),
-            tool_use_id: String::new(),
-            tool_input: json!({}),
             stop_hook_active: true,
+            ..CodexHookInput::default()
         };
         let output = handle(
             Path::new("Z:/not/a/repository"),
-            &config,
+            &config("project_a"),
             &store,
             HookEvent::Stop,
             &input,
         )
         .unwrap();
         assert_eq!(output.0, json!({ "continue": true }));
+    }
+
+    #[test]
+    fn stop_without_a_vendor_delivery_id_is_not_cached_across_invocations() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let input = CodexHookInput {
+            turn_id: "turn".to_owned(),
+            stop_hook_active: true,
+            ..CodexHookInput::default()
+        };
+        for _ in 0..2 {
+            handle(
+                Path::new("Z:/not/a/repository"),
+                &config("project_a"),
+                &store,
+                HookEvent::Stop,
+                &input,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store.recent_adapter_audit("project_a", 10).unwrap().len(),
+            2
+        );
     }
 }

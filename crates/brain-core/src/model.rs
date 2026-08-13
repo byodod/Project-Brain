@@ -10,6 +10,8 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub struct BrainConfig {
     pub schema_version: u32,
     #[serde(default)]
+    pub project_key: String,
+    #[serde(default)]
     pub project_name: String,
     #[serde(default)]
     pub rules: Vec<Rule>,
@@ -29,6 +31,15 @@ impl BrainConfig {
                 actual: self.schema_version,
                 expected: CURRENT_SCHEMA_VERSION,
             });
+        }
+        if self.project_key.trim().is_empty()
+            || self.project_key.len() > 128
+            || !self
+                .project_key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(CoreError::InvalidProjectKey(self.project_key.clone()));
         }
 
         for rule in &self.rules {
@@ -267,6 +278,7 @@ mod tests {
     fn enabled_stop_reconcile_requires_a_base_and_envelope() {
         let config = BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: "project_test".to_owned(),
             project_name: "test".to_owned(),
             rules: Vec::new(),
             stop_reconcile: StopReconcileConfig {

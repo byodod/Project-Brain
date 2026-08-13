@@ -176,6 +176,7 @@ mod tests {
     fn hard_block_has_priority_over_context() {
         let config = BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: "project_test".to_owned(),
             project_name: "test".to_owned(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![
@@ -196,6 +197,7 @@ mod tests {
     fn unrelated_paths_are_allowed() {
         let config = BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: "project_test".to_owned(),
             project_name: "test".to_owned(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![rule("block", RuleEffect::Block, RuleStrength::Hard)],
@@ -214,6 +216,7 @@ mod tests {
         invalid.authority = Authority::AgentInference;
         let config = BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: "project_test".to_owned(),
             project_name: "test".to_owned(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![invalid],
@@ -231,6 +234,7 @@ mod tests {
         inactive.status = MemoryStatus::Superseded;
         let config = BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: "project_test".to_owned(),
             project_name: "test".to_owned(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![inactive],
@@ -249,6 +253,7 @@ mod tests {
         bash_only.operations = vec!["Bash".to_owned()];
         let config = BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: "project_test".to_owned(),
             project_name: "test".to_owned(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![bash_only],

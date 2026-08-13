@@ -4,6 +4,7 @@ mod codex;
 mod error;
 mod git;
 mod index;
+mod protocol;
 mod reconcile;
 
 use std::{path::PathBuf, process::ExitCode};
@@ -33,6 +34,9 @@ enum Command {
 
     /// 从标准输入读取 Agent Hook JSON 并输出对应 Hook 协议
     Hook { agent: AgentKind, event: HookEvent },
+
+    /// 输出指定 Agent adapter 的已确认治理能力
+    Capabilities { agent: AgentKind },
 
     /// 对照 Change Envelope 检查当前 Git 变更范围
     Reconcile {
@@ -76,9 +80,8 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Init => App::init(cli.project_root),
         Command::Preflight => App::open(cli.project_root).and_then(|app| app.preflight()),
-        Command::Hook { agent, event } => {
-            App::open(cli.project_root).and_then(|app| app.hook(agent, event))
-        }
+        Command::Hook { agent, event } => App::run_hook(cli.project_root, agent, event),
+        Command::Capabilities { agent } => App::capabilities(agent),
         Command::Reconcile { base, envelope } => {
             App::open(cli.project_root).and_then(|app| app.reconcile(&base, &envelope))
         }

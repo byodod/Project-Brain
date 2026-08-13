@@ -7,6 +7,9 @@ pub enum AppError {
     #[error("I/O 操作失败：{0}")]
     Io(#[from] std::io::Error),
 
+    #[error("系统时间无效：{0}")]
+    Clock(#[from] std::time::SystemTimeError),
+
     #[error("JSON 解析或序列化失败：{0}")]
     Json(#[from] serde_json::Error),
 

@@ -6,13 +6,14 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 
 - `ALLOW / ALLOW_WITH_CONTEXT / BLOCK / ESCALATE` 四态规则引擎；
 - 带 authority、strength、scope 和 lifecycle 的版本化规则模型；
-- Codex `SessionStart`、`PreToolUse`、`PostToolUse`、`Stop` 协议适配；
-- SQLite 本地审计记录；
+- Project-scoped Internal Hook Protocol v1；
+- Codex `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Stop` 协议适配；
+- 按项目和 adapter 隔离、可重放的 SQLite 本地审计记录；
 - Git Change Envelope 范围核对；
 - Codex `Stop` 自动 Change Envelope 对账与防循环保护；
 - 基于 Tree-sitter 的 Rust changed-symbol 与纯删除符号提取；
 - Provider-neutral 符号身份协议、完整工作区快照与本地派生符号图；
-- SQLite schema v1→v2 迁移、符号 removed 历史与幂等增量更新；
+- SQLite schema v1→v3 迁移、符号 removed 历史与幂等增量更新；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
 ## 核心原则
@@ -23,6 +24,8 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 4. SQLite 是本地审计和派生状态，不是仓库规则的权威来源。
 5. `PostToolUse` 无法撤销已经发生的副作用，只能阻止 Agent 把结果视为完成。
 6. 语法 Provider 的身份必须标记为 `syntax_fallback`，不得冒充跨 rename/move 稳定语义。
+7. `project_key` 是项目边界；`cwd`、session ID 和 event ID 都不能单独代表项目。
+8. 核心 `NoVeto` 不等于批准 Agent vendor 权限。
 
 ## 构建与测试
 
@@ -52,7 +55,7 @@ project-brain init
 
 ```text
 .project-brain/
-├── config.json      # 应提交：项目规则权威来源
+├── config.json      # 应提交：project_key 与项目规则权威来源
 ├── envelope.json    # 应提交或按任务生成：声明变更范围
 └── brain.db         # 不提交：本地审计数据库
 ```
@@ -83,6 +86,12 @@ project-brain preflight
 
 将 [examples/codex-hooks.json](examples/codex-hooks.json) 复制或合并到仓库的 `.codex/hooks.json`，并确保 `project-brain` 在 `PATH` 中。示例配置使用同步 `PreToolUse`，因此硬规则可以在工具执行前拒绝调用。
 
+查看当前 Codex adapter 明确声明的能力：
+
+```text
+project-brain capabilities codex
+```
+
 手工验证适配器：
 
 ```text
@@ -106,6 +115,10 @@ project-brain hook codex pre-tool-use
 ```
 
 该请求会被仓库默认硬规则拒绝。
+
+内部事件和审计均携带配置中持久化的 `project_key`。相同 session/tool ID 在不同项目中
+会落入不同幂等域；重复 delivery 则复用首次 outcome。`audit` 命令同时输出当前项目的
+`adapter_events` 与旧 preflight 的 `legacy_actions`。
 
 ## Change Envelope
 
