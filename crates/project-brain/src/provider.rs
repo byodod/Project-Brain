@@ -26,6 +26,8 @@ const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 const MAX_SCIP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
 const AUDIT_RETAIN_BYTES: usize = 2 * 1024 * 1024;
+const MAX_LAUNCHER_PACKAGE_FILES: usize = 20_000;
+const MAX_LAUNCHER_PACKAGE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ProviderArtifact {
@@ -42,6 +44,8 @@ struct ProviderBinding {
     producer: String,
     executable: ProviderArtifact,
     launcher_script: Option<ProviderArtifact>,
+    #[serde(default)]
+    launcher_package_manifest_sha256: Option<String>,
     resolved_version: String,
 }
 
@@ -59,6 +63,7 @@ pub struct ProviderBindReport {
     producer: String,
     executable: PathBuf,
     launcher_script: Option<PathBuf>,
+    launcher_package_manifest_sha256: Option<String>,
     executable_sha256: String,
     resolved_version: String,
     registration_id: String,
@@ -101,6 +106,7 @@ pub struct ProviderExecutionReport {
     registration_id: String,
     registration_revision: u64,
     executable_sha256: String,
+    launcher_package_manifest_sha256: Option<String>,
     resolved_version: String,
     duration_ms: u128,
     exit_code: Option<i32>,
@@ -129,6 +135,7 @@ pub struct ProviderTrustStatus {
     pub registration_id: Option<String>,
     pub registration_revision: Option<u64>,
     pub executable_sha256: Option<String>,
+    pub launcher_package_manifest_sha256: Option<String>,
     pub issue: Option<String>,
 }
 
@@ -180,6 +187,9 @@ pub fn trust_status(
                             registration_id: Some(binding.registration_id.clone()),
                             registration_revision: Some(binding.revision),
                             executable_sha256: Some(binding.executable.sha256.clone()),
+                            launcher_package_manifest_sha256: binding
+                                .launcher_package_manifest_sha256
+                                .clone(),
                             issue,
                         }
                     } else {
@@ -189,6 +199,7 @@ pub fn trust_status(
                             registration_id: None,
                             registration_revision: None,
                             executable_sha256: None,
+                            launcher_package_manifest_sha256: None,
                             issue: Some(format!("provider profile={} 尚未在本机绑定", profile.id)),
                         }
                     }
@@ -199,6 +210,7 @@ pub fn trust_status(
                     registration_id: None,
                     registration_revision: None,
                     executable_sha256: None,
+                    launcher_package_manifest_sha256: None,
                     issue: Some(error.clone()),
                 },
             };
@@ -333,6 +345,13 @@ pub fn bind(
             "launcher script 只用于通过原生 node executable 启动 scip-python".to_owned(),
         ));
     }
+    let launcher_package_manifest_sha256 = match (
+        profile.producer.eq_ignore_ascii_case("scip-python"),
+        launcher_script.as_ref(),
+    ) {
+        (true, Some(script)) => Some(scip_python_package_manifest(script)?),
+        _ => None,
+    };
 
     let probe = run_process(
         &executable.canonical_path,
@@ -397,6 +416,7 @@ pub fn bind(
             &profile.producer,
             &executable,
             launcher_script.as_ref(),
+            launcher_package_manifest_sha256.as_deref(),
         ),
         revision: 1,
         project_key: project_key.to_owned(),
@@ -404,6 +424,7 @@ pub fn bind(
         producer: profile.producer.clone(),
         executable,
         launcher_script,
+        launcher_package_manifest_sha256,
         resolved_version: resolved_version.clone(),
     };
 
@@ -455,6 +476,7 @@ pub fn bind(
         launcher_script: binding
             .launcher_script
             .map(|artifact| artifact.canonical_path),
+        launcher_package_manifest_sha256: binding.launcher_package_manifest_sha256,
         executable_sha256: binding.executable.sha256,
         resolved_version,
         registration_id: binding.registration_id,
@@ -701,6 +723,7 @@ pub fn execute(
         registration_id: binding.registration_id,
         registration_revision: binding.revision,
         executable_sha256: binding.executable.sha256,
+        launcher_package_manifest_sha256: binding.launcher_package_manifest_sha256,
         resolved_version: binding.resolved_version,
         duration_ms: process.duration.as_millis(),
         exit_code: process.status.code(),
@@ -896,6 +919,108 @@ fn pinned_artifact(path: &Path, label: &str) -> Result<ProviderArtifact, AppErro
     })
 }
 
+fn scip_python_package_manifest(script: &ProviderArtifact) -> Result<String, AppError> {
+    let package_root = script
+        .canonical_path
+        .parent()
+        .ok_or_else(|| AppError::Provider("scip-python launcher script 缺少父目录".to_owned()))?;
+    let package_json_path = package_root.join("package.json");
+    let package_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&package_json_path).map_err(|error| {
+            AppError::Provider(format!(
+                "scip-python launcher 必须位于官方包根目录，无法读取 {}：{error}",
+                package_json_path.display()
+            ))
+        })?)?;
+    if package_json.get("name").and_then(serde_json::Value::as_str)
+        != Some("@sourcegraph/scip-python")
+    {
+        return Err(AppError::Provider(
+            "scip-python launcher 所在 package.json 的 name 不匹配".to_owned(),
+        ));
+    }
+    let bin_entry = package_json
+        .get("bin")
+        .and_then(|value| {
+            value.as_str().or_else(|| {
+                value
+                    .as_object()
+                    .and_then(|entries| entries.get("scip-python"))
+                    .and_then(serde_json::Value::as_str)
+            })
+        })
+        .ok_or_else(|| {
+            AppError::Provider("scip-python package.json 缺少 scip-python bin 入口".to_owned())
+        })?;
+    let declared_script = package_root
+        .join(bin_entry)
+        .canonicalize()
+        .map_err(|error| AppError::Provider(format!("scip-python bin 入口无法解析：{error}")))?;
+    if declared_script != script.canonical_path {
+        return Err(AppError::Provider(
+            "--script 必须指向 scip-python package.json 声明的 bin 入口".to_owned(),
+        ));
+    }
+
+    let mut pending = vec![package_root.to_owned()];
+    let mut files = Vec::new();
+    let mut total_bytes = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(AppError::Provider(format!(
+                    "scip-python 包内不允许符号链接：{}",
+                    path.display()
+                )));
+            }
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() {
+                total_bytes = total_bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| AppError::Provider("scip-python 包大小溢出".to_owned()))?;
+                if total_bytes > MAX_LAUNCHER_PACKAGE_BYTES {
+                    return Err(AppError::Provider(format!(
+                        "scip-python 包超过 {MAX_LAUNCHER_PACKAGE_BYTES} 字节安全上限"
+                    )));
+                }
+                let relative = path
+                    .strip_prefix(package_root)
+                    .map_err(|_| AppError::Provider("scip-python 包文件越过包根目录".to_owned()))?;
+                files.push((
+                    relative.to_string_lossy().replace('\\', "/"),
+                    path,
+                    metadata.len(),
+                ));
+                if files.len() > MAX_LAUNCHER_PACKAGE_FILES {
+                    return Err(AppError::Provider(format!(
+                        "scip-python 包超过 {MAX_LAUNCHER_PACKAGE_FILES} 个文件安全上限"
+                    )));
+                }
+            } else {
+                return Err(AppError::Provider(format!(
+                    "scip-python 包包含不支持的文件类型：{}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut digest = Sha256::new();
+    digest.update(b"project-brain/scip-python-package/v1\0");
+    for (relative, path, size) in files {
+        digest.update(relative.as_bytes());
+        digest.update([0]);
+        digest.update(size.to_le_bytes());
+        digest.update(hash_file(&path)?.as_bytes());
+        digest.update([0]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 fn reject_repository_artifact(
     project_root: &Path,
     artifact: &ProviderArtifact,
@@ -919,16 +1044,23 @@ fn registration_id(
     producer: &str,
     executable: &ProviderArtifact,
     launcher_script: Option<&ProviderArtifact>,
+    launcher_package_manifest_sha256: Option<&str>,
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"project-brain/provider-registration/v1\0");
-    for part in [
+    let mut parts = vec![
         project_key,
         profile_id,
         producer,
         &executable.sha256,
         launcher_script.map_or("", |script| script.sha256.as_str()),
-    ] {
+    ];
+    if let Some(manifest) = launcher_package_manifest_sha256 {
+        digest.update(b"project-brain/provider-registration/v2\0");
+        parts.push(manifest);
+    } else {
+        digest.update(b"project-brain/provider-registration/v1\0");
+    }
+    for part in parts {
         digest.update(part.as_bytes());
         digest.update([0]);
     }
@@ -941,11 +1073,13 @@ fn digest_path(path: &Path) -> String {
 }
 
 fn binding_equivalent(left: &ProviderBinding, right: &ProviderBinding) -> bool {
-    left.project_key == right.project_key
+    left.registration_id == right.registration_id
+        && left.project_key == right.project_key
         && left.profile_id == right.profile_id
         && left.producer == right.producer
         && left.executable == right.executable
         && left.launcher_script == right.launcher_script
+        && left.launcher_package_manifest_sha256 == right.launcher_package_manifest_sha256
         && left.resolved_version == right.resolved_version
 }
 
@@ -1060,9 +1194,44 @@ fn validate_binding(
             profile.id
         )));
     }
+    let expected_registration_id = registration_id(
+        &binding.project_key,
+        &binding.profile_id,
+        &binding.producer,
+        &binding.executable,
+        binding.launcher_script.as_ref(),
+        binding.launcher_package_manifest_sha256.as_deref(),
+    );
+    if binding.registration_id != expected_registration_id {
+        return Err(AppError::Provider(format!(
+            "provider profile={} 的 registration_id 与固定内容不一致；请显式重新绑定",
+            profile.id
+        )));
+    }
     validate_artifact(&binding.executable, "Provider executable")?;
     if let Some(script) = &binding.launcher_script {
         validate_artifact(script, "Provider launcher script")?;
+    }
+    if profile.producer.eq_ignore_ascii_case("scip-python")
+        && let Some(script) = binding.launcher_script.as_ref()
+    {
+        let expected = binding
+            .launcher_package_manifest_sha256
+            .as_ref()
+            .ok_or_else(|| {
+                AppError::Provider("scip-python 绑定缺少包清单哈希；请显式重新绑定".to_owned())
+            })?;
+        let actual = scip_python_package_manifest(script)?;
+        if &actual != expected {
+            return Err(AppError::Provider(
+                "scip-python 包内容发生漂移；请显式重新绑定".to_owned(),
+            ));
+        }
+    } else if binding.launcher_package_manifest_sha256.is_some() {
+        return Err(AppError::Provider(format!(
+            "provider profile={} 不应包含 launcher 包清单",
+            profile.id
+        )));
     }
     Ok(())
 }
@@ -1090,8 +1259,8 @@ fn provider_arguments(
     project_key: &str,
     output_path: &Path,
 ) -> Result<Vec<String>, AppError> {
-    let root = project_root.to_string_lossy().into_owned();
-    let output = output_path.to_string_lossy().into_owned();
+    let root = provider_cli_path(project_root);
+    let output = provider_cli_path(output_path);
     if producer.eq_ignore_ascii_case("rust-analyzer") {
         Ok(vec!["scip".to_owned(), root, "--output".to_owned(), output])
     } else if producer.eq_ignore_ascii_case("scip-dotnet") {
@@ -1106,14 +1275,28 @@ fn provider_arguments(
     } else if producer.eq_ignore_ascii_case("scip-python") {
         Ok(vec![
             "index".to_owned(),
+            "--cwd".to_owned(),
             root,
             "--project-name".to_owned(),
             project_key.to_owned(),
+            "--output".to_owned(),
+            output,
         ])
     } else {
         Err(AppError::Provider(format!(
             "producer={producer:?} 没有安全 argv 契约"
         )))
+    }
+}
+
+fn provider_cli_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        value.into_owned()
     }
 }
 
@@ -1187,7 +1370,7 @@ fn run_process(
 ) -> Result<ProcessResult, AppError> {
     let mut command = Command::new(executable);
     if let Some(script) = launcher_script {
-        command.arg(script);
+        command.arg(provider_cli_path(script));
     }
     command
         .args(arguments)
@@ -1471,8 +1654,9 @@ mod tests {
 
     use super::{
         MAX_CAPTURE_BYTES, PROVIDER_SCHEMA_VERSION, ProviderArtifact, ProviderBinding,
-        ProviderRegistry, drain_bounded, pinned_artifact, provider_arguments,
-        reject_repository_artifact, trust_status, validate_binding, verify_probe_identity,
+        ProviderRegistry, drain_bounded, pinned_artifact, provider_arguments, provider_cli_path,
+        registration_id, reject_repository_artifact, scip_python_package_manifest, trust_status,
+        validate_binding, verify_probe_identity,
     };
 
     fn profile(producer: &str) -> SemanticProviderProfile {
@@ -1510,9 +1694,33 @@ mod tests {
         );
         assert_eq!(
             provider_arguments("scip-python", root, "project-key", output).unwrap(),
-            ["index", "repo with spaces", "--project-name", "project-key"]
+            [
+                "index",
+                "--cwd",
+                "repo with spaces",
+                "--project-name",
+                "project-key",
+                "--output",
+                "run/index.scip"
+            ]
         );
         assert!(provider_arguments("custom", root, "p", output).is_err());
+    }
+
+    #[test]
+    fn provider_cli_paths_remove_windows_verbatim_prefixes() {
+        assert_eq!(
+            provider_cli_path(Path::new(r"\\?\C:\repo with spaces\index.scip")),
+            r"C:\repo with spaces\index.scip"
+        );
+        assert_eq!(
+            provider_cli_path(Path::new(r"\\?\UNC\server\share\index.scip")),
+            r"\\server\share\index.scip"
+        );
+        assert_eq!(
+            provider_cli_path(Path::new("repo with spaces/index.scip")),
+            "repo with spaces/index.scip"
+        );
     }
 
     #[test]
@@ -1528,22 +1736,31 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let executable = root.join("provider.bin");
         fs::write(&executable, b"one").unwrap();
-        let binding = ProviderBinding {
-            registration_id: "provider_test".to_owned(),
+        let mut binding = ProviderBinding {
+            registration_id: String::new(),
             revision: 1,
             project_key: "project".to_owned(),
             profile_id: "main".to_owned(),
-            producer: "scip-python".to_owned(),
+            producer: "rust-analyzer".to_owned(),
             executable: ProviderArtifact {
                 canonical_path: executable.clone(),
                 sha256: super::hash_file(&executable).unwrap(),
             },
             launcher_script: None,
+            launcher_package_manifest_sha256: None,
             resolved_version: "1".to_owned(),
         };
-        validate_binding(&binding, &profile("scip-python")).unwrap();
+        binding.registration_id = registration_id(
+            &binding.project_key,
+            &binding.profile_id,
+            &binding.producer,
+            &binding.executable,
+            binding.launcher_script.as_ref(),
+            binding.launcher_package_manifest_sha256.as_deref(),
+        );
+        validate_binding(&binding, &profile("rust-analyzer")).unwrap();
         fs::write(&executable, b"two").unwrap();
-        assert!(validate_binding(&binding, &profile("scip-python")).is_err());
+        assert!(validate_binding(&binding, &profile("rust-analyzer")).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1565,19 +1782,29 @@ mod tests {
         fs::create_dir_all(&tools).unwrap();
         let executable = tools.join("scip-python-provider.bin");
         fs::write(&executable, b"trusted").unwrap();
-        let binding = ProviderBinding {
-            registration_id: "registration-one".to_owned(),
+        let mut binding = ProviderBinding {
+            registration_id: String::new(),
             revision: 1,
             project_key: "project".to_owned(),
             profile_id: "main".to_owned(),
-            producer: "scip-python".to_owned(),
+            producer: "rust-analyzer".to_owned(),
             executable: ProviderArtifact {
                 canonical_path: executable.canonicalize().unwrap(),
                 sha256: super::hash_file(&executable).unwrap(),
             },
             launcher_script: None,
+            launcher_package_manifest_sha256: None,
             resolved_version: "1".to_owned(),
         };
+        binding.registration_id = registration_id(
+            &binding.project_key,
+            &binding.profile_id,
+            &binding.producer,
+            &binding.executable,
+            binding.launcher_script.as_ref(),
+            binding.launcher_package_manifest_sha256.as_deref(),
+        );
+        let expected_registration_id = binding.registration_id.clone();
         let registry = ProviderRegistry {
             schema_version: PROVIDER_SCHEMA_VERSION,
             bindings: vec![binding],
@@ -1592,12 +1819,12 @@ mod tests {
             Some(&install),
             &project,
             "project",
-            &[profile("scip-python")],
+            &[profile("rust-analyzer")],
         );
         assert!(ready["main"].ready);
         assert_eq!(
             ready["main"].registration_id.as_deref(),
-            Some("registration-one")
+            Some(expected_registration_id.as_str())
         );
 
         fs::write(&executable, b"drifted").unwrap();
@@ -1605,10 +1832,36 @@ mod tests {
             Some(&install),
             &project,
             "project",
-            &[profile("scip-python")],
+            &[profile("rust-analyzer")],
         );
         assert!(!drifted["main"].ready);
         assert!(drifted["main"].issue.as_deref().unwrap().contains("漂移"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scip_python_package_manifest_covers_transitive_bundle_files() {
+        let nonce = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "project-brain-scip-python-package-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            br#"{"name":"@sourcegraph/scip-python","bin":{"scip-python":"index.js"}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("index.js"), b"require('./dist/scip-python')").unwrap();
+        fs::write(root.join("dist/scip-python.js"), b"one").unwrap();
+        let script = pinned_artifact(&root.join("index.js"), "script").unwrap();
+        let before = scip_python_package_manifest(&script).unwrap();
+        fs::write(root.join("dist/scip-python.js"), b"two").unwrap();
+        let after = scip_python_package_manifest(&script).unwrap();
+        assert_ne!(before, after);
         fs::remove_dir_all(root).unwrap();
     }
 

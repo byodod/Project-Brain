@@ -316,10 +316,12 @@ V8 的 ambiguity 属于 `semantic_lineage_groups`；candidate 的旧 `ambiguity_
    snapshot 或跨 provider 建 equivalence；
 10. 已导入但不是当前最新的历史 snapshot 不能重新应用为当前符号图。
 
-SQLite schema v10 保存 semantic snapshots、source attestations、source manifests、symbol observations、
+SQLite schema v11 保存 semantic snapshots、source attestations、source manifests、symbol observations、
 lineage groups/members/generation runs、candidate/evidence/decision 与 legacy compaction audit。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升
 为硬证据，也不会从现存 symbol 反推缺失 Document。真实重跑相同 snapshot 时可以首次补录 manifest；
-可信重跑只追加 attestation，不改写 symbol observations 或人工 lineage 状态。
+可信重跑只追加 attestation，不改写 symbol observations 或人工 lineage 状态。attestation 的唯一身份
+包含 trust、registration、executable 与 artifact；相同 snapshot/worktree/HEAD 由新绑定重跑时仍会
+追加新证明，读取以最新 sequence 为准，完全相同的证明才幂等去重。
 
 V7 legacy compaction 默认是 dry-run。只有一个 group 的所有行仍为 `proposed`、每条恰有一份
 `project-brain-lineage` version 1 evidence、没有 decision/related decision 引用，且按 kind 与 definition

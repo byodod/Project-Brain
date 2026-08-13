@@ -75,8 +75,11 @@ supported/partial/unsupported/unknown 四态，不从某个索引“恰好出现
 
 自动执行 producer 时，仓库 profile 仍只保存声明式 producer 契约；`providers.json` 按
 `project_key + profile_id` 保存机器绝对路径、registration revision、version probe 与 executable/
-entrypoint SHA-256。Runner 仅对三种已知 adapter 构造固定 argv，拒绝仓库内 executable、相对路径、
-Windows shell shim 和任意 repo args。外部进程运行期间不持有 SQLite 写事务；只有输出、provenance、
+entrypoint SHA-256。scip-python 额外校验 package.json 的官方包身份、bin 入口，并固定整个包目录的
+有界文件清单哈希，避免只固定薄入口而遗漏 `dist/` 传递 bundle。Runner 仅对三种已知 adapter 构造
+固定 argv，拒绝仓库内 executable、相对路径、Windows shell shim 和任意 repo args。Windows 内部
+可继续使用 verbatim canonical path，但传给不接受 `\\?\` 的 producer argv/JS 入口会转换为等价本机路径。
+外部进程运行期间不持有 SQLite 写事务；只有输出、provenance、
 profile/root 与工作区前后指纹全部通过后，才进入 semantic snapshot 事务。
 
 `brain-core` 不依赖文件系统、Git、SQLite 或任何 Agent SDK。相同输入、配置和 schema_version 必须产生相同决策。
@@ -100,6 +103,7 @@ profile/root 与工作区前后指纹全部通过后，才进入 semantic snapsh
 <ProjectBrainData>/state/providers.json
         │
         ├── executable/entrypoint path + SHA-256  机器本地信任，不提交
+        ├── scip-python package manifest SHA-256  固定传递 bundle
         ├── registration revision + probe version
         └── provider-audit.jsonl  有界本地执行/失败 provenance
 ```
@@ -108,7 +112,7 @@ SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照�
 进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
 符号 ID、快照 revision、节点/边主键、查询和墓碑更新都包含 `project_key`。数据库 schema v4
 首次建立这组项目隔离约束；对应迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与
-adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v10，并在这些约束上
+adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v11，并在这些约束上
 增加独立的语义血缘账本、append-only 来源证明和不可伪造的源码 Document manifest。
 数据库迁移拒绝缺失或非整数的已有 `schema_version`，不会把损坏元数据静默当作 v1。
 Adapter 审计依赖 SQLite 唯一约束和 busy timeout，使并发连接对同一项目事件收敛到首次 outcome；
@@ -129,10 +133,13 @@ confirmed / rejected / superseded / invalidated
            └── never rewrites SymbolNode / tombstone / snapshot
 ```
 
-SQLite schema v10 保存 semantic snapshots、append-only source attestations、source manifests、
+SQLite schema v11 保存 semantic snapshots、append-only source attestations、source manifests、
 symbol observations、group/member/generation run、candidate/evidence/decision，以及显式旧账压缩的
 run/group 审计和 append-only Provider qualification events。压缩默认只读；apply 必须携带人工确认与幂等 request ID，且逻辑删除与审计同事务。
 物理 `VACUUM` 不属于压缩事务，也不能替代候选资格证明。
+同一 semantic snapshot 可由不同机器绑定重复产生。V11 的 attestation 唯一身份包含 trust、
+registration、executable 与 artifact 证明；图内容未变化时仍可追加新的来源证明，并由最新 sequence
+参与 hard-gate 新鲜度判断，不能让旧绑定证明遮蔽当前已资格化绑定。
 Candidate endpoint 唯一键负责算法重跑幂等，算法版本只产生新的 evidence observation；人工状态
 永远不会被 generator 恢复或覆盖。Partial unique indexes 约束同 snapshot pair 中 predecessor 与
 successor 一对一，竞争确认不会自动选择赢家。`request_id + request_hash` 提供 at-least-once 命令

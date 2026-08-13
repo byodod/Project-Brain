@@ -116,18 +116,20 @@ project-brain provider bind \
   --trust-local-executable
 ```
 
-Windows 的 npm `.cmd/.bat` shim 不会被执行。scip-python 可把原生 `node.exe` 与实际 JS 入口分别
-固定哈希：
+Windows 的 npm `.cmd/.bat` shim 不会被执行。使用 Node launcher 的 scip-python 必须把原生
+`node.exe` 与官方包 `package.json` 声明的实际 JS 入口分别绑定：
 
 ```text
 project-brain provider bind \
   --profile python-main \
   --executable C:\Program Files\nodejs\node.exe \
-  --script C:\absolute\path\to\scip-python-entry.js \
+  --script C:\absolute\path\to\node_modules\@sourcegraph\scip-python\index.js \
   --trust-local-executable
 ```
 
-绑定必须是仓库外的绝对普通文件；内容变化后会被视为 drift，必须用 `--replace` 重新显式信任。
+绑定必须是仓库外的绝对普通文件。对 scip-python，Project Brain 除了固定 node 与入口文件，还会
+递归固定官方 npm 包根目录的完整文件清单；`dist/` 中任一传递 bundle 漂移都会使绑定失效。
+内容变化后必须用 `--replace` 重新显式信任。
 可用 `project-brain provider list` 查看当前项目的机器绑定。
 
 它会创建：
@@ -345,7 +347,7 @@ project-brain provider index --profile rust-main --timeout-seconds 300
 ```
 
 Runner 从固定 adapter 构造 argv，不接收仓库命令或任意参数，不使用 shell；它固定 executable/
-Node entrypoint 哈希，关闭 stdin，使用环境白名单和净化后的 `PATH`，把输出写入机器私有临时目录，
+Node entrypoint 哈希，并对 scip-python 固定完整 npm 包清单哈希。Runner 关闭 stdin，使用环境白名单和净化后的 `PATH`，把输出写入机器私有临时目录，
 限制并完整哈希 stdout/stderr，并按项目、profile、worktree 使用 OS 文件锁。索引前后及 SCIP 解析后
 都会核对完整工作区内容指纹；源码变化、超时、非零退出、二进制漂移、链接输出、过大/非法 SCIP
 均不会提交 semantic snapshot。过程 provenance 与失败只写入机器级有界 JSONL audit。
@@ -382,7 +384,7 @@ Hook 硬阻断权。只有 `provider index` 通过当前机器已登记且哈希
 才追加 `trusted_provider` attestation；证明同时固定 registration ID、executable SHA-256、SCIP
 artifact SHA-256、Git HEAD 与完整 worktree 指纹。
 
-`doctor` 会读取 SQLite v10 中与快照同事务保存的 source manifest，并按当前 worktree/HEAD 重新计算
+`doctor` 会读取 SQLite v11 中与快照同事务保存的 source manifest，并按当前 worktree/HEAD 重新计算
 覆盖率。已有索引若为 `partial`、`stale`、损坏或来自未保存 manifest 的旧库，doctor 会降级并返回
 非零；尚未运行过索引只报告 `not_indexed` warning，不阻断首次 bootstrap。旧库迁移不会从符号表
 猜测文档清单；必须真实重跑一次 `provider index` 或 `index-scip` 才能补录 manifest。
@@ -543,8 +545,11 @@ crates/
   SCIP semantic Provider 接入。
 - SCIP 当前可靠导入 definition、reference、contains，以及 producer 明确提供的 implementation/
   type-definition 关系；不会从 occurrence 猜测 call/import/implementation。
-- Project Brain 不下载、安装或自动发现外部 producer；用户必须显式绑定机器路径。Rust Runner 已用
-  真实 rust-analyzer 验证；scip-dotnet/scip-python 的导入契约仍以合成 fixture 为自动测试基线。
+- Project Brain 不下载、安装、修补或自动发现外部 producer；用户必须显式绑定机器路径。Rust Runner
+  已记录真实 rust-analyzer 非确定性反证；scip-dotnet 0.2.14 已在 Windows 真实验证为
+  `stable_complete`。scip-python 0.6.6 的官方 npm 包在原生 Windows 存在启动缺陷；本仓库用固定整包
+  清单的审计补丁验证了后续链路，但这不是对官方原包 Windows 可用性的声明。Linux/macOS 仍需在
+  对应平台 CI 中补充真实 producer 资格证据。
 - Runner 保证自身不执行仓库声明的命令，但语言 indexer、Cargo/build script/proc macro、.NET 和
   Python 环境仍是独立信任面；当前版本不是通用 OS 沙箱。Windows 超时使用 `taskkill /T`，Unix
   使用独立 process group；尚未提供 Windows Job Object 级的强隔离证明。

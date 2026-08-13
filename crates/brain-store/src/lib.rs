@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const DATABASE_SCHEMA_VERSION: i64 = 10;
+const DATABASE_SCHEMA_VERSION: i64 = 11;
 const LEGACY_LINEAGE_ALGORITHM_ID: &str = "project-brain-lineage";
 const LEGACY_LINEAGE_ALGORITHM_VERSION: &str = "1";
 const LEGACY_COMPACTION_ALGORITHM_ID: &str = "project-brain-lineage-legacy-compaction";
@@ -487,6 +487,7 @@ impl BrainStore {
         self.ensure_lineage_v8_schema()?;
         self.ensure_lineage_v9_schema()?;
         self.ensure_provider_qualification_v10_schema()?;
+        self.ensure_semantic_attestation_v11_schema(metadata_table_existed, schema_version)?;
         self.ensure_semantic_snapshot_source_columns()?;
         self.initialize_adapter_audit_schema()?;
         self.connection.execute(
@@ -582,11 +583,16 @@ impl BrainStore {
                  provider_registration_id TEXT,
                  executable_sha256 TEXT,
                  artifact_sha256 TEXT,
-                 created_at_unix_seconds INTEGER NOT NULL,
-                 UNIQUE(project_key, provider_profile_id, provider_contract_id,
-                        snapshot_fingerprint, worktree_fingerprint, head_revision,
-                        worktree_clean)
+                 created_at_unix_seconds INTEGER NOT NULL
              );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_semantic_attestation_identity
+                 ON semantic_snapshot_attestations(
+                    project_key, provider_profile_id, provider_contract_id,
+                    snapshot_fingerprint, worktree_fingerprint, head_revision,
+                    worktree_clean, source_trust,
+                    IFNULL(provider_registration_id, ''),
+                    IFNULL(executable_sha256, ''), IFNULL(artifact_sha256, '')
+                 );
              CREATE INDEX IF NOT EXISTS idx_semantic_attestation_latest
                  ON semantic_snapshot_attestations(
                     project_key, provider_profile_id, provider_contract_id,
@@ -854,6 +860,64 @@ impl BrainStore {
                     project_key, provider_profile_id, sequence DESC
                  );",
         )?;
+        Ok(())
+    }
+
+    fn ensure_semantic_attestation_v11_schema(
+        &self,
+        metadata_table_existed: bool,
+        schema_version: i64,
+    ) -> Result<(), StoreError> {
+        if !metadata_table_existed || schema_version >= 11 {
+            return Ok(());
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE semantic_snapshot_attestations_v11 (
+                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                 project_key TEXT NOT NULL,
+                 provider_profile_id TEXT NOT NULL,
+                 provider_contract_id TEXT NOT NULL,
+                 snapshot_fingerprint TEXT NOT NULL,
+                 worktree_fingerprint TEXT NOT NULL,
+                 head_revision TEXT NOT NULL,
+                 worktree_clean INTEGER NOT NULL CHECK(worktree_clean IN (0, 1)),
+                 source_trust TEXT NOT NULL
+                     CHECK(source_trust IN ('offline_import', 'trusted_provider')),
+                 provider_registration_id TEXT,
+                 executable_sha256 TEXT,
+                 artifact_sha256 TEXT,
+                 created_at_unix_seconds INTEGER NOT NULL
+             );
+             INSERT INTO semantic_snapshot_attestations_v11(
+                 sequence, project_key, provider_profile_id, provider_contract_id,
+                 snapshot_fingerprint, worktree_fingerprint, head_revision,
+                 worktree_clean, source_trust, provider_registration_id,
+                 executable_sha256, artifact_sha256, created_at_unix_seconds
+             )
+             SELECT sequence, project_key, provider_profile_id, provider_contract_id,
+                    snapshot_fingerprint, worktree_fingerprint, head_revision,
+                    worktree_clean, source_trust, provider_registration_id,
+                    executable_sha256, artifact_sha256, created_at_unix_seconds
+             FROM semantic_snapshot_attestations ORDER BY sequence;
+             DROP TABLE semantic_snapshot_attestations;
+             ALTER TABLE semantic_snapshot_attestations_v11
+                 RENAME TO semantic_snapshot_attestations;
+             CREATE UNIQUE INDEX idx_semantic_attestation_identity
+                 ON semantic_snapshot_attestations(
+                    project_key, provider_profile_id, provider_contract_id,
+                    snapshot_fingerprint, worktree_fingerprint, head_revision,
+                    worktree_clean, source_trust,
+                    IFNULL(provider_registration_id, ''),
+                    IFNULL(executable_sha256, ''), IFNULL(artifact_sha256, '')
+                 );
+             CREATE INDEX idx_semantic_attestation_latest
+                 ON semantic_snapshot_attestations(
+                    project_key, provider_profile_id, provider_contract_id,
+                    snapshot_fingerprint, sequence DESC
+                 );",
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -4965,7 +5029,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 10);
+        assert_eq!(store.database_schema_version().unwrap(), 11);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, false, 10)
@@ -5050,7 +5114,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 10);
+        assert_eq!(store.database_schema_version().unwrap(), 11);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, true, 10)
@@ -5090,7 +5154,7 @@ mod tests {
         drop(connection);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 10);
+        assert_eq!(migrated.database_schema_version().unwrap(), 11);
         let legacy_source = migrated
             .connection
             .query_row(
@@ -5342,6 +5406,176 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn identical_snapshot_accepts_new_trusted_registration_attestation() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let snapshot = semantic_snapshot(
+            "semantic-registration-refresh",
+            vec![semantic_symbol("stable", "src/lib.rs", "stable-key")],
+        );
+        let first = SemanticSnapshotSource::trusted_provider(
+            "d".repeat(64),
+            "same-head".to_owned(),
+            true,
+            "registration-one".to_owned(),
+            "e".repeat(64),
+            "f".repeat(64),
+        );
+        store
+            .apply_semantic_snapshot(
+                &snapshot,
+                "test-main",
+                &semantic_observations(&snapshot),
+                &[],
+                &first,
+            )
+            .unwrap();
+        let refreshed = SemanticSnapshotSource::trusted_provider(
+            "d".repeat(64),
+            "same-head".to_owned(),
+            true,
+            "registration-two".to_owned(),
+            "e".repeat(64),
+            "f".repeat(64),
+        );
+        let replay = store
+            .apply_semantic_snapshot(
+                &snapshot,
+                "test-main",
+                &semantic_observations(&snapshot),
+                &[],
+                &refreshed,
+            )
+            .unwrap();
+        assert!(!replay.snapshot_inserted);
+        let latest = store
+            .latest_semantic_source_manifest(PROJECT_KEY, "test-main", &semantic_provider().id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.source, refreshed);
+        store
+            .apply_semantic_snapshot(
+                &snapshot,
+                "test-main",
+                &semantic_observations(&snapshot),
+                &[],
+                &refreshed,
+            )
+            .unwrap();
+        let count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_snapshot_attestations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn v10_attestation_identity_migrates_without_losing_history() {
+        let (root, database) = temporary_database("v10-attestation-migration");
+        let snapshot = semantic_snapshot(
+            "semantic-v10-attestation",
+            vec![semantic_symbol("stable", "src/lib.rs", "stable-key")],
+        );
+        let first = SemanticSnapshotSource::trusted_provider(
+            "d".repeat(64),
+            "same-head".to_owned(),
+            true,
+            "registration-one".to_owned(),
+            "e".repeat(64),
+            "f".repeat(64),
+        );
+        let store = BrainStore::open(&database).unwrap();
+        store
+            .apply_semantic_snapshot(
+                &snapshot,
+                "test-main",
+                &semantic_observations(&snapshot),
+                &[],
+                &first,
+            )
+            .unwrap();
+        drop(store);
+
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute_batch(
+                "DROP INDEX idx_semantic_attestation_identity;
+                 DROP INDEX idx_semantic_attestation_latest;
+                 ALTER TABLE semantic_snapshot_attestations
+                     RENAME TO semantic_snapshot_attestations_v11_source;
+                 CREATE TABLE semantic_snapshot_attestations (
+                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                     project_key TEXT NOT NULL,
+                     provider_profile_id TEXT NOT NULL,
+                     provider_contract_id TEXT NOT NULL,
+                     snapshot_fingerprint TEXT NOT NULL,
+                     worktree_fingerprint TEXT NOT NULL,
+                     head_revision TEXT NOT NULL,
+                     worktree_clean INTEGER NOT NULL CHECK(worktree_clean IN (0, 1)),
+                     source_trust TEXT NOT NULL
+                         CHECK(source_trust IN ('offline_import', 'trusted_provider')),
+                     provider_registration_id TEXT,
+                     executable_sha256 TEXT,
+                     artifact_sha256 TEXT,
+                     created_at_unix_seconds INTEGER NOT NULL,
+                     UNIQUE(project_key, provider_profile_id, provider_contract_id,
+                            snapshot_fingerprint, worktree_fingerprint, head_revision,
+                            worktree_clean)
+                 );
+                 INSERT INTO semantic_snapshot_attestations
+                 SELECT * FROM semantic_snapshot_attestations_v11_source;
+                 DROP TABLE semantic_snapshot_attestations_v11_source;
+                 CREATE INDEX idx_semantic_attestation_latest
+                     ON semantic_snapshot_attestations(
+                        project_key, provider_profile_id, provider_contract_id,
+                        snapshot_fingerprint, sequence DESC
+                     );
+                 UPDATE metadata SET value = '10' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let migrated = BrainStore::open(&database).unwrap();
+        assert_eq!(migrated.database_schema_version().unwrap(), 11);
+        let refreshed = SemanticSnapshotSource::trusted_provider(
+            "d".repeat(64),
+            "same-head".to_owned(),
+            true,
+            "registration-two".to_owned(),
+            "e".repeat(64),
+            "f".repeat(64),
+        );
+        migrated
+            .apply_semantic_snapshot(
+                &snapshot,
+                "test-main",
+                &semantic_observations(&snapshot),
+                &[],
+                &refreshed,
+            )
+            .unwrap();
+        let latest = migrated
+            .latest_semantic_source_manifest(PROJECT_KEY, "test-main", &semantic_provider().id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.source, refreshed);
+        let count: i64 = migrated
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_snapshot_attestations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        drop(migrated);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5911,7 +6145,7 @@ mod tests {
         drop(store);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 10);
+        assert_eq!(migrated.database_schema_version().unwrap(), 11);
         assert_eq!(
             migrated
                 .list_symbols(PROJECT_KEY, None, false, 10)

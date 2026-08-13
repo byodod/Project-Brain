@@ -867,10 +867,7 @@ fn occurrence_range(occurrence: &Occurrence) -> Result<SourceRange, ScipError> {
             }
         },
     };
-    if raw.iter().any(|value| *value < 0)
-        || (raw[0], raw[1]) > (raw[2], raw[3])
-        || (raw[0] == raw[2] && raw[1] == raw[3])
-    {
+    if raw.iter().any(|value| *value < 0) || (raw[0], raw[1]) > (raw[2], raw[3]) {
         return Err(ScipError::InvalidRange(format!(
             "symbol={:?} range={raw:?}",
             occurrence.symbol
@@ -888,7 +885,7 @@ fn extract_range(source: &str, range: SourceRange) -> Result<String, ScipError> 
     let starts = line_starts(source);
     let start = position_offset(source, &starts, range.start_line, range.start_character)?;
     let end = position_offset(source, &starts, range.end_line, range.end_character)?;
-    if start >= end || !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+    if start > end || !source.is_char_boundary(start) || !source.is_char_boundary(end) {
         return Err(ScipError::InvalidRange(format!(
             "range 不是有效 UTF-8 边界：{range:?}"
         )));
@@ -1061,7 +1058,7 @@ mod tests {
 
     use super::{
         CapabilitySupport, ScipError, ScipImport, ScipImportProfile, ScipLanguageMapping,
-        import_bytes, semantic_definition_fingerprint,
+        extract_range, import_bytes, occurrence_range, semantic_definition_fingerprint,
     };
 
     const PROJECT_KEY: &str = "project_fixture";
@@ -1148,6 +1145,17 @@ mod tests {
             ..SingleLineRange::default()
         });
         occurrence
+    }
+
+    #[test]
+    fn empty_occurrence_ranges_are_valid_scip_ranges() {
+        let range = occurrence("module", 0, 0, 0, true);
+        let parsed = occurrence_range(&range).unwrap();
+        assert_eq!(parsed.start_line, 0);
+        assert_eq!(parsed.start_character, 0);
+        assert_eq!(parsed.end_line, 0);
+        assert_eq!(parsed.end_character, 0);
+        assert_eq!(extract_range("", parsed).unwrap(), "");
     }
 
     #[test]
