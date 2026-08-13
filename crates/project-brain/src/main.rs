@@ -1,6 +1,8 @@
+mod analyze;
 mod app;
 mod codex;
 mod error;
+mod git;
 mod reconcile;
 
 use std::{path::PathBuf, process::ExitCode};
@@ -40,6 +42,12 @@ enum Command {
         envelope: PathBuf,
     },
 
+    /// 提取当前 Git 变更触及的源代码符号
+    Analyze {
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+    },
+
     /// 输出最近的本地 Hook 审计记录
     Audit {
         #[arg(long, default_value_t = 20)]
@@ -58,6 +66,7 @@ fn main() -> ExitCode {
         Command::Reconcile { base, envelope } => {
             App::open(cli.project_root).and_then(|app| app.reconcile(&base, &envelope))
         }
+        Command::Analyze { base } => App::open(cli.project_root).and_then(|app| app.analyze(&base)),
         Command::Audit { limit } => App::open(cli.project_root).and_then(|app| app.audit(limit)),
     };
 

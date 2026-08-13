@@ -2,13 +2,15 @@
 
 Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。它不依赖 Agent 主动“想起”记忆，而是在生命周期 Hook 中，根据仓库级规则和实际变更给出确定性决策。
 
-当前版本是第一个可运行的纵向切片，包含：
+当前版本包含：
 
 - `ALLOW / ALLOW_WITH_CONTEXT / BLOCK / ESCALATE` 四态规则引擎；
 - 带 authority、strength、scope 和 lifecycle 的版本化规则模型；
 - Codex `SessionStart`、`PreToolUse`、`PostToolUse`、`Stop` 协议适配；
 - SQLite 本地审计记录；
 - Git Change Envelope 范围核对；
+- Codex `Stop` 自动 Change Envelope 对账与防循环保护；
+- 基于 Tree-sitter 的 Rust changed-symbol 与纯删除符号提取；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
 ## 核心原则
@@ -114,10 +116,41 @@ project-brain reconcile --base HEAD --envelope .project-brain/envelope.json
 - 超出 `allowed_paths`：`escalate`；
 - 完全处于声明范围：`allow`。
 
+Envelope 文件必须位于项目根目录内；绝对路径、`..` 或符号链接解析后若越出仓库，
+Runtime 会拒绝读取。
+
+仓库配置可让 Codex `Stop` 自动执行同一检查：
+
+```json
+{
+  "stop_reconcile": {
+    "enabled": true,
+    "base": "HEAD",
+    "envelope": ".project-brain/envelope.json"
+  }
+}
+```
+
+若 Codex 正在响应 Stop hook 自己发起的继续请求，适配器读取
+`stop_hook_active` 并直接放行，避免无限循环。
+
+## 变更符号分析
+
+提取工作区相对基线实际触及的 Rust 符号：
+
+```text
+project-brain analyze --base HEAD
+```
+
+输出按文件区分 `changed_symbols` 与 `removed_symbols`。未跟踪 Rust 文件按全文分析；
+纯删除 hunk 从 Git 基线读取旧源码，因此删除函数不会丢失。当前同时报告叶级符号和词法所有者，
+例如 `impl Worker` 与 `impl Worker::run`。
+
 ## Workspace
 
 ```text
 crates/
+├── brain-analyzer/   # Tree-sitter changed-symbol 提取
 ├── brain-core/       # 协议、规则验证、确定性决策
 ├── brain-store/      # SQLite schema 与审计
 └── project-brain/    # CLI、Git、Codex Hook 适配
@@ -132,7 +165,6 @@ crates/
 
 - 当前只提供 Codex 适配器；Claude Code 和 Prime Agent 尚未实现。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
-- 当前代码分析只覆盖 Git 文件范围和 Hook 载荷，尚未接入 Tree-sitter、LSP/SCIP 或符号图。
-- `reconcile` 当前是显式命令，尚未自动挂入 `Stop`。
+- changed-symbol 当前只支持 Rust；LSP/SCIP、跨文件引用和符号图尚未接入。
+- `Stop` 自动对账只核对文件范围；符号级 Change Envelope 约束尚未加入。
 - Semantic Sentinel / Architecture Judge 尚未加入；这是有意的 V0 边界。
-

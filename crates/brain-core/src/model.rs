@@ -13,6 +13,8 @@ pub struct BrainConfig {
     pub project_name: String,
     #[serde(default)]
     pub rules: Vec<Rule>,
+    #[serde(default)]
+    pub stop_reconcile: StopReconcileConfig,
 }
 
 impl BrainConfig {
@@ -32,8 +34,46 @@ impl BrainConfig {
         for rule in &self.rules {
             rule.validate()?;
         }
+        if self.stop_reconcile.enabled {
+            if self.stop_reconcile.base.trim().is_empty() {
+                return Err(CoreError::InvalidStopReconcile("base 不能为空".to_owned()));
+            }
+            if self.stop_reconcile.envelope.trim().is_empty() {
+                return Err(CoreError::InvalidStopReconcile(
+                    "envelope 不能为空".to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StopReconcileConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_reconcile_base")]
+    pub base: String,
+    #[serde(default = "default_envelope_path")]
+    pub envelope: String,
+}
+
+impl Default for StopReconcileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base: default_reconcile_base(),
+            envelope: default_envelope_path(),
+        }
+    }
+}
+
+fn default_reconcile_base() -> String {
+    "HEAD".to_owned()
+}
+
+fn default_envelope_path() -> String {
+    ".project-brain/envelope.json".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -216,4 +256,28 @@ pub struct Decision {
     pub context: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BrainConfig, CURRENT_SCHEMA_VERSION, StopReconcileConfig};
+    use crate::CoreError;
+
+    #[test]
+    fn enabled_stop_reconcile_requires_a_base_and_envelope() {
+        let config = BrainConfig {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            project_name: "test".to_owned(),
+            rules: Vec::new(),
+            stop_reconcile: StopReconcileConfig {
+                enabled: true,
+                base: String::new(),
+                envelope: ".project-brain/envelope.json".to_owned(),
+            },
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(CoreError::InvalidStopReconcile(_))
+        ));
+    }
 }

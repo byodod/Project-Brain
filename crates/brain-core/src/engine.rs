@@ -138,7 +138,7 @@ mod tests {
     use super::RuleEngine;
     use crate::{
         ActionDescriptor, ActionKind, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, CoreError,
-        DecisionKind, MemoryStatus, Rule, RuleEffect, RuleStrength,
+        DecisionKind, MemoryStatus, Rule, RuleEffect, RuleStrength, StopReconcileConfig,
     };
 
     fn action(kind: ActionKind, path: &str) -> ActionDescriptor {
@@ -177,6 +177,7 @@ mod tests {
         let config = BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_name: "test".to_owned(),
+            stop_reconcile: StopReconcileConfig::default(),
             rules: vec![
                 rule("context", RuleEffect::InjectContext, RuleStrength::Soft),
                 rule("block", RuleEffect::Block, RuleStrength::Hard),
@@ -196,6 +197,7 @@ mod tests {
         let config = BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_name: "test".to_owned(),
+            stop_reconcile: StopReconcileConfig::default(),
             rules: vec![rule("block", RuleEffect::Block, RuleStrength::Hard)],
         };
         let decision = RuleEngine::new(&config)
@@ -213,6 +215,7 @@ mod tests {
         let config = BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_name: "test".to_owned(),
+            stop_reconcile: StopReconcileConfig::default(),
             rules: vec![invalid],
         };
 
@@ -229,6 +232,7 @@ mod tests {
         let config = BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_name: "test".to_owned(),
+            stop_reconcile: StopReconcileConfig::default(),
             rules: vec![inactive],
         };
         let decision = RuleEngine::new(&config)
@@ -246,6 +250,7 @@ mod tests {
         let config = BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_name: "test".to_owned(),
+            stop_reconcile: StopReconcileConfig::default(),
             rules: vec![bash_only],
         };
         let decision = RuleEngine::new(&config)

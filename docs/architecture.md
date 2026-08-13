@@ -22,6 +22,21 @@ Deterministic Rule Engine
       └── SQLite audit event
 ```
 
+Git 变更进入另一条同样确定性的分析路径：
+
+```text
+Git zero-context diff
+      │
+      ├── 当前/未跟踪源码
+      └── 基线旧源码（纯删除）
+              │
+              ▼
+       Tree-sitter parser
+              │
+              ├── changed_symbols
+              └── removed_symbols
+```
+
 `brain-core` 不依赖文件系统、Git、SQLite 或任何 Agent SDK。相同输入、配置和 schema_version 必须产生相同决策。
 
 ## 权威来源
@@ -51,11 +66,18 @@ authority ∈ { explicit_user, repository_rule, accepted_decision }
 
 配置加载阶段即拒绝其他组合，避免把概率判断意外提升为强制规则。
 
+## Stop 闭环
+
+Codex `Stop` 读取 `stop_reconcile` 配置，对当前 Git 文件集合执行 Change Envelope 对账。
+`block` 或 `escalate` 会转换为 Codex 的 Stop block 响应，使 Agent 继续处理；当
+`stop_hook_active=true` 时直接放行，防止 hook 自触发循环。
+Envelope 在读取前会规范化并限制在项目根目录内；所有 Git diff 调用显式禁用
+external diff，避免分析动作执行仓库配置中的外部程序。
+
 ## 下一阶段
 
 1. 增加事件幂等键和 schema migration 测试。
-2. 把 `Stop` 与 Change Envelope reconcile 连接起来。
+2. 把 changed-symbol 纳入符号级 Change Envelope 与规则 scope。
 3. 增加 Claude Code 和 Prime Agent 适配器；核心协议保持不变。
-4. 增加 Tree-sitter changed-symbol 提取。
-5. 通过语言原生分析器补足跨文件语义解析。
-6. 最后才加入只读、可拔插的 Semantic Sentinel。
+4. 扩展更多语言 grammar，并通过语言原生分析器补足跨文件语义解析。
+5. 最后才加入只读、可拔插的 Semantic Sentinel。

@@ -77,3 +77,28 @@ Adapter 只负责：
 4. 记录审计事件。
 
 Adapter 不得自行重新解释某条项目规则。
+
+## AnalysisReport
+
+`project-brain analyze` 输出版本化报告。每个受支持文件包含：
+
+```json
+{
+  "path": "src/worker.rs",
+  "language": "rust",
+  "has_syntax_errors": false,
+  "changed_ranges": [{ "start_line": 12, "end_line": 18 }],
+  "changed_symbols": [
+    {
+      "name": "impl Worker::run",
+      "kind": "function_item",
+      "start_line": 12,
+      "end_line": 18
+    }
+  ],
+  "removed_symbols": []
+}
+```
+
+行号为一基、闭区间。`has_syntax_errors` 不会阻止输出 Tree-sitter 可恢复的局部结果，
+但调用方不得把存在语法错误的结果提升为强阻断事实。

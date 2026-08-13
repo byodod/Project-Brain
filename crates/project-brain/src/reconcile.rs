@@ -1,13 +1,12 @@
 use std::{
-    collections::BTreeSet,
-    path::Path,
-    process::{Command, Output},
+    fs,
+    path::{Path, PathBuf},
 };
 
-use brain_core::{CURRENT_SCHEMA_VERSION, normalize_project_path, path_has_prefix};
+use brain_core::{CURRENT_SCHEMA_VERSION, path_has_prefix};
 use serde::{Deserialize, Serialize};
 
-use crate::error::AppError;
+use crate::{error::AppError, git};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChangeEnvelope {
@@ -28,6 +27,30 @@ impl ChangeEnvelope {
             forbidden_paths: vec![".git".to_owned()],
         }
     }
+}
+
+pub fn evaluate_from_path(
+    root: &Path,
+    base: &str,
+    envelope: &Path,
+) -> Result<ReconcileReport, AppError> {
+    let envelope_path = resolve_envelope_path(root, envelope)?;
+    let envelope = serde_json::from_slice(&fs::read(envelope_path)?)?;
+    evaluate(root, base, &envelope)
+}
+
+fn resolve_envelope_path(root: &Path, envelope: &Path) -> Result<PathBuf, AppError> {
+    let root = root.canonicalize()?;
+    let candidate = if envelope.is_absolute() {
+        envelope.to_owned()
+    } else {
+        root.join(envelope)
+    };
+    let candidate = candidate.canonicalize()?;
+    if !candidate.starts_with(&root) {
+        return Err(AppError::EnvelopeOutsideRoot(candidate));
+    }
+    Ok(candidate)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,7 +87,7 @@ pub fn evaluate(
         .into());
     }
 
-    let changed_files = git_changed_files(root, base)?;
+    let changed_files = git::changed_files(root, base)?;
     let forbidden_files = changed_files
         .iter()
         .filter(|path| {
@@ -118,51 +141,37 @@ pub fn evaluate(
     })
 }
 
-fn git_changed_files(root: &Path, base: &str) -> Result<Vec<String>, AppError> {
-    let diff = Command::new("git")
-        .current_dir(root)
-        .args(["diff", "--name-only", "-z", base, "--"])
-        .output()?;
-    ensure_git_success(&diff)?;
-
-    let untracked = Command::new("git")
-        .current_dir(root)
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .output()?;
-    ensure_git_success(&untracked)?;
-
-    let mut files = parse_null_paths(&diff.stdout);
-    files.extend(parse_null_paths(&untracked.stdout));
-    Ok(files.into_iter().collect())
-}
-
-fn ensure_git_success(output: &Output) -> Result<(), AppError> {
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(AppError::Git(
-        String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-    ))
-}
-
-fn parse_null_paths(bytes: &[u8]) -> BTreeSet<String> {
-    bytes
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| normalize_project_path(&String::from_utf8_lossy(path)))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::parse_null_paths;
+    use std::{
+        fs,
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::resolve_envelope_path;
+    use crate::error::AppError;
 
     #[test]
-    fn parses_and_sorts_null_delimited_git_paths() {
-        let paths = parse_null_paths(b"src/z.rs\0src/a.rs\0");
-        assert_eq!(
-            paths.into_iter().collect::<Vec<_>>(),
-            vec!["src/a.rs".to_owned(), "src/z.rs".to_owned()]
-        );
+    fn rejects_an_envelope_outside_the_project_root() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sandbox = std::env::temp_dir().join(format!(
+            "project-brain-envelope-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = sandbox.join("repo");
+        let outside = sandbox.join("outside.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, "{}").unwrap();
+
+        for envelope in [&outside, Path::new("../outside.json")] {
+            let result = resolve_envelope_path(&root, envelope);
+            assert!(matches!(result, Err(AppError::EnvelopeOutsideRoot(_))));
+        }
+
+        fs::remove_dir_all(sandbox).unwrap();
     }
 }

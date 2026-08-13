@@ -29,6 +29,8 @@ pub struct CodexHookInput {
     tool_use_id: String,
     #[serde(default)]
     tool_input: Value,
+    #[serde(default)]
+    stop_hook_active: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,7 +49,48 @@ pub fn handle(
         HookEvent::PreToolUse | HookEvent::PostToolUse => {
             evaluate_tool(root, config, store, event, input)
         }
-        HookEvent::Stop => Ok(CodexHookOutput(json!({ "continue": true }))),
+        HookEvent::Stop => Ok(stop(root, config, input)),
+    }
+}
+
+fn stop(root: &Path, config: &BrainConfig, input: &CodexHookInput) -> CodexHookOutput {
+    if input.stop_hook_active || !config.stop_reconcile.enabled {
+        return CodexHookOutput(json!({ "continue": true }));
+    }
+
+    let result = crate::reconcile::evaluate_from_path(
+        root,
+        &config.stop_reconcile.base,
+        Path::new(&config.stop_reconcile.envelope),
+    );
+    let report = match result {
+        Ok(report) => report,
+        Err(error) => {
+            return CodexHookOutput(json!({
+                "decision": "block",
+                "reason": format!("Project Brain Stop 对账失败：{error}")
+            }));
+        }
+    };
+
+    match report.decision {
+        crate::reconcile::ReconcileDecision::Allow => CodexHookOutput(json!({ "continue": true })),
+        crate::reconcile::ReconcileDecision::Block
+        | crate::reconcile::ReconcileDecision::Escalate => {
+            let details = if report.forbidden_files.is_empty() {
+                &report.unexpected_files
+            } else {
+                &report.forbidden_files
+            };
+            CodexHookOutput(json!({
+                "decision": "block",
+                "reason": format!(
+                    "Project Brain Stop 对账未通过：{}。涉及：{}",
+                    report.summary,
+                    details.join(", ")
+                )
+            }))
+        }
     }
 }
 
@@ -245,7 +288,7 @@ mod tests {
 
     use brain_core::{
         Authority, BrainConfig, CURRENT_SCHEMA_VERSION, MemoryStatus, Rule, RuleEffect,
-        RuleStrength,
+        RuleStrength, StopReconcileConfig,
     };
     use brain_store::BrainStore;
     use serde_json::json;
@@ -282,6 +325,7 @@ mod tests {
         let config = BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
             project_name: "test".to_owned(),
+            stop_reconcile: StopReconcileConfig::default(),
             rules: vec![Rule {
                 id: "PROTECT".to_owned(),
                 status: MemoryStatus::Active,
@@ -308,6 +352,7 @@ mod tests {
             tool_input: json!({
                 "command": "*** Begin Patch\n*** Delete File: .project-brain/config.json\n*** End Patch"
             }),
+            stop_hook_active: false,
         };
 
         let output = handle(
@@ -321,5 +366,39 @@ mod tests {
 
         assert_eq!(output.0["hookSpecificOutput"]["permissionDecision"], "deny");
         assert_eq!(store.audit_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn active_stop_hook_does_not_start_a_reconcile_loop() {
+        let config = BrainConfig {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            project_name: "test".to_owned(),
+            rules: Vec::new(),
+            stop_reconcile: brain_core::StopReconcileConfig {
+                enabled: true,
+                base: "HEAD".to_owned(),
+                envelope: ".project-brain/envelope.json".to_owned(),
+            },
+        };
+        let store = BrainStore::open_in_memory().unwrap();
+        let input = CodexHookInput {
+            session_id: String::new(),
+            cwd: String::new(),
+            hook_event_name: "Stop".to_owned(),
+            turn_id: String::new(),
+            tool_name: String::new(),
+            tool_use_id: String::new(),
+            tool_input: json!({}),
+            stop_hook_active: true,
+        };
+        let output = handle(
+            Path::new("Z:/not/a/repository"),
+            &config,
+            &store,
+            HookEvent::Stop,
+            &input,
+        )
+        .unwrap();
+        assert_eq!(output.0, json!({ "continue": true }));
     }
 }

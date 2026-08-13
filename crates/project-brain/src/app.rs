@@ -6,12 +6,13 @@ use std::{
 
 use brain_core::{
     ActionDescriptor, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, DecisionKind, MemoryStatus,
-    Rule, RuleEffect, RuleEngine, RuleStrength,
+    Rule, RuleEffect, RuleEngine, RuleStrength, StopReconcileConfig,
 };
 use brain_store::BrainStore;
 use clap::ValueEnum;
 
 use crate::{
+    analyze,
     codex::{self, CodexHookInput},
     error::AppError,
     reconcile,
@@ -106,15 +107,13 @@ impl App {
     }
 
     pub fn reconcile(&self, base: &str, envelope: &Path) -> Result<(), AppError> {
-        let envelope_path = if envelope.is_absolute() {
-            envelope.to_owned()
-        } else {
-            self.root.join(envelope)
-        };
-        let envelope: reconcile::ChangeEnvelope =
-            serde_json::from_slice(&fs::read(envelope_path)?)?;
-        let report = reconcile::evaluate(&self.root, base, &envelope)?;
+        let report = reconcile::evaluate_from_path(&self.root, base, envelope)?;
         println!("{}", pretty_json(&report)?);
+        Ok(())
+    }
+
+    pub fn analyze(&self, base: &str) -> Result<(), AppError> {
+        println!("{}", pretty_json(&analyze::evaluate(&self.root, base)?)?);
         Ok(())
     }
 
@@ -128,6 +127,11 @@ fn initial_config(project_name: String) -> BrainConfig {
     BrainConfig {
         schema_version: CURRENT_SCHEMA_VERSION,
         project_name,
+        stop_reconcile: StopReconcileConfig {
+            enabled: true,
+            base: "HEAD".to_owned(),
+            envelope: format!("{BRAIN_DIRECTORY}/envelope.json"),
+        },
         rules: vec![
             Rule {
                 id: "PB-CORE-001".to_owned(),

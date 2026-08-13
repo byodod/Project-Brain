@@ -1,6 +1,11 @@
 {
   "schema_version": 1,
   "project_name": "Project Brain",
+  "stop_reconcile": {
+    "enabled": true,
+    "base": "HEAD",
+    "envelope": ".project-brain/envelope.json"
+  },
   "rules": [
     {
       "id": "PB-CORE-001",

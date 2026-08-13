@@ -1,5 +1,5 @@
 [package]
-name = "project-brain"
+name = "brain-analyzer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,13 +7,10 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-brain-analyzer = { path = "../brain-analyzer" }
-brain-core = { path = "../brain-core" }
-brain-store = { path = "../brain-store" }
-clap.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
 
 [lints]
 workspace = true
