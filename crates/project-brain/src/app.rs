@@ -473,6 +473,13 @@ impl App {
             provider::record_import_failure(install_root, &run, &error)?;
             return Err(error);
         }
+        let qualification = match self.provider_commit_qualification(profile, &run) {
+            Ok(qualification) => qualification,
+            Err(error) => {
+                provider::record_import_failure(install_root, &run, &error)?;
+                return Err(error);
+            }
+        };
         prepared.attest_trusted_provider(
             run.registration_id(),
             run.executable_sha256(),
@@ -492,6 +499,7 @@ impl App {
             pretty_json(&serde_json::json!({
                 "schema_version": CURRENT_SCHEMA_VERSION,
                 "execution": run.report(),
+                "qualification": qualification,
                 "index": imported,
             }))?
         );
@@ -575,13 +583,16 @@ impl App {
             }));
         }
 
-        let status = if document_sets_equal && semantic_snapshots_equal && all_complete {
-            "stable_complete"
-        } else if !document_sets_equal || !semantic_snapshots_equal {
-            "nondeterministic"
-        } else {
-            "stable_incomplete"
-        };
+        let status =
+            provider_stability_status(document_sets_equal, semantic_snapshots_equal, all_complete);
+        let qualification = self.record_provider_stability_qualification(
+            profile,
+            runs,
+            status,
+            baseline_provider_binding,
+            baseline_source_fingerprint,
+            &observations,
+        )?;
         let report = serde_json::json!({
             "schema_version": CURRENT_SCHEMA_VERSION,
             "project_key": self.config.project_key,
@@ -593,6 +604,7 @@ impl App {
             "all_runs_coverage_complete": all_complete,
             "divergent_document_sample": divergent_document_sample,
             "snapshot_committed": false,
+            "qualification": qualification,
             "observations": observations,
         });
         println!("{}", pretty_json(&report)?);
@@ -603,6 +615,61 @@ impl App {
                 "Provider 稳定性验证未通过：status={status}；未提交 semantic snapshot"
             )))
         }
+    }
+
+    fn record_provider_stability_qualification(
+        &self,
+        profile: &str,
+        runs: u8,
+        status: &str,
+        binding: Option<(String, u64, String)>,
+        source_fingerprint: Option<String>,
+        observations: &[serde_json::Value],
+    ) -> Result<brain_store::ProviderQualificationRecord, AppError> {
+        let binding = binding
+            .ok_or_else(|| AppError::Provider("稳定性验证没有产生 Provider 绑定证据".to_owned()))?;
+        let source_fingerprint = source_fingerprint
+            .ok_or_else(|| AppError::Provider("稳定性验证没有产生源码指纹证据".to_owned()))?;
+        let evidence_manifest = serde_json::to_vec(observations)?;
+        Ok(self.store.record_provider_qualification(
+            &self.config.project_key,
+            profile,
+            status,
+            u64::from(runs),
+            &binding.0,
+            binding.1,
+            &binding.2,
+            &source_fingerprint,
+            &format!("sha256_{:x}", Sha256::digest(evidence_manifest)),
+        )?)
+    }
+
+    fn provider_commit_qualification(
+        &self,
+        profile: &str,
+        run: &provider::ProviderRun,
+    ) -> Result<Option<brain_store::ProviderQualificationRecord>, AppError> {
+        let qualification = self
+            .store
+            .latest_provider_qualification(&self.config.project_key, profile)?;
+        let Some(qualification) = qualification else {
+            return Ok(None);
+        };
+        if qualification.status != "stable_complete" {
+            return Err(AppError::Provider(format!(
+                "Provider profile={profile} 最新稳定性资格为 {}；普通 index 不得用一次偶然输出覆盖，必须显式 verify-stability",
+                qualification.status
+            )));
+        }
+        if qualification.registration_id != run.registration_id()
+            || qualification.registration_revision != run.registration_revision()
+            || qualification.executable_sha256 != run.executable_sha256()
+        {
+            return Err(AppError::Provider(format!(
+                "Provider profile={profile} 的 stable_complete 资格已因机器绑定或 executable 漂移而过期；必须重新 verify-stability"
+            )));
+        }
+        Ok(Some(qualification))
     }
 
     fn prepare_provider_stability_run(
@@ -988,6 +1055,20 @@ fn require_human_confirmation(confirmed: bool, operation: &str) -> Result<(), Ap
         Err(AppError::Governance(format!(
             "{operation} 改变人工治理事实，必须由操作者显式提供 --human-confirmed"
         )))
+    }
+}
+
+fn provider_stability_status(
+    document_sets_equal: bool,
+    semantic_snapshots_equal: bool,
+    all_complete: bool,
+) -> &'static str {
+    if document_sets_equal && semantic_snapshots_equal && all_complete {
+        "stable_complete"
+    } else if !document_sets_equal || !semantic_snapshots_equal {
+        "nondeterministic"
+    } else {
+        "stable_incomplete"
     }
 }
 

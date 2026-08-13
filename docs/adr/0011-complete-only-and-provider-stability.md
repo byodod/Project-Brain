@@ -27,11 +27,16 @@ exit 0、SCIP 可解析，甚至多次运行的 Document 并集看似完整，�
    默认五轮只输出 14/15/16/19/15 个 Document；单线程五轮仍只输出 15/14/15/14/15 个 Document。
    两组实验的 Document manifest 与语义指纹均逐轮不同。一次单线程 23/23 对照只是偶然观测，不能
    推翻稳定性门禁；当前 producer/config 对该 workspace 不具备提交真实语义快照的资格。
+7. SQLite schema v10 把每次完整稳定性验证的最终状态、运行数、registration/revision、executable
+   SHA、源码指纹和 evidence manifest 作为 append-only qualification event。最新状态为
+   `nondeterministic` 或 `stable_incomplete` 时，普通 index 不得因一次偶然 complete 而提交；只有
+   显式 `verify-stability` 得到 `stable_complete` 才解锁。已有 qualification 的机器绑定漂移后必须重验。
 
 ## 后果
 
 - Provider 成功但漏文件不再污染最新语义基线。
 - 不稳定 Provider 会以可重放的运行、二进制和源码证据显式失败。
+- 已观测的不稳定性跨普通 index 持久生效；一次偶然完整输出不再能覆盖多轮反证。
 - 不用线程数开关或重复运行结果并集伪造稳定性，也不把重复执行整个 workspace 冒充 package shard。
 - 某些语义 Producer 天生不为无 occurrence 文件输出 Document；这类项目需要后续 Required/Optional/
   Excluded source expectation，而不能放松 complete-only 门禁。

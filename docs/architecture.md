@@ -108,7 +108,7 @@ SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照�
 进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
 符号 ID、快照 revision、节点/边主键、查询和墓碑更新都包含 `project_key`。数据库 schema v4
 首次建立这组项目隔离约束；对应迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与
-adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v9，并在这些约束上
+adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v10，并在这些约束上
 增加独立的语义血缘账本、append-only 来源证明和不可伪造的源码 Document manifest。
 数据库迁移拒绝缺失或非整数的已有 `schema_version`，不会把损坏元数据静默当作 v1。
 Adapter 审计依赖 SQLite 唯一约束和 busy timeout，使并发连接对同一项目事件收敛到首次 outcome；
@@ -129,9 +129,9 @@ confirmed / rejected / superseded / invalidated
            └── never rewrites SymbolNode / tombstone / snapshot
 ```
 
-SQLite schema v9 保存 semantic snapshots、append-only source attestations、source manifests、
+SQLite schema v10 保存 semantic snapshots、append-only source attestations、source manifests、
 symbol observations、group/member/generation run、candidate/evidence/decision，以及显式旧账压缩的
-run/group 审计。压缩默认只读；apply 必须携带人工确认与幂等 request ID，且逻辑删除与审计同事务。
+run/group 审计和 append-only Provider qualification events。压缩默认只读；apply 必须携带人工确认与幂等 request ID，且逻辑删除与审计同事务。
 物理 `VACUUM` 不属于压缩事务，也不能替代候选资格证明。
 Candidate endpoint 唯一键负责算法重跑幂等，算法版本只产生新的 evidence observation；人工状态
 永远不会被 generator 恢复或覆盖。Partial unique indexes 约束同 snapshot pair 中 predecessor 与
@@ -146,6 +146,10 @@ not_indexed 与 unverifiable，避免“Provider 成功退出”等价于“全�
 机器级运行审计。`provider verify-stability` 以 workspace index 为快速路径，固定源码与 executable
 身份后重复比较 Document manifest 和完整 semantic snapshot 指纹，且永不提交观测结果。多次失败
 workspace run 的 union 不构成一致的语义世界，因此协议明确禁止。
+稳定性验证的最终结论持久化到项目数据库。最新结论为 `nondeterministic` / `stable_incomplete` 时，
+普通 `provider index` 即使偶然得到 complete 输出也不得提交；只有相同机器绑定的显式重复验证达到
+`stable_complete` 才恢复提交资格。资格存在后，Provider registration revision 或 executable hash
+变化会使它过期并要求重新验证。
 
 ## 阻断权限
 

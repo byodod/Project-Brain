@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const DATABASE_SCHEMA_VERSION: i64 = 9;
+const DATABASE_SCHEMA_VERSION: i64 = 10;
 const LEGACY_LINEAGE_ALGORITHM_ID: &str = "project-brain-lineage";
 const LEGACY_LINEAGE_ALGORITHM_VERSION: &str = "1";
 const LEGACY_COMPACTION_ALGORITHM_ID: &str = "project-brain-lineage-legacy-compaction";
@@ -59,6 +59,9 @@ pub enum StoreError {
 
     #[error("lineage request_id 已用于不同请求：{0}")]
     LineageIdempotencyConflict(String),
+
+    #[error("Provider 资格状态无效：{0}")]
+    InvalidProviderQualification(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -298,6 +301,21 @@ pub struct LegacyLineageCompactionReport {
     pub groups: Vec<LegacyLineageCompactionGroup>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderQualificationRecord {
+    pub sequence: u64,
+    pub project_key: String,
+    pub provider_profile_id: String,
+    pub status: String,
+    pub runs: u64,
+    pub registration_id: String,
+    pub registration_revision: u64,
+    pub executable_sha256: String,
+    pub source_fingerprint: String,
+    pub evidence_manifest_hash: String,
+    pub created_at_unix_seconds: i64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LineageDecisionAction {
@@ -468,6 +486,7 @@ impl BrainStore {
         self.initialize_lineage_schema()?;
         self.ensure_lineage_v8_schema()?;
         self.ensure_lineage_v9_schema()?;
+        self.ensure_provider_qualification_v10_schema()?;
         self.ensure_semantic_snapshot_source_columns()?;
         self.initialize_adapter_audit_schema()?;
         self.connection.execute(
@@ -810,6 +829,30 @@ impl BrainStore {
              );
              CREATE INDEX IF NOT EXISTS idx_lineage_compaction_project
                  ON semantic_lineage_compaction_runs(project_key, created_at_unix_seconds DESC);",
+        )?;
+        Ok(())
+    }
+
+    fn ensure_provider_qualification_v10_schema(&self) -> Result<(), StoreError> {
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS semantic_provider_qualification_events (
+                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                 project_key TEXT NOT NULL,
+                 provider_profile_id TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK(status IN
+                     ('stable_complete', 'stable_incomplete', 'nondeterministic')),
+                 runs INTEGER NOT NULL CHECK(runs >= 2),
+                 registration_id TEXT NOT NULL,
+                 registration_revision INTEGER NOT NULL CHECK(registration_revision > 0),
+                 executable_sha256 TEXT NOT NULL,
+                 source_fingerprint TEXT NOT NULL,
+                 evidence_manifest_hash TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_provider_qualification_latest
+                 ON semantic_provider_qualification_events(
+                    project_key, provider_profile_id, sequence DESC
+                 );",
         )?;
         Ok(())
     }
@@ -1924,6 +1967,124 @@ impl BrainStore {
         value
             .parse()
             .map_err(|_| StoreError::Integrity("schema_version 不是整数".to_owned()))
+    }
+
+    /// 追加一次显式 Provider 稳定性资格结论；不会改写旧结论。
+    ///
+    /// # Errors
+    ///
+    /// 资格字段无效或 `SQLite` 写入失败时返回错误。
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_provider_qualification(
+        &self,
+        project_key: &str,
+        provider_profile_id: &str,
+        status: &str,
+        runs: u64,
+        registration_id: &str,
+        registration_revision: u64,
+        executable_sha256: &str,
+        source_fingerprint: &str,
+        evidence_manifest_hash: &str,
+    ) -> Result<ProviderQualificationRecord, StoreError> {
+        if !is_valid_project_key(project_key)
+            || provider_profile_id.trim().is_empty()
+            || provider_profile_id.len() > 64
+            || !matches!(
+                status,
+                "stable_complete" | "stable_incomplete" | "nondeterministic"
+            )
+            || runs < 2
+            || registration_id.trim().is_empty()
+            || registration_id.len() > 192
+            || registration_revision == 0
+            || !is_raw_sha256(executable_sha256)
+            || !is_raw_sha256(source_fingerprint)
+            || !is_sha256_fingerprint(evidence_manifest_hash)
+        {
+            return Err(StoreError::InvalidProviderQualification(
+                "project/profile/status/runs/binding/source/evidence 边界不完整".to_owned(),
+            ));
+        }
+        let created_at = unix_seconds()?;
+        self.connection.execute(
+            "INSERT INTO semantic_provider_qualification_events(
+                 project_key, provider_profile_id, status, runs, registration_id,
+                 registration_revision, executable_sha256, source_fingerprint,
+                 evidence_manifest_hash, created_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                project_key,
+                provider_profile_id,
+                status,
+                i64::try_from(runs).map_err(|_| StoreError::InvalidProviderQualification(
+                    "runs 超出 SQLite INTEGER".to_owned()
+                ))?,
+                registration_id,
+                i64::try_from(registration_revision).map_err(|_| {
+                    StoreError::InvalidProviderQualification(
+                        "registration_revision 超出 SQLite INTEGER".to_owned(),
+                    )
+                })?,
+                executable_sha256,
+                source_fingerprint,
+                evidence_manifest_hash,
+                created_at,
+            ],
+        )?;
+        self.latest_provider_qualification(project_key, provider_profile_id)?
+            .ok_or_else(|| StoreError::Integrity("刚写入的 Provider 资格状态无法回读".to_owned()))
+    }
+
+    /// 返回项目/profile 最新的 append-only Provider 稳定性资格结论。
+    ///
+    /// # Errors
+    ///
+    /// `SQLite` 查询或整数转换失败时返回错误。
+    pub fn latest_provider_qualification(
+        &self,
+        project_key: &str,
+        provider_profile_id: &str,
+    ) -> Result<Option<ProviderQualificationRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT sequence, project_key, provider_profile_id, status, runs,
+                        registration_id, registration_revision, executable_sha256,
+                        source_fingerprint, evidence_manifest_hash, created_at_unix_seconds
+                 FROM semantic_provider_qualification_events
+                 WHERE project_key = ?1 AND provider_profile_id = ?2
+                 ORDER BY sequence DESC LIMIT 1",
+                params![project_key, provider_profile_id],
+                |row| {
+                    let sequence = row.get::<_, i64>(0)?;
+                    let runs = row.get::<_, i64>(4)?;
+                    let revision = row.get::<_, i64>(6)?;
+                    Ok(ProviderQualificationRecord {
+                        sequence: u64::try_from(sequence).map_err(|_| {
+                            invalid_provider_qualification_sql(0, format!("sequence={sequence}"))
+                        })?,
+                        project_key: row.get(1)?,
+                        provider_profile_id: row.get(2)?,
+                        status: row.get(3)?,
+                        runs: u64::try_from(runs).map_err(|_| {
+                            invalid_provider_qualification_sql(4, format!("runs={runs}"))
+                        })?,
+                        registration_id: row.get(5)?,
+                        registration_revision: u64::try_from(revision).map_err(|_| {
+                            invalid_provider_qualification_sql(
+                                6,
+                                format!("registration_revision={revision}"),
+                            )
+                        })?,
+                        executable_sha256: row.get(7)?,
+                        source_fingerprint: row.get(8)?,
+                        evidence_manifest_hash: row.get(9)?,
+                        created_at_unix_seconds: row.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     /// 以不可变 JSON 快照记录一次动作和决策。
@@ -3568,6 +3729,14 @@ fn invalid_lineage_sql(column: usize, message: String) -> rusqlite::Error {
     )
 }
 
+fn invalid_provider_qualification_sql(column: usize, message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        rusqlite::types::Type::Integer,
+        Box::new(StoreError::InvalidProviderQualification(message)),
+    )
+}
+
 fn validate_lineage_command(
     project_key: &str,
     candidate_id: &str,
@@ -3921,6 +4090,10 @@ fn is_sha256_fingerprint(value: &str) -> bool {
     value.len() == 71
         && value.starts_with("sha256_")
         && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_raw_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn is_normalized_symbol_path(path: &str) -> bool {
@@ -4486,6 +4659,67 @@ mod tests {
     }
 
     #[test]
+    fn provider_qualification_is_append_only_and_latest_wins() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let unstable = store
+            .record_provider_qualification(
+                PROJECT_KEY,
+                "rust-main",
+                "nondeterministic",
+                5,
+                "registration-1",
+                1,
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &format!("sha256_{}", "c".repeat(64)),
+            )
+            .unwrap();
+        let stable = store
+            .record_provider_qualification(
+                PROJECT_KEY,
+                "rust-main",
+                "stable_complete",
+                3,
+                "registration-1",
+                1,
+                &"a".repeat(64),
+                &"d".repeat(64),
+                &format!("sha256_{}", "e".repeat(64)),
+            )
+            .unwrap();
+        assert!(stable.sequence > unstable.sequence);
+        assert_eq!(
+            store
+                .latest_provider_qualification(PROJECT_KEY, "rust-main")
+                .unwrap(),
+            Some(stable)
+        );
+        let event_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_provider_qualification_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 2);
+        assert!(matches!(
+            store.record_provider_qualification(
+                PROJECT_KEY,
+                "rust-main",
+                "stable_complete",
+                1,
+                "registration-1",
+                1,
+                &"a".repeat(64),
+                &"b".repeat(64),
+                &format!("sha256_{}", "c".repeat(64)),
+            ),
+            Err(StoreError::InvalidProviderQualification(_))
+        ));
+    }
+
+    #[test]
     fn a_successful_retry_replaces_a_failure_for_the_same_project_event() {
         let store = BrainStore::open_in_memory().unwrap();
         let event = hook_event("project_a", "event-1");
@@ -4731,7 +4965,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 9);
+        assert_eq!(store.database_schema_version().unwrap(), 10);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, false, 10)
@@ -4816,7 +5050,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 9);
+        assert_eq!(store.database_schema_version().unwrap(), 10);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, true, 10)
@@ -4856,7 +5090,7 @@ mod tests {
         drop(connection);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 9);
+        assert_eq!(migrated.database_schema_version().unwrap(), 10);
         let legacy_source = migrated
             .connection
             .query_row(
@@ -5677,7 +5911,7 @@ mod tests {
         drop(store);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 9);
+        assert_eq!(migrated.database_schema_version().unwrap(), 10);
         assert_eq!(
             migrated
                 .list_symbols(PROJECT_KEY, None, false, 10)

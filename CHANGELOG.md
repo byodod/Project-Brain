@@ -18,6 +18,7 @@
 - complete-only semantic commit 门禁，以及不提交快照的 Provider 多次运行 Document/semantic 指纹稳定性验证。
 - SQLite v8 group-first lineage、SCIP producer signature 证据与线性有界歧义存储。
 - SQLite v9 V7 pair-first 旧账 dry-run/显式幂等压缩、manifest 审计与 legacy group 禁止重新物化。
+- SQLite v10 append-only Provider 稳定性资格；已失败或已过期的资格阻止普通 index 偶然提交。
 
 ### Security
 

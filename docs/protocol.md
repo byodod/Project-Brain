@@ -284,7 +284,9 @@ Lineage 连接两个历史 observation，而不是合并或重命名 `SymbolNode
 - `semantic_lineage_evidence`：算法 ID、版本、输入摘要、结构化证据与置信度的 append-only 观察；
 - `semantic_lineage_decisions`：显式用户裁决的 append-only 日志；
 - `semantic_lineage_compaction_runs` / `semantic_lineage_compaction_groups`：V7 pair-first 旧账的
-  幂等逻辑压缩审计、候选/证据 manifest hash 与目标 group。
+  幂等逻辑压缩审计、候选/证据 manifest hash 与目标 group；
+- `semantic_provider_qualification_events`：显式多轮稳定性验证的 append-only 最终结论、机器绑定、
+  源码指纹与整组 evidence manifest hash。
 
 候选状态只有：
 
@@ -314,7 +316,7 @@ V8 的 ambiguity 属于 `semantic_lineage_groups`；candidate 的旧 `ambiguity_
    snapshot 或跨 provider 建 equivalence；
 10. 已导入但不是当前最新的历史 snapshot 不能重新应用为当前符号图。
 
-SQLite schema v9 保存 semantic snapshots、source attestations、source manifests、symbol observations、
+SQLite schema v10 保存 semantic snapshots、source attestations、source manifests、symbol observations、
 lineage groups/members/generation runs、candidate/evidence/decision 与 legacy compaction audit。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升
 为硬证据，也不会从现存 symbol 反推缺失 Document。真实重跑相同 snapshot 时可以首次补录 manifest；
 可信重跑只追加 attestation，不改写 symbol observations 或人工 lineage 状态。

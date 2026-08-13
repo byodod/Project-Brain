@@ -366,7 +366,10 @@ project-brain provider verify-stability --profile rust-main --runs 5 --timeout-s
 该命令固定同一源码指纹、机器绑定 revision 与 executable SHA-256，逐次比较完整 Document 路径集合
 和完整 provider-neutral semantic snapshot 指纹。只有所有运行均 `complete` 且两类指纹都一致时返回
 成功；任何不完整或非确定性结果都返回非零。原始 Provider audit 会保留，但命令永远不提交快照，
-也不会把多次失败结果取并集。
+也不会把多次失败结果取并集。最终状态会作为项目级 append-only qualification 写入 SQLite：一旦
+记录为 `nondeterministic` 或 `stable_incomplete`，普通 `provider index` 即使偶然得到一次 complete
+也不能提交；必须再次显式运行稳定性验证并得到 `stable_complete`。资格绑定 registration revision
+与 executable SHA-256，绑定变化后必须重验。
 
 如果 `.scip` 由 CI 或其他流程生成，仍可按项目内稳定 profile ID 手工导入：
 
@@ -379,7 +382,7 @@ Hook 硬阻断权。只有 `provider index` 通过当前机器已登记且哈希
 才追加 `trusted_provider` attestation；证明同时固定 registration ID、executable SHA-256、SCIP
 artifact SHA-256、Git HEAD 与完整 worktree 指纹。
 
-`doctor` 会读取 SQLite v8 中与快照同事务保存的 source manifest，并按当前 worktree/HEAD 重新计算
+`doctor` 会读取 SQLite v10 中与快照同事务保存的 source manifest，并按当前 worktree/HEAD 重新计算
 覆盖率。已有索引若为 `partial`、`stale`、损坏或来自未保存 manifest 的旧库，doctor 会降级并返回
 非零；尚未运行过索引只报告 `not_indexed` warning，不阻断首次 bootstrap。旧库迁移不会从符号表
 猜测文档清单；必须真实重跑一次 `provider index` 或 `index-scip` 才能补录 manifest。
