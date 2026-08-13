@@ -75,8 +75,11 @@ enum Command {
     /// 用户级 Hook 入口；未注册项目静默 NO-OP
     Dispatch { agent: AgentKind, event: HookEvent },
 
-    /// 检查安装、项目注册、Codex Hook 与本地存储就绪状态
-    Doctor,
+    /// 检查安装、项目注册、指定 Agent Hook 与本地存储就绪状态
+    Doctor {
+        #[arg(value_enum, default_value = "codex")]
+        agent: AgentKind,
+    },
 
     /// 从标准输入读取 `ActionDescriptor` 并输出通用决策 JSON
     Preflight,
@@ -413,8 +416,14 @@ fn main() -> ExitCode {
         Command::Dispatch { agent, event } => {
             App::dispatch_hook(cli.install_root.as_deref(), agent, event)
         }
-        Command::Doctor => App::open(cli.project_root)
-            .and_then(|app| app.doctor(cli.install_root.as_deref(), cli.codex_home.as_deref())),
+        Command::Doctor { agent } => {
+            let agent_home = match agent {
+                AgentKind::Codex => cli.codex_home.as_deref(),
+                AgentKind::ClaudeCode => cli.claude_home.as_deref(),
+            };
+            App::open(cli.project_root)
+                .and_then(|app| app.doctor(cli.install_root.as_deref(), agent, agent_home))
+        }
         Command::Preflight => App::open(cli.project_root).and_then(|app| app.preflight()),
         Command::Hook { agent, event } => {
             App::run_hook(cli.project_root, cli.install_root.as_deref(), agent, event)

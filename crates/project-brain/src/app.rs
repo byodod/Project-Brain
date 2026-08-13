@@ -146,11 +146,17 @@ impl App {
     pub fn doctor(
         &self,
         install_root: Option<&Path>,
-        codex_home: Option<&Path>,
+        agent: AgentKind,
+        agent_home: Option<&Path>,
     ) -> Result<(), AppError> {
+        let adapter = match agent {
+            AgentKind::Codex => setup::DoctorAdapter::Codex,
+            AgentKind::ClaudeCode => setup::DoctorAdapter::ClaudeCode,
+        };
         let mut report = setup::doctor(
             install_root,
-            codex_home,
+            adapter,
+            agent_home,
             &self.root,
             &self.config.project_key,
             &self.config.semantic_providers,

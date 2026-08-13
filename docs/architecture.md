@@ -204,8 +204,8 @@ handler hash。`SubagentStart`、`SessionEnd` 与 Prime Agent 仍留在后续阶
    producer 行为的合成 fixture 固定 C#/VB、空 Python language、未指定 kind 与 implementation 契约。
 3. Semantic lineage 裁决与 symbol-scoped rules 已实现；下一步扩展 symbol set、split/merge 和调用图
    影响面，但仍不允许自动确认或 LLM hard block。
-4. 为 Claude Code adapter 增加按 adapter 选择的 doctor 与真实进程 lifecycle fixture；之后再研究
-   Prime Agent 独立 runtime 接入，不把它伪装成 Hook 等价物。
+4. 为 Claude Code adapter 增加真实进程 lifecycle fixture；之后再研究 Prime Agent 独立 runtime
+   接入，不把它伪装成 Hook 等价物。按 adapter 选择的 doctor 已由 ADR-0016 完成。
 5. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
    直接 hard block。
 

@@ -34,7 +34,7 @@ uninstall，验证五个 handler、用户 `language` 和自定义 `Stop` hook �
 ## 后果
 
 - Claude Code 获得与 Codex 同级的可回滚用户级接入，但两套配置和审计仍完全隔离。
-- 通用 `doctor` 目前仍报告 Codex Hook；按 adapter 选择的就绪检查属于下一提交。
+- 按 adapter 选择的就绪检查由 ADR-0016 补充。
 - 不因安装器存在而声称 `SubagentStart`、`SessionEnd` 或 Prime Agent 已实现。
 
 ## 参考

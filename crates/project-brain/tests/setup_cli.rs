@@ -63,11 +63,13 @@ fn install_bootstrap_dispatch_doctor_and_uninstall_are_end_to_end() {
     let root = temp_root("e2e");
     let install_root = root.join("machine/Project Brain");
     let codex_home = root.join("Codex Home");
+    let claude_home = root.join("Claude Home");
     let project = root.join("repo");
     let unknown = root.join("unknown");
     fs::create_dir_all(&project).unwrap();
     fs::create_dir_all(&unknown).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
+    fs::create_dir_all(&claude_home).unwrap();
     let user_hooks = "{\n  \"custom\": true,\n  \"hooks\": {\n    \"Stop\": [{\"hooks\": [{\"type\": \"command\", \"command\": \"user-stop\"}]}]\n  }\n}\n";
     fs::write(codex_home.join("hooks.json"), user_hooks).unwrap();
 
@@ -264,12 +266,49 @@ fn install_bootstrap_dispatch_doctor_and_uninstall_are_end_to_end() {
     );
     assert_success(&doctor);
     let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(doctor["schema_version"], 2);
     assert_eq!(doctor["status"], "ready");
     assert_eq!(doctor["providers"], "pass");
     assert_eq!(
-        doctor["codex_trust_state"],
+        doctor["adapter_trust_state"],
         "not_programmatically_verifiable"
     );
+    assert_eq!(doctor["adapter"], "codex");
+    assert_eq!(doctor["adapter_hooks"], "pass");
+
+    assert_success(&run(
+        &launcher,
+        &[
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--claude-home",
+            claude_home.to_str().unwrap(),
+            "install-hooks",
+            "claude-code",
+        ],
+        &root,
+        None,
+    ));
+    let claude_doctor = run(
+        &launcher,
+        &[
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--claude-home",
+            claude_home.to_str().unwrap(),
+            "--project-root",
+            project.to_str().unwrap(),
+            "doctor",
+            "claude-code",
+        ],
+        &project,
+        None,
+    );
+    assert_success(&claude_doctor);
+    let claude_doctor: Value = serde_json::from_slice(&claude_doctor.stdout).unwrap();
+    assert_eq!(claude_doctor["schema_version"], 2);
+    assert_eq!(claude_doctor["adapter"], "claude_code");
+    assert_eq!(claude_doctor["adapter_hooks"], "pass");
 
     let hooks_before_drift = fs::read(codex_home.join("hooks.json")).unwrap();
     let mut drifted: Value = serde_json::from_slice(&hooks_before_drift).unwrap();
@@ -336,7 +375,8 @@ fn install_bootstrap_dispatch_doctor_and_uninstall_are_end_to_end() {
     assert!(!degraded_doctor.status.success());
     let degraded: Value = serde_json::from_slice(&degraded_doctor.stdout).unwrap();
     assert_eq!(degraded["status"], "degraded");
-    assert_eq!(degraded["codex_hooks"], "fail");
+    assert_eq!(degraded["adapter"], "codex");
+    assert_eq!(degraded["adapter_hooks"], "fail");
 
     fs::remove_dir_all(root).unwrap();
 }

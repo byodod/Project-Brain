@@ -16,6 +16,7 @@ use brain_core::SemanticProviderProfile;
 use crate::{error::AppError, provider};
 
 const INSTALL_SCHEMA_VERSION: u32 = 1;
+const DOCTOR_SCHEMA_VERSION: u32 = 2;
 const REGISTRY_SCHEMA_VERSION: u32 = 1;
 const CODEX_INTEGRATION_VERSION: u32 = 1;
 const CLAUDE_INTEGRATION_VERSION: u32 = 1;
@@ -121,12 +122,35 @@ pub struct DoctorReport {
     pub payload: CheckState,
     pub project_registration: CheckState,
     pub providers: CheckState,
-    pub codex_hooks: CheckState,
-    pub codex_trust_state: &'static str,
+    pub adapter: &'static str,
+    pub adapter_hooks: CheckState,
+    pub adapter_trust_state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_coverage: Option<crate::scip_index::SemanticCoverageDoctorReport>,
     pub issues: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DoctorAdapter {
+    Codex,
+    ClaudeCode,
+}
+
+impl DoctorAdapter {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude_code",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::ClaudeCode => "Claude Code",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -305,6 +329,7 @@ pub fn bootstrap(
     if install_codex {
         let report = doctor(
             Some(&install_root),
+            DoctorAdapter::Codex,
             explicit_codex_home,
             &canonical_root,
             project_key,
@@ -604,7 +629,8 @@ pub fn uninstall_claude_hooks(
 
 pub fn doctor(
     explicit_install_root: Option<&Path>,
-    explicit_codex_home: Option<&Path>,
+    adapter: DoctorAdapter,
+    explicit_agent_home: Option<&Path>,
     project_root: &Path,
     project_key: &str,
     provider_profiles: &[SemanticProviderProfile],
@@ -614,15 +640,16 @@ pub fn doctor(
         Ok(root) => root,
         Err(error) => {
             return DoctorReport {
-                schema_version: INSTALL_SCHEMA_VERSION,
+                schema_version: DOCTOR_SCHEMA_VERSION,
                 status: "broken",
                 install_root: PathBuf::new(),
                 launcher: CheckState::Fail,
                 payload: CheckState::Fail,
                 project_registration: CheckState::Fail,
                 providers: CheckState::Fail,
-                codex_hooks: CheckState::Fail,
-                codex_trust_state: "not_programmatically_verifiable",
+                adapter: adapter.name(),
+                adapter_hooks: CheckState::Fail,
+                adapter_trust_state: "not_programmatically_verifiable",
                 semantic_coverage: None,
                 issues: vec![error.to_string()],
                 warnings: Vec::new(),
@@ -665,15 +692,24 @@ pub fn doctor(
     if !providers.ready {
         issues.extend(providers.issues);
     }
-    let codex_hooks_valid = codex_integration_valid(
-        &install_root,
-        resolve_codex_home(explicit_codex_home).ok().as_deref(),
-    );
-    if !codex_hooks_valid {
-        issues.push("Codex 用户级 Hook 缺失、重复或发生漂移".to_owned());
+    let adapter_hooks_valid = match adapter {
+        DoctorAdapter::Codex => codex_integration_valid(
+            &install_root,
+            resolve_codex_home(explicit_agent_home).ok().as_deref(),
+        ),
+        DoctorAdapter::ClaudeCode => claude_integration_valid(
+            &install_root,
+            resolve_claude_home(explicit_agent_home).ok().as_deref(),
+        ),
+    };
+    if !adapter_hooks_valid {
+        issues.push(format!(
+            "{} 用户级 Hook 缺失、重复或发生漂移",
+            adapter.display_name()
+        ));
     }
     DoctorReport {
-        schema_version: INSTALL_SCHEMA_VERSION,
+        schema_version: DOCTOR_SCHEMA_VERSION,
         status: if issues.is_empty() {
             "ready"
         } else {
@@ -684,8 +720,9 @@ pub fn doctor(
         payload: payload_exists.into(),
         project_registration: project_registered.into(),
         providers: providers.ready.into(),
-        codex_hooks: codex_hooks_valid.into(),
-        codex_trust_state: "not_programmatically_verifiable",
+        adapter: adapter.name(),
+        adapter_hooks: adapter_hooks_valid.into(),
+        adapter_trust_state: "not_programmatically_verifiable",
         semantic_coverage: None,
         issues,
         warnings: Vec::new(),
@@ -1203,6 +1240,22 @@ fn codex_integration_valid(install_root: &Path, codex_home: Option<&Path>) -> bo
     };
     validate_integration_manifest(&manifest, &target).is_ok()
         && observed_managed_hashes(&document) == manifest.managed_handler_hashes
+}
+
+fn claude_integration_valid(install_root: &Path, claude_home: Option<&Path>) -> bool {
+    let Some(claude_home) = claude_home else {
+        return false;
+    };
+    let target = claude_home.join("settings.json");
+    let integration = install_root.join("state/integrations/claude-code.json");
+    let Ok(document) = read_json::<Value>(&target) else {
+        return false;
+    };
+    let Ok(manifest) = read_json::<ClaudeIntegrationManifest>(&integration) else {
+        return false;
+    };
+    validate_claude_integration_manifest(&manifest, &target).is_ok()
+        && observed_claude_managed_hashes(&document) == manifest.managed_handler_hashes
 }
 
 fn quote_posix(path: &str) -> String {

@@ -184,7 +184,9 @@ project-brain doctor
 project-brain uninstall-hooks codex
 ```
 
-`doctor` 总会先把结构化报告写到标准输出；只要状态不是 `ready`，进程同时返回非零退出码，
+`doctor` 默认检查 Codex；也可执行 `project-brain doctor claude-code`，并通过全局
+`--claude-home` 指定 Claude 配置根。报告使用通用的 `adapter`、`adapter_hooks` 与
+`adapter_trust_state` 字段。`doctor` 总会先把结构化报告写到标准输出；只要状态不是 `ready`，进程同时返回非零退出码，
 因此既适合人工诊断，也可以作为 CI/bootstrap 的硬门禁。
 
 卸载只删除 manifest 中精确记录的 Project Brain handler，保留用户后来增加的 Hook。检测到
@@ -556,8 +558,8 @@ crates/
 
 ## 当前限制
 
-- Codex 与 Claude Code 已提供直接适配器和用户级 Hook 安装器；当前 `doctor` 的 Hook 就绪字段仍
-  只覆盖 Codex，Claude 安装健康检查将在后续拆成按 adapter 选择；Prime Agent 仍未实现。
+- Codex 与 Claude Code 已提供直接适配器、用户级 Hook 安装器和按 adapter 选择的 `doctor`；
+  Prime Agent 仍未实现。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。
