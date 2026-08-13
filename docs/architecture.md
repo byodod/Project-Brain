@@ -78,6 +78,13 @@ main scene、autoload、resource dependency 与文件哈希；Rust 侧要求两�
 `loaded` 结果外完全一致，并再次读取文件核对哈希。HOME、APPDATA 与 XDG 路径指向本次临时目录，
 避免读取或写入用户 editor 配置。`.godot/` 不进入 ArtifactGraph，也不参与 source fingerprint。
 
+Build Provider 不复用 Semantic Runner，也不把“编译”并入 Engine。`.NET` 与 `cargo` 属于
+`RepositoryBuildCode`：即使 argv 由 Project Brain 固定，MSBuild task、build.rs 和 proc macro 仍可
+执行仓库代码，因此必须同时取得机器 executable 信任与仓库构建代码信任。Python v1 属于
+`CompilerOnly`，固定 isolated interpreter bootstrap，只调用 `compile()`。所有构建在机器私有 scratch
+中运行并生成产物哈希清单；完整观测到非零退出仍是 complete error evidence，基础设施缺失则降级为
+partial unavailable。Godot C# Build Snapshot 显式引用本次实际消费的 Engine fingerprint。
+
 SCIP 路径以 `project_key + semantic provider profile ID + producer + contract_version` 建立
 Provider 命名空间，并把规范化 language ID 写入 provider key。语言映射逐 Document 执行，
 因此单一 scip-dotnet index 可同时容纳 C# 与 Visual Basic。Producer 自身版本只作为 provenance
@@ -230,8 +237,9 @@ Extension 安装器仍留在后续阶段。
    adapter 已完成，下一步增加原子 Extension 安装与真实 Prime runtime fixture。按 adapter 选择的
    doctor 已由 ADR-0016 完成。
 5. Source、Semantic、Engine、Build、Runtime 分层 Evidence Plane、独立 ArtifactGraph、SQLite
-   快照/attestation/head/staleness ledger 与 Hook 新鲜度提示已经完成；Godot Engine Evidence Provider
-   v1 已通过真实 Godot 4.6 项目验证。下一阶段实现 Build/Runtime Provider 和规则到 finding 的显式映射。
+   快照/attestation/head/staleness ledger 与 Hook 新鲜度提示已经完成；Godot Engine 以及
+   .NET/Rust/Python Build Evidence Provider v1 已通过真实项目验证。下一阶段实现 Godot headless
+   Runtime Provider 和规则到 finding 的显式映射。
 6. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
    直接 hard block。
 
@@ -249,4 +257,6 @@ Extension 安装器仍留在后续阶段。
 [ADR-0012](adr/0012-group-first-lineage-and-signature-evidence.md)，以及
 [ADR-0019](adr/0019-evidence-planes-and-artifact-graph.md) 与
 [ADR-0020](adr/0020-godot-engine-evidence-provider.md) 与
-[ADR-0021](adr/0021-evidence-ledger-and-hook-staleness.md)。
+[ADR-0021](adr/0021-evidence-ledger-and-hook-staleness.md)、
+[ADR-0022](adr/0022-evidence-upstream-freshness-propagation.md) 与
+[ADR-0023](adr/0023-fixed-build-evidence-providers.md)。

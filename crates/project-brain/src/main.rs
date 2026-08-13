@@ -1,5 +1,6 @@
 mod analyze;
 mod app;
+mod build;
 mod claude;
 mod codex;
 mod error;
@@ -230,6 +231,70 @@ enum EvidenceCommand {
         #[arg(long)]
         executable: PathBuf,
         /// 确认信任此机器本地 executable；Hook 不会自动提供此参数
+        #[arg(long)]
+        trust_local_executable: bool,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
+    },
+
+    /// 使用固定工具链合同生成 Build Evidence；不会运行测试、应用或导出
+    Build {
+        #[command(subcommand)]
+        command: BuildEvidenceCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BuildEvidenceCommand {
+    /// 固定执行 dotnet build Debug；MSBuild 可能执行仓库控制的构建代码
+    Dotnet {
+        /// 项目内稳定 Build profile ID；参与 Evidence head 身份
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        executable: PathBuf,
+        /// 项目内单个 .csproj 路径；v1 不接受多项目 .sln
+        #[arg(long)]
+        target: PathBuf,
+        /// Godot C# 等项目要求引用当前 fresh Engine Evidence
+        #[arg(long)]
+        require_engine: bool,
+        #[arg(long)]
+        trust_local_executable: bool,
+        #[arg(long)]
+        trust_repository_build_code: bool,
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
+    },
+
+    /// 固定执行 cargo build --workspace --all-targets --frozen；Cargo 可能执行 build.rs
+    Rust {
+        /// 项目内稳定 Build profile ID；参与 Evidence head 身份
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        executable: PathBuf,
+        /// 项目内 Cargo.toml 路径
+        #[arg(long, default_value = "Cargo.toml")]
+        manifest: PathBuf,
+        #[arg(long)]
+        trust_local_executable: bool,
+        #[arg(long)]
+        trust_repository_build_code: bool,
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
+    },
+
+    /// 使用 Python isolated mode 逐文件 compile；不 import、不 exec 项目模块、不构建 wheel
+    Python {
+        /// 项目内稳定 Build profile ID；参与 Evidence head 身份
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        executable: PathBuf,
+        /// 项目内 Python 源码根目录
+        #[arg(long, default_value = ".")]
+        source_root: PathBuf,
         #[arg(long)]
         trust_local_executable: bool,
         #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
@@ -517,6 +582,53 @@ fn main() -> ExitCode {
                     trust_local_executable,
                     timeout_seconds,
                 } => app.evidence_godot(&executable, trust_local_executable, timeout_seconds),
+                EvidenceCommand::Build { command } => match command {
+                    BuildEvidenceCommand::Dotnet {
+                        profile,
+                        executable,
+                        target,
+                        require_engine,
+                        trust_local_executable,
+                        trust_repository_build_code,
+                        timeout_seconds,
+                    } => app.evidence_build_dotnet(
+                        &executable,
+                        &profile,
+                        &target,
+                        require_engine,
+                        trust_local_executable,
+                        trust_repository_build_code,
+                        timeout_seconds,
+                    ),
+                    BuildEvidenceCommand::Rust {
+                        profile,
+                        executable,
+                        manifest,
+                        trust_local_executable,
+                        trust_repository_build_code,
+                        timeout_seconds,
+                    } => app.evidence_build_rust(
+                        &executable,
+                        &profile,
+                        &manifest,
+                        trust_local_executable,
+                        trust_repository_build_code,
+                        timeout_seconds,
+                    ),
+                    BuildEvidenceCommand::Python {
+                        profile,
+                        executable,
+                        source_root,
+                        trust_local_executable,
+                        timeout_seconds,
+                    } => app.evidence_build_python(
+                        &executable,
+                        &profile,
+                        &source_root,
+                        trust_local_executable,
+                        timeout_seconds,
+                    ),
+                },
             })
         }
         Command::Lineage { command } => App::open(cli.project_root).and_then(|app| match command {

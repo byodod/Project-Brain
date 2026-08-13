@@ -1323,7 +1323,7 @@ fn configure_provider_environment(
     command: &mut Command,
     repository_root: Option<&Path>,
 ) -> Result<(), AppError> {
-    const ALLOWED: [&str; 18] = [
+    const ALLOWED: [&str; 22] = [
         "SystemRoot",
         "WINDIR",
         "USERPROFILE",
@@ -1342,6 +1342,10 @@ fn configure_provider_environment(
         "LC_ALL",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramData",
+        "CommonProgramFiles",
     ];
     command
         .env_clear()

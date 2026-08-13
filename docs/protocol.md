@@ -205,6 +205,19 @@ Godot Engine Snapshot 使用固定 provider ID `godot-engine-resolver`；provide
 Godot version 与 executable SHA-256。Engine 导出的 diagnostics、load failure、missing dependency、
 unresolved UID 和 cache reference 都成为明确 finding，而不是依赖自由文本猜测。
 
+Build run schema v1 只允许内置 adapter 构造固定 argv：`dotnet-build`、`cargo-build` 与
+`python-compile`。provider ID 为 `adapter + profile_id`，provider version 绑定真实工具版本和
+executable SHA-256。`.NET` 与 Rust 的 execution class 是 `repository_build_code`；Python 是
+`compiler_only`，输出类型为 `validation_only`。RepositoryBuildCode 必须取得独立的显式信任位，
+不能从 executable 信任推导。
+
+Build Snapshot 的 `coverage` 描述观测是否完整，而不是进程是否成功。固定合同完整执行但返回非零时，
+保存 `complete + build_exit_failure(error)`；输出被截断、链接器/SDK/离线依赖或预还原状态不可用时，
+保存 `partial + build_unavailable(warning)`。成功的 ArtifactSet 合同没有普通产物时保存
+`required_artifact_missing(error)`。CLI 在这些情况下仍原子保存 Evidence 后返回非零。下游 Runtime
+必须检查 Build findings，而不能只检查 complete/fresh。Godot C# 的 Build Snapshot 还必须通过
+显式 `EvidenceReference` 固定其 Engine upstream。
+
 SQLite schema v13 为 Evidence Protocol 维护四类项目隔离记录：
 
 - `evidence_snapshots`：不可变完整快照；相同 project/plane/provider/fingerprint 只保存一次 JSON；

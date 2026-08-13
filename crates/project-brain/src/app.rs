@@ -11,12 +11,15 @@ use brain_core::{
     SemanticLanguageMapping, SemanticProviderFormat, SemanticProviderProfile, StopReconcileConfig,
     SymbolResolutionPolicy, normalize_project_path,
 };
+use brain_evidence::{
+    EvidenceAuthority, EvidenceCoverage, EvidenceFreshness, EvidencePlane, EvidenceReference,
+};
 use brain_store::{BrainStore, SemanticResolutionKind};
 use clap::ValueEnum;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    analyze,
+    analyze, build,
     claude::{self, ClaudeHookInput},
     codex::{self, CodexHookInput},
     error::AppError,
@@ -596,6 +599,130 @@ impl App {
             )?
         );
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn evidence_build_dotnet(
+        &self,
+        executable: &Path,
+        profile: &str,
+        target: &Path,
+        require_engine: bool,
+        trust_local_executable: bool,
+        trust_repository_build_code: bool,
+        timeout_seconds: u64,
+    ) -> Result<(), AppError> {
+        let upstream = if require_engine {
+            vec![self.required_engine_reference()?]
+        } else {
+            Vec::new()
+        };
+        let report = build::run_dotnet(&build::BuildRequest {
+            project_root: &self.root,
+            project_key: &self.config.project_key,
+            profile_id: profile,
+            executable,
+            target,
+            trust_local_executable,
+            trust_repository_build_code,
+            timeout_seconds,
+            upstream,
+        })?;
+        self.persist_build_report(&report)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn evidence_build_rust(
+        &self,
+        executable: &Path,
+        profile: &str,
+        manifest: &Path,
+        trust_local_executable: bool,
+        trust_repository_build_code: bool,
+        timeout_seconds: u64,
+    ) -> Result<(), AppError> {
+        let report = build::run_rust(&build::BuildRequest {
+            project_root: &self.root,
+            project_key: &self.config.project_key,
+            profile_id: profile,
+            executable,
+            target: manifest,
+            trust_local_executable,
+            trust_repository_build_code,
+            timeout_seconds,
+            upstream: Vec::new(),
+        })?;
+        self.persist_build_report(&report)
+    }
+
+    pub fn evidence_build_python(
+        &self,
+        executable: &Path,
+        profile: &str,
+        source_root: &Path,
+        trust_local_executable: bool,
+        timeout_seconds: u64,
+    ) -> Result<(), AppError> {
+        let report = build::run_python(&build::BuildRequest {
+            project_root: &self.root,
+            project_key: &self.config.project_key,
+            profile_id: profile,
+            executable,
+            target: source_root,
+            trust_local_executable,
+            trust_repository_build_code: false,
+            timeout_seconds,
+            upstream: Vec::new(),
+        })?;
+        self.persist_build_report(&report)
+    }
+
+    fn persist_build_report(&self, report: &build::BuildRunReport) -> Result<(), AppError> {
+        let succeeded = report.succeeded();
+        let persistence = self
+            .store
+            .apply_evidence_snapshot(report.evidence_snapshot())?;
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": 1,
+                "run": report,
+                "persistence": persistence,
+            }))?
+        );
+        if succeeded {
+            Ok(())
+        } else {
+            Err(AppError::Provider(
+                "Build Evidence 已保存失败或未完成结果；构建合同未通过".to_owned(),
+            ))
+        }
+    }
+
+    fn required_engine_reference(&self) -> Result<EvidenceReference, AppError> {
+        let candidates = self
+            .store
+            .list_evidence_head_summaries(&self.config.project_key)?
+            .into_iter()
+            .filter(|head| {
+                head.plane == EvidencePlane::Engine
+                    && head.freshness == EvidenceFreshness::Fresh
+                    && head.coverage == EvidenceCoverage::Complete
+                    && head.authority == EvidenceAuthority::Deterministic
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return Err(AppError::Provider(format!(
+                "--require-engine 需要且只允许一个 fresh+complete+deterministic Engine head，实际={}",
+                candidates.len()
+            )));
+        }
+        let head = &candidates[0];
+        Ok(EvidenceReference {
+            plane: EvidencePlane::Engine,
+            provider_id: head.provider_id.clone(),
+            snapshot_fingerprint: head.snapshot_fingerprint.clone(),
+        })
     }
 
     pub fn analyze(&self, base: &str) -> Result<(), AppError> {

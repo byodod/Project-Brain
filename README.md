@@ -16,7 +16,7 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - 按项目显式配置的 SCIP 导入与机器级安全 Runner，首批契约覆盖 rust-analyzer、scip-dotnet 与 scip-python；
 - 开放 language ID、逐文档语言映射和四态语义能力声明；
 - Project-scoped semantic lineage ledger、不可变证据与 append-only 显式裁决；
-- SQLite schema v1→v11 迁移、按项目隔离的符号 removed 历史与幂等增量更新；
+- SQLite schema v1→v13 迁移、按项目隔离的符号 removed 历史、Evidence ledger 与幂等增量更新；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
 ## 核心原则
@@ -269,6 +269,50 @@ Provider 应用新快照时会校验其显式 upstream fingerprint，并把失�
 `stale` 证据永远没有硬阻断资格。即便是 `fresh + complete + deterministic + error` finding，也仍须
 仓库规则显式提供 authority/strength/effect，Provider 本身不能自动 block。
 
+## Build Evidence Provider
+
+Build Evidence 与 Engine、Runtime 分开。仓库不能声明命令、参数、脚本或环境变量；CLI 只暴露
+Project Brain 内置的三种固定合同：
+
+```text
+project-brain evidence build dotnet \
+  --profile godot-debug \
+  --executable /absolute/path/to/dotnet \
+  --target game.csproj \
+  --require-engine \
+  --trust-local-executable \
+  --trust-repository-build-code
+
+project-brain evidence build rust \
+  --profile workspace-debug \
+  --executable /absolute/path/to/cargo \
+  --manifest Cargo.toml \
+  --trust-local-executable \
+  --trust-repository-build-code
+
+project-brain evidence build python \
+  --profile source-validation \
+  --executable /absolute/path/to/python \
+  --source-root . \
+  --trust-local-executable
+```
+
+.NET 固定执行 Debug、`--no-restore --no-incremental --disable-build-servers`，只接受单个 `.csproj`；
+已准备的 NuGet restore metadata 会复制到机器私有临时目录，bin/obj 也只写入该目录。Godot C# 可用
+`--require-engine` 强制引用唯一的 fresh、complete、deterministic Engine head。Rust 固定执行
+`cargo build --workspace --all-targets --frozen` 并使用临时 target。两者都可能执行仓库控制的
+MSBuild task、build.rs 或 proc macro，因此除了信任机器 executable，还必须单独确认
+`--trust-repository-build-code`。
+
+Python v1 是 `validation_only`：以 `-I -S -B` 启动 Project Brain 内置 bootstrap，对项目内 `.py`
+逐文件调用 `compile()`，不 import、不 exec、不构建 wheel。三种合同都会固定 executable SHA-256，
+清空并重建环境，比较运行前后 worktree 指纹，限制输出大小，并为临时产物生成文件级哈希清单。
+命令不会运行测试、应用或任何 export。
+
+`coverage=complete` 表示“完整观测了本次合同”，不表示构建成功。非零退出可同时是
+`complete + build_exit_failure`；工具链、链接器或预还原状态缺失则是
+`partial + build_unavailable`，不能冒充项目违规。CLI 会先保存这份失败证据再返回非零。
+
 手工验证适配器：
 
 ```text
@@ -454,7 +498,7 @@ Hook 硬阻断权。只有 `provider index` 通过当前机器已登记且哈希
 才追加 `trusted_provider` attestation；证明同时固定 registration ID、executable SHA-256、SCIP
 artifact SHA-256、Git HEAD 与完整 worktree 指纹。
 
-`doctor` 会读取 SQLite v11 中与快照同事务保存的 source manifest，并按当前 worktree/HEAD 重新计算
+`doctor` 会读取 SQLite 中与快照同事务保存的 source manifest，并按当前 worktree/HEAD 重新计算
 覆盖率。已有索引若为 `partial`、`stale`、损坏或来自未保存 manifest 的旧库，doctor 会降级并返回
 非零；尚未运行过索引只报告 `not_indexed` warning，不阻断首次 bootstrap。旧库迁移不会从符号表
 猜测文档清单；必须真实重跑一次 `provider index` 或 `index-scip` 才能补录 manifest。
@@ -601,7 +645,7 @@ crates/
 ├── brain-scip/       # 离线 SCIP protobuf、项目 profile 与语义快照
 ├── brain-store/      # SQLite schema 与审计
 ├── brain-symbols/    # Provider-neutral 符号、边、快照与身份协议
-└── project-brain/    # CLI、Git、Codex Hook 适配
+└── project-brain/    # CLI、Git、Agent adapters、机器级 Evidence runners
 ```
 
 进一步设计见：
@@ -613,8 +657,8 @@ crates/
 
 - Codex 与 Claude Code 已提供直接适配器、用户级 Hook 安装器和按 adapter 选择的 `doctor`；
   Prime Agent 已有独立 direct adapter，但用户级 Extension 安装器与 doctor 尚未实现。
-- Godot Engine Provider v1 已能运行真实 import/load 探针并生成 Engine Snapshot，但持久化与 Hook
-  新鲜度联动尚未完成，不能据此声称已具备引擎项目完整治理闭环。
+- Godot Engine Provider、Evidence ledger、Hook 失效传播以及 .NET/Rust/Python Build Provider v1 已完成；
+  Godot headless Runtime Evidence、测试结果与规则 finding 的显式映射仍未完成，不能声称完整治理闭环。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。
