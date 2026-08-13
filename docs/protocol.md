@@ -185,6 +185,17 @@ pre-tool 返回 `block/reason/context`，post-tool 返回 `feedback`，停止阶
 `supported=false` 的 continuation 描述。Project Brain 不因内部规则想继续而伪造 Prime 已支持
 settled continuation。
 
+## Evidence Protocol v1
+
+`brain-evidence` 将 `source/semantic/engine/build/runtime` 建模为独立 Evidence Plane。快照包含
+项目与 provider 身份、source fingerprint、独立 snapshot fingerprint、coverage、显式 upstream
+引用、ArtifactGraph 与 findings。下游只在当前源码和全部 upstream fingerprint 一致时为 fresh；
+缺少当前证据为 unknown，任一指纹不同为 stale。
+
+Artifact ID 绑定 `project_key + provider_id + provider_key`，边的两端必须同时存在于本快照。
+只有 deterministic provider 产生的 complete、fresh、error finding 才具有 hard-block 资格；
+资格仍不等于自动阻断，最终必须继续经过规则 authority/strength/effect 判定。
+
 ## AnalysisReport
 
 `project-brain analyze` 输出版本化报告。每个受支持文件包含：

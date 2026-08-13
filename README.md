@@ -564,6 +564,7 @@ project-brain rules symbol-scopes --rule ARCH-001
 crates/
 ├── brain-analyzer/   # Tree-sitter changed-symbol 提取
 ├── brain-core/       # 协议、规则验证、确定性决策
+├── brain-evidence/   # Source/Semantic/Engine/Build/Runtime 证据与 ArtifactGraph 协议
 ├── brain-scip/       # 离线 SCIP protobuf、项目 profile 与语义快照
 ├── brain-store/      # SQLite schema 与审计
 ├── brain-symbols/    # Provider-neutral 符号、边、快照与身份协议
@@ -579,6 +580,8 @@ crates/
 
 - Codex 与 Claude Code 已提供直接适配器、用户级 Hook 安装器和按 adapter 选择的 `doctor`；
   Prime Agent 已有独立 direct adapter，但用户级 Extension 安装器与 doctor 尚未实现。
+- `brain-evidence` 已定义分层证据与 ArtifactGraph 协议，但 Godot Engine Provider、持久化与 Hook
+  新鲜度联动尚未完成，不能据此声称已具备引擎项目完整真相。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。

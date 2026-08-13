@@ -67,6 +67,11 @@ Tracked + unignored files
 `brain-symbols` 只定义 Provider、节点、边、快照和身份质量；它不依赖 Tree-sitter、
 Git 或 SQLite。`brain-analyzer` 与 `brain-scip` 是 Provider，`brain-store` 只消费完整快照。
 
+引擎、构建与运行时事实走独立的 `brain-evidence` 协议。它把 Source、Semantic、Engine、Build、
+Runtime 作为不同 Evidence Plane，并用 ArtifactGraph 表达场景、资源、脚本绑定、构建产物和运行
+场景。每个下游快照记录实际消费的 upstream fingerprint；源码或任一上游变化都会使证据 stale。
+SymbolGraph 与 ArtifactGraph 不共享身份，后续只能通过显式 evidence edge 连接。
+
 SCIP 路径以 `project_key + semantic provider profile ID + producer + contract_version` 建立
 Provider 命名空间，并把规范化 language ID 写入 provider key。语言映射逐 Document 执行，
 因此单一 scip-dotnet index 可同时容纳 C# 与 Visual Basic。Producer 自身版本只作为 provenance
@@ -208,8 +213,9 @@ Extension 安装器仍留在后续阶段。
 4. Claude Code 已覆盖安装后 exec-form handler 的真实子进程 fixture；Prime Agent 独立 direct
    adapter 已完成，下一步增加原子 Extension 安装与真实 Prime runtime fixture。按 adapter 选择的
    doctor 已由 ADR-0016 完成。
-5. 引擎型项目需要 Source、Semantic、Engine、Build、Runtime 分层 Evidence Plane；下一阶段先定义
-   provider-neutral 契约，再以 Godot Engine Evidence Provider v1 验证，不能把 `.godot/` 缓存当权威。
+5. Source、Semantic、Engine、Build、Runtime 分层 Evidence Plane 与独立 ArtifactGraph 已由
+   `brain-evidence` 定义；下一阶段以 Godot Engine Evidence Provider v1 验证，不能把 `.godot/`
+   缓存当权威。
 6. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
    直接 hard block。
 
@@ -224,4 +230,5 @@ Extension 安装器仍留在后续阶段。
 [ADR-0009](adr/0009-symbol-scoped-hard-gates.md)、
 [ADR-0010](adr/0010-semantic-source-coverage.md)、
 [ADR-0011](adr/0011-complete-only-and-provider-stability.md) 与
-[ADR-0012](adr/0012-group-first-lineage-and-signature-evidence.md)。
+[ADR-0012](adr/0012-group-first-lineage-and-signature-evidence.md)，以及
+[ADR-0019](adr/0019-evidence-planes-and-artifact-graph.md)。
