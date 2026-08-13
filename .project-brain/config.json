@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "project_name": "Project Brain",
+  "rules": [
+    {
+      "id": "PB-CORE-001",
+      "status": "active",
+      "authority": "repository_rule",
+      "strength": "hard",
+      "effect": "block",
+      "include_paths": [
+        ".project-brain/config.json"
+      ],
+      "exclude_paths": [],
+      "actions": [
+        "delete"
+      ],
+      "operations": [],
+      "operation_contains": [],
+      "message": "禁止通过普通删除操作移除 Project Brain 的项目规则配置",
+      "rationale": "规则控制面必须通过显式的规则修订流程变更"
+    },
+    {
+      "id": "PB-CORE-002",
+      "status": "active",
+      "authority": "repository_rule",
+      "strength": "soft",
+      "effect": "inject_context",
+      "include_paths": [
+        ".project-brain"
+      ],
+      "exclude_paths": [
+        ".project-brain/brain.db"
+      ],
+      "actions": [
+        "create",
+        "modify"
+      ],
+      "operations": [],
+      "operation_contains": [],
+      "message": "正在修改项目决策控制面；请保持 schema_version、authority 与 lifecycle 语义兼容",
+      "rationale": "控制面规则变化会影响后续所有 Agent 行为"
+    },
+    {
+      "id": "PB-CORE-003",
+      "status": "active",
+      "authority": "repository_rule",
+      "strength": "hard",
+      "effect": "block",
+      "include_paths": [],
+      "exclude_paths": [],
+      "actions": [
+        "delete"
+      ],
+      "operations": [
+        "Bash"
+      ],
+      "operation_contains": [
+        ".project-brain/config.json",
+        ".project-brain\\config.json"
+      ],
+      "message": "禁止通过 shell 删除 Project Brain 的项目规则配置",
+      "rationale": "无结构化路径参数的 shell 删除需要单独匹配命令载荷"
+    }
+  ]
+}

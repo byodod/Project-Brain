@@ -1,0 +1,11 @@
+{
+  "session_id": "smoke-session",
+  "cwd": "E:/Github/Tools/Project Brain",
+  "hook_event_name": "PreToolUse",
+  "turn_id": "smoke-turn-modify",
+  "tool_name": "apply_patch",
+  "tool_use_id": "smoke-tool-modify",
+  "tool_input": {
+    "command": "*** Begin Patch\n*** Update File: .project-brain/config.json\n*** End Patch"
+  }
+}

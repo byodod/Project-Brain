@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "event_id": "smoke-preflight",
+  "session_id": "smoke-session",
+  "cwd": "E:/Github/Tools/Project Brain",
+  "action": "modify",
+  "operation": "apply_patch",
+  "target_files": [
+    "crates/brain-core/src/model.rs"
+  ]
+}

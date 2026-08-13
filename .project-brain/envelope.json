@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "intent": "开发 Project Brain 确定性 Runtime",
+  "allowed_paths": [
+    ".gitattributes",
+    ".gitignore",
+    ".project-brain",
+    "Cargo.lock",
+    "Cargo.toml",
+    "README.md",
+    "crates",
+    "docs",
+    "examples",
+    "rustfmt.toml"
+  ],
+  "forbidden_paths": [
+    ".git"
+  ]
+}

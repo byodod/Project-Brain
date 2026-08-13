@@ -1,0 +1,271 @@
+use std::{
+    env, fs,
+    io::{self, Read},
+    path::{Path, PathBuf},
+};
+
+use brain_core::{
+    ActionDescriptor, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, DecisionKind, MemoryStatus,
+    Rule, RuleEffect, RuleEngine, RuleStrength,
+};
+use brain_store::BrainStore;
+use clap::ValueEnum;
+
+use crate::{
+    codex::{self, CodexHookInput},
+    error::AppError,
+    reconcile,
+};
+
+const BRAIN_DIRECTORY: &str = ".project-brain";
+const CONFIG_FILE: &str = "config.json";
+const DATABASE_FILE: &str = "brain.db";
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AgentKind {
+    Codex,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum HookEvent {
+    SessionStart,
+    PreToolUse,
+    PostToolUse,
+    Stop,
+}
+
+pub struct App {
+    root: PathBuf,
+    config: BrainConfig,
+    store: BrainStore,
+}
+
+impl App {
+    pub fn init(explicit_root: Option<PathBuf>) -> Result<(), AppError> {
+        let root = explicit_root.unwrap_or(env::current_dir()?);
+        let brain_dir = root.join(BRAIN_DIRECTORY);
+        let config_path = brain_dir.join(CONFIG_FILE);
+        if config_path.exists() {
+            return Err(AppError::AlreadyInitialized(config_path));
+        }
+
+        fs::create_dir_all(&brain_dir)?;
+        let project_name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("project")
+            .to_owned();
+        let config = initial_config(project_name);
+        config.validate()?;
+        fs::write(&config_path, pretty_json(&config)?)?;
+        fs::write(
+            brain_dir.join(".gitignore"),
+            "brain.db\nbrain.db-shm\nbrain.db-wal\n",
+        )?;
+        fs::write(
+            brain_dir.join("envelope.json"),
+            pretty_json(&reconcile::ChangeEnvelope::example())?,
+        )?;
+        BrainStore::open(&brain_dir.join(DATABASE_FILE))?;
+
+        println!("Project Brain 已初始化：{}", brain_dir.display());
+        Ok(())
+    }
+
+    pub fn open(explicit_root: Option<PathBuf>) -> Result<Self, AppError> {
+        let start = explicit_root.unwrap_or(env::current_dir()?);
+        let root = discover_root(&start).ok_or(AppError::ProjectNotInitialized)?;
+        let brain_dir = root.join(BRAIN_DIRECTORY);
+        let config: BrainConfig = serde_json::from_slice(&fs::read(brain_dir.join(CONFIG_FILE))?)?;
+        config.validate()?;
+        let store = BrainStore::open(&brain_dir.join(DATABASE_FILE))?;
+        Ok(Self {
+            root,
+            config,
+            store,
+        })
+    }
+
+    pub fn preflight(&self) -> Result<(), AppError> {
+        let action: ActionDescriptor = read_stdin_json()?;
+        let decision = RuleEngine::new(&self.config)?.evaluate(&action)?;
+        self.store.record("preflight", &action, &decision)?;
+        println!("{}", pretty_json(&decision)?);
+        Ok(())
+    }
+
+    pub fn hook(&self, agent: AgentKind, event: HookEvent) -> Result<(), AppError> {
+        match agent {
+            AgentKind::Codex => {
+                let input: CodexHookInput = read_stdin_json()?;
+                let output = codex::handle(&self.root, &self.config, &self.store, event, &input)?;
+                println!("{}", pretty_json(&output)?);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn reconcile(&self, base: &str, envelope: &Path) -> Result<(), AppError> {
+        let envelope_path = if envelope.is_absolute() {
+            envelope.to_owned()
+        } else {
+            self.root.join(envelope)
+        };
+        let envelope: reconcile::ChangeEnvelope =
+            serde_json::from_slice(&fs::read(envelope_path)?)?;
+        let report = reconcile::evaluate(&self.root, base, &envelope)?;
+        println!("{}", pretty_json(&report)?);
+        Ok(())
+    }
+
+    pub fn audit(&self, limit: u32) -> Result<(), AppError> {
+        println!("{}", pretty_json(&self.store.recent_audit(limit)?)?);
+        Ok(())
+    }
+}
+
+fn initial_config(project_name: String) -> BrainConfig {
+    BrainConfig {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        project_name,
+        rules: vec![
+            Rule {
+                id: "PB-CORE-001".to_owned(),
+                status: MemoryStatus::Active,
+                authority: Authority::RepositoryRule,
+                strength: RuleStrength::Hard,
+                effect: RuleEffect::Block,
+                include_paths: vec![format!("{BRAIN_DIRECTORY}/{CONFIG_FILE}")],
+                exclude_paths: Vec::new(),
+                actions: vec![brain_core::ActionKind::Delete],
+                operations: Vec::new(),
+                operation_contains: Vec::new(),
+                message: "禁止通过普通删除操作移除 Project Brain 的项目规则配置".to_owned(),
+                rationale: "规则控制面必须通过显式的规则修订流程变更".to_owned(),
+            },
+            Rule {
+                id: "PB-CORE-002".to_owned(),
+                status: MemoryStatus::Active,
+                authority: Authority::RepositoryRule,
+                strength: RuleStrength::Soft,
+                effect: RuleEffect::InjectContext,
+                include_paths: vec![BRAIN_DIRECTORY.to_owned()],
+                exclude_paths: vec![format!("{BRAIN_DIRECTORY}/brain.db")],
+                actions: vec![
+                    brain_core::ActionKind::Create,
+                    brain_core::ActionKind::Modify,
+                ],
+                operations: Vec::new(),
+                operation_contains: Vec::new(),
+                message:
+                    "正在修改项目决策控制面；请保持 schema_version、authority 与 lifecycle 语义兼容"
+                        .to_owned(),
+                rationale: "控制面规则变化会影响后续所有 Agent 行为".to_owned(),
+            },
+            Rule {
+                id: "PB-CORE-003".to_owned(),
+                status: MemoryStatus::Active,
+                authority: Authority::RepositoryRule,
+                strength: RuleStrength::Hard,
+                effect: RuleEffect::Block,
+                include_paths: Vec::new(),
+                exclude_paths: Vec::new(),
+                actions: vec![brain_core::ActionKind::Delete],
+                operations: vec!["Bash".to_owned()],
+                operation_contains: vec![
+                    ".project-brain/config.json".to_owned(),
+                    ".project-brain\\config.json".to_owned(),
+                ],
+                message: "禁止通过 shell 删除 Project Brain 的项目规则配置".to_owned(),
+                rationale: "无结构化路径参数的 shell 删除需要单独匹配命令载荷".to_owned(),
+            },
+        ],
+    }
+}
+
+fn discover_root(start: &Path) -> Option<PathBuf> {
+    start.ancestors().find_map(|candidate| {
+        candidate
+            .join(BRAIN_DIRECTORY)
+            .join(CONFIG_FILE)
+            .is_file()
+            .then(|| candidate.to_owned())
+    })
+}
+
+fn read_stdin_json<T>() -> Result<T, AppError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    Ok(serde_json::from_str(&input)?)
+}
+
+fn pretty_json<T: serde::Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    let mut output = serde_json::to_string_pretty(value)?;
+    output.push('\n');
+    Ok(output)
+}
+
+pub fn decision_reason(decision: &brain_core::Decision) -> String {
+    if decision.evidence.is_empty() {
+        return decision.summary.clone();
+    }
+    decision
+        .evidence
+        .iter()
+        .map(|evidence| format!("{}: {}", evidence.rule_id, evidence.message))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn should_deny(decision: &brain_core::Decision) -> bool {
+    matches!(
+        decision.decision,
+        DecisionKind::Block | DecisionKind::Escalate
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{App, discover_root};
+
+    #[test]
+    fn missing_marker_does_not_guess_a_project_root() {
+        assert_eq!(
+            discover_root(Path::new("Z:/definitely/not/a/project")),
+            None
+        );
+    }
+
+    #[test]
+    fn init_creates_a_reopenable_project_without_tracking_the_database() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "project-brain-init-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+
+        App::init(Some(root.clone())).unwrap();
+
+        assert!(root.join(".project-brain/config.json").is_file());
+        assert!(root.join(".project-brain/envelope.json").is_file());
+        assert!(root.join(".project-brain/brain.db").is_file());
+        let ignore = fs::read_to_string(root.join(".project-brain/.gitignore")).unwrap();
+        assert!(ignore.lines().any(|line| line == "brain.db"));
+        assert!(App::open(Some(root.clone())).is_ok());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
