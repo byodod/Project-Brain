@@ -46,6 +46,15 @@ pub enum AppError {
     #[error("SCIP 导入不符合当前项目 language profile：{0}")]
     ScipProfileMismatch(String),
 
+    #[error("机器级安装或项目 bootstrap 失败：{0}")]
+    Setup(String),
+
+    #[error("Codex Hook 集成发生漂移，拒绝覆盖：{0}")]
+    IntegrationDrift(PathBuf),
+
+    #[error("目标在写入期间被并发修改，拒绝覆盖：{0}")]
+    ConcurrentModification(PathBuf),
+
     #[error("Git 命令失败：{0}")]
     Git(String),
 }

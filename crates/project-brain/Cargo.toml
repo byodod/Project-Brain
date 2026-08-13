@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+atomic-write-file.workspace = true
 brain-analyzer = { path = "../brain-analyzer" }
 brain-core = { path = "../brain-core" }
 brain-scip = { path = "../brain-scip" }

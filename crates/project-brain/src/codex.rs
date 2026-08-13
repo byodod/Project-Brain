@@ -47,6 +47,12 @@ pub struct CodexHookInput {
     stop_hook_active: bool,
 }
 
+impl CodexHookInput {
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(transparent)]
 pub struct CodexHookOutput(Value);

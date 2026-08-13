@@ -7,6 +7,7 @@ mod index;
 mod protocol;
 mod reconcile;
 mod scip_index;
+mod setup;
 
 use std::{path::PathBuf, process::ExitCode};
 
@@ -21,18 +22,54 @@ struct Cli {
     #[arg(long, global = true)]
     project_root: Option<PathBuf>,
 
+    /// 机器级安装根；主要用于测试、便携安装和管理员部署
+    #[arg(long, global = true)]
+    install_root: Option<PathBuf>,
+
+    /// Codex 配置根；省略时使用 `CODEX_HOME` 或 `~/.codex`
+    #[arg(long, global = true)]
+    codex_home: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// 把当前版本安装到机器级稳定 launcher 与版本化 payload 目录
+    Install,
+
+    /// 原子切回安装清单中的上一版本，不修改 Hook 定义
+    Rollback,
+
     /// 初始化仓库级 Project Brain 配置；语言能力只能通过显式 profile 声明
     Init {
         /// 可重复指定 rust、dotnet、python；省略时创建不含语言假设的基础配置
         #[arg(long, value_enum)]
         profile: Vec<ProjectProfile>,
     },
+
+    /// 将已初始化项目注册到当前机器，并可安装 Codex 用户级 dispatcher
+    Bootstrap {
+        #[arg(long)]
+        codex: bool,
+    },
+
+    /// 安装用户级 Agent lifecycle dispatcher
+    InstallHooks { agent: AgentKind },
+
+    /// 只移除 Project Brain 管理的用户级 lifecycle dispatcher
+    UninstallHooks {
+        agent: AgentKind,
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// 用户级 Hook 入口；未注册项目静默 NO-OP
+    Dispatch { agent: AgentKind, event: HookEvent },
+
+    /// 检查安装、项目注册、Codex Hook 与本地存储就绪状态
+    Doctor,
 
     /// 从标准输入读取 `ActionDescriptor` 并输出通用决策 JSON
     Preflight,
@@ -169,9 +206,42 @@ impl From<LineageStateArg> for brain_symbols::LineageState {
 }
 
 fn main() -> ExitCode {
+    match setup::delegate_if_installed_launcher() {
+        Ok(Some(exit_code)) => return exit_code,
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("project-brain: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
     let cli = Cli::parse();
     let result = match cli.command {
+        Command::Install => App::install_machine(cli.install_root.as_deref()),
+        Command::Rollback => App::rollback_machine(cli.install_root.as_deref()),
         Command::Init { profile } => App::init(cli.project_root, &profile),
+        Command::Bootstrap { codex } => App::open(cli.project_root).and_then(|app| {
+            app.bootstrap(
+                cli.install_root.as_deref(),
+                cli.codex_home.as_deref(),
+                codex,
+            )
+        }),
+        Command::InstallHooks { agent } => App::install_hooks(
+            cli.install_root.as_deref(),
+            cli.codex_home.as_deref(),
+            agent,
+        ),
+        Command::UninstallHooks { agent, force } => App::uninstall_hooks(
+            cli.install_root.as_deref(),
+            cli.codex_home.as_deref(),
+            agent,
+            force,
+        ),
+        Command::Dispatch { agent, event } => {
+            App::dispatch_hook(cli.install_root.as_deref(), agent, event)
+        }
+        Command::Doctor => App::open(cli.project_root)
+            .and_then(|app| app.doctor(cli.install_root.as_deref(), cli.codex_home.as_deref())),
         Command::Preflight => App::open(cli.project_root).and_then(|app| app.preflight()),
         Command::Hook { agent, event } => App::run_hook(cli.project_root, agent, event),
         Command::Capabilities { agent } => App::capabilities(agent),

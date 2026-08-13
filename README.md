@@ -46,6 +46,32 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release --locked -p project-brain
 ```
 
+## 机器级安装
+
+生产使用先执行：
+
+```text
+project-brain install
+```
+
+它把当前版本安装为“稳定 launcher + 版本化 payload”。默认根目录为：
+
+```text
+Windows  %LOCALAPPDATA%\ProjectBrain
+Linux    ${XDG_DATA_HOME:-~/.local/share}/project-brain
+macOS    ~/Library/Application Support/ProjectBrain
+```
+
+Hook 永远调用稳定 launcher 的绝对路径，不依赖 `PATH`。`--install-root` 只用于便携安装、
+测试或管理员部署。同一版本目录不可被不同二进制覆盖；新版本通过新版本号并排安装。需要
+回退时执行：
+
+```text
+project-brain rollback
+```
+
+它只原子切换安装清单中的 `current / previous`，稳定 launcher 与 Codex Hook 定义保持不变。
+
 ## 快速开始
 
 在目标仓库根目录执行：
@@ -105,7 +131,29 @@ project-brain preflight
 
 ## Codex Hook 接入
 
-将 [examples/codex-hooks.json](examples/codex-hooks.json) 复制或合并到仓库的 `.codex/hooks.json`，并确保 `project-brain` 在 `PATH` 中。示例配置使用同步 `PreToolUse`，因此硬规则可以在工具执行前拒绝调用。
+项目初始化并提交配置后，每台开发机器执行：
+
+```text
+project-brain bootstrap --codex
+```
+
+它把项目根和已提交的 `project_key` 注册到机器本地，并将 Project Brain dispatcher 结构化合并
+到用户级 `~/.codex/hooks.json`。已有用户 Hook、未知顶层字段和 matcher group 都会保留；重复
+执行不添加副本。未注册项目会静默 NO-OP，项目仓库不再保存开发机绝对路径。
+
+Codex 会按 Hook 精确定义哈希要求审核非托管命令 Hook。安装后若 Codex 提示待审核，请在
+`/hooks` 中检查并信任；`doctor` 会诚实报告该信任状态无法通过正式机器接口验证。
+
+```text
+project-brain doctor
+project-brain uninstall-hooks codex
+```
+
+卸载只删除 manifest 中精确记录的 Project Brain handler，保留用户后来增加的 Hook。检测到
+人工修改或重复 handler 时默认返回 Integration Drift，不覆盖用户配置。
+
+[examples/codex-hooks.json](examples/codex-hooks.json) 仅保留为 adapter 协议演示，不是生产安装方案。
+示例使用同步 `PreToolUse`，因此硬规则可以在工具执行前拒绝调用。
 
 查看当前 Codex adapter 明确声明的能力：
 

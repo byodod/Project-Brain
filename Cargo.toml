@@ -17,6 +17,7 @@ license = "MIT OR Apache-2.0"
 authors = ["Project Brain contributors"]
 
 [workspace.dependencies]
+atomic-write-file = "=0.3.0"
 clap = { version = "4.6.6", features = ["derive"] }
 protobuf = "=3.7.2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }

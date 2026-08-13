@@ -17,12 +17,13 @@ use crate::{
     analyze,
     codex::{self, CodexHookInput},
     error::AppError,
-    index, reconcile, scip_index,
+    index, reconcile, scip_index, setup,
 };
 
 const BRAIN_DIRECTORY: &str = ".project-brain";
 const CONFIG_FILE: &str = "config.json";
 const DATABASE_FILE: &str = "brain.db";
+const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum AgentKind {
@@ -55,6 +56,126 @@ pub struct App {
 }
 
 impl App {
+    pub fn install_machine(install_root: Option<&Path>) -> Result<(), AppError> {
+        println!("{}", pretty_json(&setup::install(install_root)?)?);
+        Ok(())
+    }
+
+    pub fn rollback_machine(install_root: Option<&Path>) -> Result<(), AppError> {
+        println!("{}", pretty_json(&setup::rollback(install_root)?)?);
+        Ok(())
+    }
+
+    pub fn install_hooks(
+        install_root: Option<&Path>,
+        codex_home: Option<&Path>,
+        agent: AgentKind,
+    ) -> Result<(), AppError> {
+        match agent {
+            AgentKind::Codex => {
+                println!(
+                    "{}",
+                    pretty_json(&setup::install_codex_hooks(install_root, codex_home)?)?
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn uninstall_hooks(
+        install_root: Option<&Path>,
+        codex_home: Option<&Path>,
+        agent: AgentKind,
+        force: bool,
+    ) -> Result<(), AppError> {
+        match agent {
+            AgentKind::Codex => {
+                println!(
+                    "{}",
+                    pretty_json(&setup::uninstall_codex_hooks(
+                        install_root,
+                        codex_home,
+                        force,
+                    )?)?
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn bootstrap(
+        &self,
+        install_root: Option<&Path>,
+        codex_home: Option<&Path>,
+        install_codex: bool,
+    ) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&setup::bootstrap(
+                install_root,
+                codex_home,
+                &self.root,
+                &self.config.project_key,
+                install_codex,
+            )?)?
+        );
+        Ok(())
+    }
+
+    pub fn doctor(
+        &self,
+        install_root: Option<&Path>,
+        codex_home: Option<&Path>,
+    ) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&setup::doctor(
+                install_root,
+                codex_home,
+                &self.root,
+                &self.config.project_key,
+            ))?
+        );
+        Ok(())
+    }
+
+    pub fn dispatch_hook(
+        install_root: Option<&Path>,
+        agent: AgentKind,
+        event: HookEvent,
+    ) -> Result<(), AppError> {
+        match agent {
+            AgentKind::Codex => {
+                // 用户级 dispatcher 会在所有 Codex 项目中运行；无法解析的输入既不能定位
+                // 已注册项目，也不能安全执行治理逻辑，因此保持静默 NO-OP。
+                let input: CodexHookInput = match read_stdin_json_limited(MAX_HOOK_INPUT_BYTES) {
+                    Ok(input) => input,
+                    Err(_) => return Ok(()),
+                };
+                let Some((root, registered_project_key)) =
+                    setup::registered_project_for_cwd(install_root, Path::new(input.cwd()))?
+                else {
+                    return Ok(());
+                };
+                let app = Self::open(Some(root))?;
+                if app.config.project_key != registered_project_key {
+                    let error = format!(
+                        "本机注册 project_key={} 与仓库 project_key={} 不一致",
+                        registered_project_key, app.config.project_key
+                    );
+                    if let Some(output) = codex::failure_output(event, &input, &error) {
+                        println!("{}", pretty_json(&output)?);
+                        return Ok(());
+                    }
+                    return Err(AppError::Setup(error));
+                }
+                let output = codex::handle(&app.root, &app.config, &app.store, event, &input)?;
+                println!("{}", pretty_json(&output)?);
+                Ok(())
+            }
+        }
+    }
+
     pub fn capabilities(agent: AgentKind) -> Result<(), AppError> {
         let capabilities = match agent {
             AgentKind::Codex => codex::capabilities(),
@@ -498,6 +619,20 @@ where
 {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
+    Ok(serde_json::from_str(&input)?)
+}
+
+fn read_stdin_json_limited<T>(limit: u64) -> Result<T, AppError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut input = String::new();
+    io::stdin().take(limit + 1).read_to_string(&mut input)?;
+    if input.len() as u64 > limit {
+        return Err(AppError::Setup(format!(
+            "Hook 输入超过最大允许字节数：{limit}"
+        )));
+    }
     Ok(serde_json::from_str(&input)?)
 }
 
