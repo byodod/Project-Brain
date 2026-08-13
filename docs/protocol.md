@@ -219,6 +219,20 @@ Build Snapshot 的 `coverage` 描述观测是否完整，而不是进程是否�
 显式 `EvidenceReference` 固定其 Engine upstream。`.NET` manifest 只覆盖最终 bin output；包含
 scratch 绝对路径的 obj cache 是执行中间态，不进入 artifact identity。
 
+成功的 Godot C# Build 在 scratch 回收前创建 `RuntimeArtifactBundle v1`。bundle 的规范 JSON 包含
+`project_key`、Build provider、Source fingerprint、ArtifactManifest fingerprint、排序后的全部最终
+文件 `(relative_path,size,sha256)`，以及从 `project.godot` 明确解析出的主程序集路径与 SHA-256。
+每个文件以 SHA-256 为 key 原子写入机器级 CAS；同名 object 或 manifest 若内容不符即视为损坏并
+fail closed。Build Evidence 中的 `runtime_artifact_bundle` 节点绑定完整规范 JSON 字节，不记录 CAS
+绝对路径或把当前可用性写进不可变事实。
+
+CAS 的 Present/Evicted/Corrupt 是机器运行状态，不改写历史 Build Evidence。Runtime 必须在准备时
+重新校验 bundle manifest 与全部 object；缺失、逐出或损坏只会拒绝本次 Runtime 准备，不会自动
+重建并冒充原 Build。v1 Runtime 禁止 restore、build、test、script 与全部 export/release 路径。
+CAS 提升失败时仍保存已完成的 Build 观测，但状态为 `incomplete` 并加入
+`runtime_bundle_unavailable(warning)`；错误文本只以 fingerprint 进入 Evidence，避免把机器绝对路径
+写入不可变快照。该 Build 不能供 Runtime 使用。
+
 SQLite schema v13 为 Evidence Protocol 维护四类项目隔离记录：
 
 - `evidence_snapshots`：不可变完整快照；相同 project/plane/provider/fingerprint 只保存一次 JSON；

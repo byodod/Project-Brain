@@ -1,5 +1,6 @@
 mod analyze;
 mod app;
+mod artifact_store;
 mod build;
 mod claude;
 mod codex;
@@ -592,6 +593,7 @@ fn main() -> ExitCode {
                         trust_repository_build_code,
                         timeout_seconds,
                     } => app.evidence_build_dotnet(
+                        cli.install_root.as_deref(),
                         &executable,
                         &profile,
                         &target,
@@ -608,6 +610,7 @@ fn main() -> ExitCode {
                         trust_repository_build_code,
                         timeout_seconds,
                     } => app.evidence_build_rust(
+                        cli.install_root.as_deref(),
                         &executable,
                         &profile,
                         &manifest,
@@ -622,6 +625,7 @@ fn main() -> ExitCode {
                         trust_local_executable,
                         timeout_seconds,
                     } => app.evidence_build_python(
+                        cli.install_root.as_deref(),
                         &executable,
                         &profile,
                         &source_root,

@@ -238,8 +238,9 @@ Extension 安装器仍留在后续阶段。
    doctor 已由 ADR-0016 完成。
 5. Source、Semantic、Engine、Build、Runtime 分层 Evidence Plane、独立 ArtifactGraph、SQLite
    快照/attestation/head/staleness ledger 与 Hook 新鲜度提示已经完成；Godot Engine 以及
-   .NET/Rust/Python Build Evidence Provider v1 已通过真实项目验证。下一阶段实现 Godot headless
-   Runtime Provider 和规则到 finding 的显式映射。
+   .NET/Rust/Python Build Evidence Provider v1 已通过真实项目验证；Godot C# 最终产物还会提升到
+   机器级内容寻址存储，以不可变 RuntimeArtifactBundle 绑定精确文件字节与主程序集。下一阶段从该
+   bundle 建立隔离 Godot headless Runtime Provider 和规则到 finding 的显式映射。
 6. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
    直接 hard block。
 
@@ -259,4 +260,5 @@ Extension 安装器仍留在后续阶段。
 [ADR-0020](adr/0020-godot-engine-evidence-provider.md) 与
 [ADR-0021](adr/0021-evidence-ledger-and-hook-staleness.md)、
 [ADR-0022](adr/0022-evidence-upstream-freshness-propagation.md) 与
-[ADR-0023](adr/0023-fixed-build-evidence-providers.md)。
+[ADR-0023](adr/0023-fixed-build-evidence-providers.md) 与
+[ADR-0024](adr/0024-content-addressed-runtime-bundles.md)。

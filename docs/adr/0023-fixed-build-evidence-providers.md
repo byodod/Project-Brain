@@ -33,6 +33,8 @@ finding，后者只能 advisory。对于 Godot C#，编译事实必须引用已�
 8. `coverage=complete` 不代表成功。项目构建错误为 complete error finding；工具链/准备状态不可用为
    partial warning finding。失败证据先持久化，CLI 再返回非零。
 9. Godot C# 可要求唯一 fresh+complete+deterministic Engine head，并把该 fingerprint 写入 upstream。
+10. 成功的 Godot C# 最终输出必须在 scratch 删除前提升为机器级内容寻址 RuntimeArtifactBundle；
+    精确运行绑定的完整合同见 ADR-0024。
 
 ## 验证
 
@@ -46,6 +48,7 @@ finding，后者只能 advisory。对于 Godot C#，编译事实必须引用已�
 
 ## 后果
 
-- Runtime Provider 可引用一份明确成功、无 error finding 的 Build Snapshot，而不会把 complete 误读为成功。
+- Runtime Provider 可引用一份明确成功、无 error finding 且精确产物仍可验证的 Build Snapshot，而不会把
+  complete 误读为成功，也不会重新构建后冒充旧 Build。
 - 构建不会隐式下载依赖、运行测试、启动应用或执行引擎 export。
 - v1 `.NET` 暂不接受多项目 solution；多项目必须先定义逐项目 restore/output 隔离与聚合身份。

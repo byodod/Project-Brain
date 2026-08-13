@@ -604,6 +604,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn evidence_build_dotnet(
         &self,
+        install_root: Option<&Path>,
         executable: &Path,
         profile: &str,
         target: &Path,
@@ -619,6 +620,7 @@ impl App {
         };
         let report = build::run_dotnet(&build::BuildRequest {
             project_root: &self.root,
+            install_root,
             project_key: &self.config.project_key,
             profile_id: profile,
             executable,
@@ -634,6 +636,7 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     pub fn evidence_build_rust(
         &self,
+        install_root: Option<&Path>,
         executable: &Path,
         profile: &str,
         manifest: &Path,
@@ -643,6 +646,7 @@ impl App {
     ) -> Result<(), AppError> {
         let report = build::run_rust(&build::BuildRequest {
             project_root: &self.root,
+            install_root,
             project_key: &self.config.project_key,
             profile_id: profile,
             executable,
@@ -657,6 +661,7 @@ impl App {
 
     pub fn evidence_build_python(
         &self,
+        install_root: Option<&Path>,
         executable: &Path,
         profile: &str,
         source_root: &Path,
@@ -665,6 +670,7 @@ impl App {
     ) -> Result<(), AppError> {
         let report = build::run_python(&build::BuildRequest {
             project_root: &self.root,
+            install_root,
             project_key: &self.config.project_key,
             profile_id: profile,
             executable,

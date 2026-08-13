@@ -310,6 +310,12 @@ Python v1 是 `validation_only`：以 `-I -S -B` 启动 Project Brain 内置 boo
 .NET 的 `obj` 路径相关 cache 不进入权威产物清单。
 命令不会运行测试、应用或任何 export。
 
+成功的 Godot C# Build 还会在 machine scratch 删除前，将最终输出闭包逐文件按 SHA-256 原子提升到
+机器级 content-addressed store，并生成绑定 `project_key`、Build provider、Source fingerprint、
+完整相对路径清单与 Godot 主程序集的不可变 RuntimeArtifactBundle。Evidence 只保存内容身份，不保存
+机器绝对路径。Runtime 不允许重新构建后冒充该 Build；它只能重新校验并物化 bundle 的精确字节。
+当前 store 不执行隐式 GC；object 缺失或损坏只会令 Runtime 拒绝准备。
+
 `coverage=complete` 表示“完整观测了本次合同”，不表示构建成功。非零退出可同时是
 `complete + build_exit_failure`；工具链、链接器或预还原状态缺失则是
 `partial + build_unavailable`，不能冒充项目违规。CLI 会先保存这份失败证据再返回非零。
@@ -658,8 +664,9 @@ crates/
 
 - Codex 与 Claude Code 已提供直接适配器、用户级 Hook 安装器和按 adapter 选择的 `doctor`；
   Prime Agent 已有独立 direct adapter，但用户级 Extension 安装器与 doctor 尚未实现。
-- Godot Engine Provider、Evidence ledger、Hook 失效传播以及 .NET/Rust/Python Build Provider v1 已完成；
-  Godot headless Runtime Evidence、测试结果与规则 finding 的显式映射仍未完成，不能声称完整治理闭环。
+- Godot Engine Provider、Evidence ledger、Hook 失效传播、.NET/Rust/Python Build Provider v1 与 Godot
+  C# RuntimeArtifactBundle CAS 已完成；隔离 Godot headless Runtime Evidence、测试结果与规则 finding
+  的显式映射仍未完成，不能声称完整治理闭环。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。

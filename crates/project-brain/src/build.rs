@@ -8,9 +8,9 @@ use brain_evidence::{
     ArtifactNode, EvidenceAuthority, EvidenceCoverage, EvidenceFinding, EvidencePlane,
     EvidenceProvider, EvidenceReference, EvidenceSnapshot, FindingSeverity, content_fingerprint,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::{error::AppError, git, provider};
+use crate::{artifact_store, error::AppError, git, provider};
 
 const BUILD_RUN_SCHEMA_VERSION: u32 = 1;
 const BUILD_CONTRACT_VERSION: u16 = 1;
@@ -51,6 +51,7 @@ pub struct BuildRunReport {
     contract: BuildContract,
     process: BuildProcessSummary,
     artifact_manifest: Option<ArtifactManifest>,
+    runtime_artifact_bundle: Option<artifact_store::RuntimeArtifactBundleReceipt>,
     status: &'static str,
     evidence: EvidenceSnapshot,
 }
@@ -90,22 +91,23 @@ struct BuildProcessSummary {
     output_truncated: bool,
 }
 
-#[derive(Debug, Serialize)]
-struct ArtifactManifest {
-    entries: Vec<ArtifactEntry>,
-    total_bytes: u64,
-    manifest_fingerprint: String,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ArtifactManifest {
+    pub(crate) entries: Vec<ArtifactEntry>,
+    pub(crate) total_bytes: u64,
+    pub(crate) manifest_fingerprint: String,
 }
 
-#[derive(Debug, Serialize)]
-struct ArtifactEntry {
-    relative_path: String,
-    size: u64,
-    sha256: String,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ArtifactEntry {
+    pub(crate) relative_path: String,
+    pub(crate) size: u64,
+    pub(crate) sha256: String,
 }
 
 pub struct BuildRequest<'a> {
     pub project_root: &'a Path,
+    pub install_root: Option<&'a Path>,
     pub project_key: &'a str,
     pub profile_id: &'a str,
     pub executable: &'a Path,
@@ -444,6 +446,55 @@ fn run_build(
             path: Some(target_display.clone()),
         });
     }
+    let mut runtime_bundle_failure = None;
+    let runtime_artifact_bundle = if !infrastructure_failure
+        && findings.is_empty()
+        && process.status.success()
+        && adapter == "dotnet-build"
+    {
+        let root = artifact_root.ok_or_else(|| {
+            AppError::Provider("dotnet Build 缺少最终产物根，拒绝创建 Runtime bundle".to_owned())
+        })?;
+        let manifest = artifact_manifest.as_ref().ok_or_else(|| {
+            AppError::Provider("dotnet Build 缺少最终产物清单，拒绝创建 Runtime bundle".to_owned())
+        })?;
+        match artifact_store::promote_runtime_bundle(
+            request.install_root,
+            request.project_key,
+            &format!("{adapter}.{}", request.profile_id),
+            &source_after,
+            request.project_root,
+            root,
+            manifest,
+        ) {
+            Ok(bundle) => Some(bundle),
+            Err(error) => {
+                runtime_bundle_failure = Some(error.to_string());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(failure) = &runtime_bundle_failure {
+        findings.push(EvidenceFinding {
+            code: "runtime_bundle_unavailable".to_owned(),
+            severity: FindingSeverity::Warning,
+            message: format!(
+                "Build completed but exact Runtime bundle could not be committed to machine CAS; failure_fingerprint={}",
+                content_fingerprint(failure.as_bytes())
+            ),
+            artifact_id: None,
+            path: None,
+        });
+    }
+    let status = if infrastructure_failure || runtime_bundle_failure.is_some() {
+        "incomplete"
+    } else if findings.is_empty() && process.status.success() {
+        "succeeded"
+    } else {
+        "failed"
+    };
     let contract = BuildContract {
         contract_version: BUILD_CONTRACT_VERSION,
         adapter,
@@ -482,13 +533,17 @@ fn run_build(
             manifest.manifest_fingerprint.as_bytes(),
         ));
     }
-    let status = if infrastructure_failure {
-        "incomplete"
-    } else if findings.is_empty() && process.status.success() {
-        "succeeded"
-    } else {
-        "failed"
-    };
+    if let Some(bundle) = &runtime_artifact_bundle {
+        artifacts.push(ArtifactNode::from_provider_key(
+            request.project_key,
+            &provider_id,
+            "runtime_artifact_bundle",
+            "runtime-artifact-bundle",
+            "Content-addressed Runtime artifact bundle",
+            None,
+            bundle.canonical_manifest_bytes(),
+        ));
+    }
     let evidence = EvidenceSnapshot::new(
         request.project_key,
         EvidencePlane::Build,
@@ -536,6 +591,7 @@ fn run_build(
             output_truncated,
         },
         artifact_manifest,
+        runtime_artifact_bundle,
         status,
         evidence,
     })
@@ -843,6 +899,7 @@ mod tests {
     fn request() -> BuildRequest<'static> {
         BuildRequest {
             project_root: Path::new("."),
+            install_root: None,
             project_key: "project",
             profile_id: "main",
             executable: Path::new("tool"),
