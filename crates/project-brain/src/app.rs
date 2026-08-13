@@ -442,6 +442,7 @@ impl App {
         profile: &str,
         timeout_seconds: u64,
     ) -> Result<(), AppError> {
+        self.ensure_provider_preflight_qualification(install_root, profile)?;
         let run = provider::execute(
             install_root,
             &self.root,
@@ -670,6 +671,44 @@ impl App {
             )));
         }
         Ok(Some(qualification))
+    }
+
+    fn ensure_provider_preflight_qualification(
+        &self,
+        install_root: Option<&Path>,
+        profile: &str,
+    ) -> Result<(), AppError> {
+        let qualification = self
+            .store
+            .latest_provider_qualification(&self.config.project_key, profile)?;
+        let Some(qualification) = qualification else {
+            return Ok(());
+        };
+        if qualification.status != "stable_complete" {
+            return Err(AppError::Provider(format!(
+                "Provider profile={profile} 最新稳定性资格为 {}；在启动昂贵索引前拒绝，必须显式 verify-stability",
+                qualification.status
+            )));
+        }
+        let trust = provider::trust_status(
+            install_root,
+            &self.root,
+            &self.config.project_key,
+            &self.config.semantic_providers,
+        );
+        let current = trust.get(profile).ok_or_else(|| {
+            AppError::Provider(format!("找不到 Provider profile={profile} 的机器绑定状态"))
+        })?;
+        if !current.ready
+            || current.registration_id.as_deref() != Some(&qualification.registration_id)
+            || current.registration_revision != Some(qualification.registration_revision)
+            || current.executable_sha256.as_deref() != Some(&qualification.executable_sha256)
+        {
+            return Err(AppError::Provider(format!(
+                "Provider profile={profile} 的 stable_complete 资格已过期；必须重新 verify-stability"
+            )));
+        }
+        Ok(())
     }
 
     fn prepare_provider_stability_run(

@@ -775,6 +775,7 @@ mod tests {
                 profile_id: "test-main".to_owned(),
                 ready: true,
                 registration_id: Some("registration-test".to_owned()),
+                registration_revision: Some(1),
                 executable_sha256: Some("b".repeat(64)),
                 issue: None,
             },

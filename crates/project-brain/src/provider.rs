@@ -127,6 +127,7 @@ pub struct ProviderTrustStatus {
     pub profile_id: String,
     pub ready: bool,
     pub registration_id: Option<String>,
+    pub registration_revision: Option<u64>,
     pub executable_sha256: Option<String>,
     pub issue: Option<String>,
 }
@@ -177,6 +178,7 @@ pub fn trust_status(
                             profile_id: profile.id.clone(),
                             ready: issue.is_none(),
                             registration_id: Some(binding.registration_id.clone()),
+                            registration_revision: Some(binding.revision),
                             executable_sha256: Some(binding.executable.sha256.clone()),
                             issue,
                         }
@@ -185,6 +187,7 @@ pub fn trust_status(
                             profile_id: profile.id.clone(),
                             ready: false,
                             registration_id: None,
+                            registration_revision: None,
                             executable_sha256: None,
                             issue: Some(format!("provider profile={} 尚未在本机绑定", profile.id)),
                         }
@@ -194,6 +197,7 @@ pub fn trust_status(
                     profile_id: profile.id.clone(),
                     ready: false,
                     registration_id: None,
+                    registration_revision: None,
                     executable_sha256: None,
                     issue: Some(error.clone()),
                 },
