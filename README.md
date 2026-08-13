@@ -13,7 +13,7 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - Codex `Stop` 自动 Change Envelope 对账与防循环保护；
 - 基于 Tree-sitter 的 Rust changed-symbol 与纯删除符号提取；
 - Project-scoped Provider-neutral 符号身份协议、完整工作区快照与本地派生符号图；
-- 按项目显式配置的离线 SCIP 导入，首批契约覆盖 rust-analyzer、scip-dotnet 与 scip-python；
+- 按项目显式配置的 SCIP 导入与机器级安全 Runner，首批契约覆盖 rust-analyzer、scip-dotnet 与 scip-python；
 - 开放 language ID、逐文档语言映射和四态语义能力声明；
 - Project-scoped semantic lineage ledger、不可变证据与 append-only 显式裁决；
 - SQLite schema v1→v4 迁移、按项目隔离的符号 removed 历史与幂等增量更新；
@@ -102,6 +102,34 @@ project-brain init --profile dotnet --profile python --profile rust
 `rust-analyzer`；`python` 绑定显式允许空 `Document.language` 的 `scip-python` 契约。
 重复参数会被幂等去重。省略所有 `--profile` 仍只创建基础控制面，不引入任何语言假设。
 
+仓库只声明 profile，不保存本机命令或绝对路径。每台机器需要对每个 profile 做一次显式信任绑定：
+
+```text
+project-brain provider bind \
+  --profile rust-main \
+  --executable /absolute/path/to/rust-analyzer \
+  --trust-local-executable
+
+project-brain provider bind \
+  --profile dotnet-main \
+  --executable /absolute/path/to/scip-dotnet \
+  --trust-local-executable
+```
+
+Windows 的 npm `.cmd/.bat` shim 不会被执行。scip-python 可把原生 `node.exe` 与实际 JS 入口分别
+固定哈希：
+
+```text
+project-brain provider bind \
+  --profile python-main \
+  --executable C:\Program Files\nodejs\node.exe \
+  --script C:\absolute\path\to\scip-python-entry.js \
+  --trust-local-executable
+```
+
+绑定必须是仓库外的绝对普通文件；内容变化后会被视为 drift，必须用 `--replace` 重新显式信任。
+可用 `project-brain provider list` 查看当前项目的机器绑定。
+
 它会创建：
 
 ```text
@@ -141,7 +169,8 @@ project-brain preflight
 project-brain bootstrap --codex
 ```
 
-它把项目根和已提交的 `project_key` 注册到机器本地，并将 Project Brain dispatcher 结构化合并
+应先完成上一节所示的 Provider 绑定；否则 `bootstrap` 的最终 `doctor` 会拒绝把项目报告为
+ready。`bootstrap` 把项目根和已提交的 `project_key` 注册到机器本地，并将 Project Brain dispatcher 结构化合并
 到用户级 `~/.codex/hooks.json`。已有用户 Hook、未知顶层字段和 matcher group 都会保留；重复
 执行不添加副本。未注册项目会静默 NO-OP，项目仓库不再保存开发机绝对路径。
 
@@ -263,7 +292,7 @@ unborn HEAD 标记。符号 ID、快照、查询和 tombstone 都显式绑定配
 在不同项目中生成不同身份，即使未来共用一个数据库也不会串图。跨快照 lineage 由 Brain
 自己维护，目前只生成 `proposed`/`ambiguous` 候选，不会自动复用 ID 或改写历史。
 
-### 离线 SCIP 语义索引
+### SCIP 语义索引
 
 Project Brain 不自动根据扩展名、`Cargo.toml`、solution 或 `pyproject.toml` 猜测项目语言。
 每个项目需要在 `.project-brain/config.json` 中显式声明语言和 provider：
@@ -309,7 +338,19 @@ Project Brain 不自动根据扩展名、`Cargo.toml`、solution 或 `pyproject.
 }
 ```
 
-生成 `.scip` 后按项目内稳定 profile ID 导入：
+推荐让机器级 Runner 直接执行已绑定 producer：
+
+```text
+project-brain provider index --profile rust-main --timeout-seconds 300
+```
+
+Runner 从固定 adapter 构造 argv，不接收仓库命令或任意参数，不使用 shell；它固定 executable/
+Node entrypoint 哈希，关闭 stdin，使用环境白名单和净化后的 `PATH`，把输出写入机器私有临时目录，
+限制并完整哈希 stdout/stderr，并按项目、profile、worktree 使用 OS 文件锁。索引前后及 SCIP 解析后
+都会核对完整工作区内容指纹；源码变化、超时、非零退出、二进制漂移、链接输出、过大/非法 SCIP
+均不会提交 semantic snapshot。过程 provenance 与失败只写入机器级有界 JSONL audit。
+
+如果 `.scip` 由 CI 或其他可信流程生成，仍可按项目内稳定 profile ID 手工导入：
 
 ```text
 project-brain index-scip --provider rust-main --input index.scip
@@ -383,10 +424,14 @@ crates/
 - 当前只提供 Codex 适配器；Claude Code 和 Prime Agent 尚未实现。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
-  离线 SCIP semantic Provider 接入。
+  SCIP semantic Provider 接入。
 - SCIP 当前可靠导入 definition、reference、contains，以及 producer 明确提供的 implementation/
   type-definition 关系；不会从 occurrence 猜测 call/import/implementation。
-- scip-dotnet 与 scip-python 使用合成契约 fixture；本阶段不捆绑或自动运行外部 producer。
+- Project Brain 不下载、安装或自动发现外部 producer；用户必须显式绑定机器路径。Rust Runner 已用
+  真实 rust-analyzer 验证；scip-dotnet/scip-python 的导入契约仍以合成 fixture 为自动测试基线。
+- Runner 保证自身不执行仓库声明的命令，但语言 indexer、Cargo/build script/proc macro、.NET 和
+  Python 环境仍是独立信任面；当前版本不是通用 OS 沙箱。Windows 超时使用 `taskkill /T`，Unix
+  使用独立 process group；尚未提供 Windows Job Object 级的强隔离证明。
 - syntax fallback 不自动关联 rename/move lineage；这必须由语义证据或显式确认完成。
 - semantic lineage 当前只支持同项目、同 provider profile/contract、同语言、相邻快照的一对一
   predecessor/successor；split/merge、跨 provider equivalence 和传递闭包不在本阶段。

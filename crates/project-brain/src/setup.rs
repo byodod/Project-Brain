@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::error::AppError;
+use brain_core::SemanticProviderProfile;
+
+use crate::{error::AppError, provider};
 
 const INSTALL_SCHEMA_VERSION: u32 = 1;
 const REGISTRY_SCHEMA_VERSION: u32 = 1;
@@ -27,7 +29,7 @@ const REQUIRED_CODEX_EVENTS: [&str; 5] = [
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct InstallManifest {
+pub(crate) struct InstallManifest {
     schema_version: u32,
     current: String,
     previous: Option<String>,
@@ -100,6 +102,7 @@ pub struct DoctorReport {
     pub launcher: CheckState,
     pub payload: CheckState,
     pub project_registration: CheckState,
+    pub providers: CheckState,
     pub codex_hooks: CheckState,
     pub codex_trust_state: &'static str,
     pub issues: Vec<String>,
@@ -258,6 +261,7 @@ pub fn bootstrap(
     explicit_codex_home: Option<&Path>,
     project_root: &Path,
     project_key: &str,
+    provider_profiles: &[SemanticProviderProfile],
     install_codex: bool,
 ) -> Result<BootstrapReport, AppError> {
     let install_root = resolve_install_root(explicit_install_root)?;
@@ -283,6 +287,7 @@ pub fn bootstrap(
             explicit_codex_home,
             &canonical_root,
             project_key,
+            provider_profiles,
         );
         if report.status != "ready" {
             if hook_report.as_ref().is_some_and(|report| report.changed) {
@@ -455,6 +460,7 @@ pub fn doctor(
     explicit_codex_home: Option<&Path>,
     project_root: &Path,
     project_key: &str,
+    provider_profiles: &[SemanticProviderProfile],
 ) -> DoctorReport {
     let mut issues = Vec::new();
     let install_root = match resolve_install_root(explicit_install_root) {
@@ -467,6 +473,7 @@ pub fn doctor(
                 launcher: CheckState::Fail,
                 payload: CheckState::Fail,
                 project_registration: CheckState::Fail,
+                providers: CheckState::Fail,
                 codex_hooks: CheckState::Fail,
                 codex_trust_state: "not_programmatically_verifiable",
                 issues: vec![error.to_string()],
@@ -500,6 +507,15 @@ pub fn doctor(
     if !project_registered {
         issues.push("当前项目未在本机注册或 project_key 不匹配".to_owned());
     }
+    let providers = provider::doctor(
+        Some(&install_root),
+        &canonical_root,
+        project_key,
+        provider_profiles,
+    );
+    if !providers.ready {
+        issues.extend(providers.issues);
+    }
     let codex_hooks_valid = codex_integration_valid(
         &install_root,
         resolve_codex_home(explicit_codex_home).ok().as_deref(),
@@ -518,13 +534,14 @@ pub fn doctor(
         launcher: launcher_exists.into(),
         payload: payload_exists.into(),
         project_registration: project_registered.into(),
+        providers: providers.ready.into(),
         codex_hooks: codex_hooks_valid.into(),
         codex_trust_state: "not_programmatically_verifiable",
         issues,
     }
 }
 
-fn ensure_install_ready(root: &Path) -> Result<InstallManifest, AppError> {
+pub(crate) fn ensure_install_ready(root: &Path) -> Result<InstallManifest, AppError> {
     let path = root.join("state/install.json");
     if !path.is_file() {
         return Err(AppError::Setup(format!(
@@ -568,7 +585,7 @@ fn validate_integration_manifest(
     Ok(())
 }
 
-fn resolve_install_root(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
+pub(crate) fn resolve_install_root(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
     if let Some(path) = explicit {
         return absolute_path(path);
     }
@@ -930,7 +947,7 @@ fn copy_file_atomically(source: &Path, target: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn atomic_replace(
+pub(crate) fn atomic_replace(
     target: &Path,
     bytes: &[u8],
     expected_current_hash: Option<&str>,
@@ -977,7 +994,7 @@ fn read_optional(path: &Path) -> Result<Vec<u8>, AppError> {
     }
 }
 
-fn pretty_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, AppError> {
+pub(crate) fn pretty_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, AppError> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     Ok(bytes)
@@ -987,16 +1004,16 @@ fn hash_value(value: &Value) -> Result<String, AppError> {
     Ok(digest_bytes(&serde_json::to_vec(value)?))
 }
 
-fn digest_bytes(bytes: &[u8]) -> String {
+pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-struct MutationLock {
+pub(crate) struct MutationLock {
     _file: fs::File,
 }
 
 impl MutationLock {
-    fn acquire(path: &Path) -> Result<Self, AppError> {
+    pub(crate) fn acquire(path: &Path) -> Result<Self, AppError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1017,7 +1034,7 @@ impl MutationLock {
     }
 }
 
-fn target_hash(path: &Path) -> Result<String, AppError> {
+pub(crate) fn target_hash(path: &Path) -> Result<String, AppError> {
     if path.is_file() {
         Ok(digest_bytes(&fs::read(path)?))
     } else {

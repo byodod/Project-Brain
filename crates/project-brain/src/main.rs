@@ -5,6 +5,7 @@ mod error;
 mod git;
 mod index;
 mod protocol;
+mod provider;
 mod reconcile;
 mod scip_index;
 mod setup;
@@ -17,6 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[derive(Debug, Parser)]
 #[command(name = "project-brain")]
 #[command(about = "由项目决策记忆驱动的确定性 Agent 控制面")]
+#[command(version)]
 struct Cli {
     /// 项目根目录；省略时从当前目录向上查找 .project-brain/config.json
     #[arg(long, global = true)]
@@ -108,6 +110,12 @@ enum Command {
         input: PathBuf,
     },
 
+    /// 管理当前项目的机器级语义 Provider 绑定与安全索引执行
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommand,
+    },
+
     /// 查看或显式裁决 semantic lineage 候选
     Lineage {
         #[command(subcommand)]
@@ -130,6 +138,45 @@ enum Command {
     Audit {
         #[arg(long, default_value_t = 20)]
         limit: u32,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderCommand {
+    /// 将仓库 profile 绑定到本机可执行文件；路径只写入机器状态
+    Bind {
+        #[arg(long)]
+        profile: String,
+        #[arg(long)]
+        executable: PathBuf,
+        /// 可选的机器级 launcher 脚本，例如由 node.exe 直接加载的 scip-python JS 入口
+        #[arg(long)]
+        script: Option<PathBuf>,
+        /// 显式替换已有且不同的绑定
+        #[arg(long)]
+        replace: bool,
+        /// 确认信任此机器本地 executable/entrypoint；Hook 不会自动提供此参数
+        #[arg(long)]
+        trust_local_executable: bool,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=120))]
+        timeout_seconds: u64,
+    },
+
+    /// 删除当前项目的一个机器级 Provider 绑定
+    Unbind {
+        #[arg(long)]
+        profile: String,
+    },
+
+    /// 查看仓库 profile 与当前机器绑定状态
+    List,
+
+    /// 在隔离临时目录运行已绑定 Provider，并事务化导入生成的 SCIP
+    Index {
+        #[arg(long)]
+        profile: String,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
     },
 }
 
@@ -205,6 +252,10 @@ impl From<LineageStateArg> for brain_symbols::LineageState {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "CLI 顶层保持所有子命令到 App 的显式、可审计路由"
+)]
 fn main() -> ExitCode {
     match setup::delegate_if_installed_launcher() {
         Ok(Some(exit_code)) => return exit_code,
@@ -252,6 +303,36 @@ fn main() -> ExitCode {
         Command::Index => App::open(cli.project_root).and_then(|app| app.index()),
         Command::IndexScip { provider, input } => {
             App::open(cli.project_root).and_then(|app| app.index_scip(&provider, &input))
+        }
+        Command::Provider { command } => {
+            App::open(cli.project_root).and_then(|app| match command {
+                ProviderCommand::Bind {
+                    profile,
+                    executable,
+                    script,
+                    replace,
+                    trust_local_executable,
+                    timeout_seconds,
+                } => app.bind_provider(
+                    cli.install_root.as_deref(),
+                    &profile,
+                    &executable,
+                    script.as_deref(),
+                    replace,
+                    trust_local_executable,
+                    timeout_seconds,
+                ),
+                ProviderCommand::Unbind { profile } => {
+                    app.unbind_provider(cli.install_root.as_deref(), &profile)
+                }
+                ProviderCommand::List => app.list_providers(cli.install_root.as_deref()),
+                ProviderCommand::Index {
+                    profile,
+                    timeout_seconds,
+                } => {
+                    app.index_with_provider(cli.install_root.as_deref(), &profile, timeout_seconds)
+                }
+            })
         }
         Command::Lineage { command } => App::open(cli.project_root).and_then(|app| match command {
             LineageCommand::Candidates {

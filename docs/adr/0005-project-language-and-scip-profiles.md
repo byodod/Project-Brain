@@ -21,7 +21,7 @@
    碰撞；provider key 再包含规范 language。Producer version 仅记录 provenance，不改变 Brain contract。
 6. 能力绑定 producer + language，使用 Supported、Partial、Unsupported、Unknown 四态。
 7. V3b 实际执行 rust-analyzer `.scip` 验证；C#/VB 与 Python 使用贴近真实 producer 行为的合成
-   fixture，不捆绑或自动运行 scip-dotnet/scip-python。
+   fixture。外部 producer 的机器级执行由 ADR-0008 单独定义，不把路径或命令写入本 profile。
 8. SCIP raw symbol 只是身份输入与 lineage evidence；lineage candidate 仅在同 project、provider、
    language 内比较，不自动复用 ID、修改墓碑或让历史规则跟随。
 

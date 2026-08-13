@@ -160,6 +160,35 @@ fn install_bootstrap_dispatch_doctor_and_uninstall_are_end_to_end() {
     assert_eq!(registry_after_failure["projects"], serde_json::json!([]));
     fs::write(codex_home.join("hooks.json"), user_hooks).unwrap();
 
+    let fake_dir = install_root.join("provider-fixtures");
+    fs::create_dir_all(&fake_dir).unwrap();
+    for (profile, producer) in [
+        ("dotnet-main", "scip-dotnet"),
+        ("python-main", "scip-python"),
+    ] {
+        let fake = fake_dir.join(format!("{producer}{}", std::env::consts::EXE_SUFFIX));
+        fs::copy(&source, &fake).unwrap();
+        let binding = run(
+            &launcher,
+            &[
+                "--install-root",
+                install_root.to_str().unwrap(),
+                "--project-root",
+                project.to_str().unwrap(),
+                "provider",
+                "bind",
+                "--profile",
+                profile,
+                "--executable",
+                fake.to_str().unwrap(),
+                "--trust-local-executable",
+            ],
+            &root,
+            None,
+        );
+        assert_success(&binding);
+    }
+
     assert_success(&run(&launcher, &bootstrap_args, &root, None));
     let second_bootstrap = run(&launcher, &bootstrap_args, &root, None);
     assert_success(&second_bootstrap);
@@ -236,6 +265,7 @@ fn install_bootstrap_dispatch_doctor_and_uninstall_are_end_to_end() {
     assert_success(&doctor);
     let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
     assert_eq!(doctor["status"], "ready");
+    assert_eq!(doctor["providers"], "pass");
     assert_eq!(
         doctor["codex_trust_state"],
         "not_programmatically_verifiable"

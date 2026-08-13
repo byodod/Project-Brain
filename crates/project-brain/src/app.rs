@@ -17,7 +17,7 @@ use crate::{
     analyze,
     codex::{self, CodexHookInput},
     error::AppError,
-    index, reconcile, scip_index, setup,
+    git, index, provider, reconcile, scip_index, setup,
 };
 
 const BRAIN_DIRECTORY: &str = ".project-brain";
@@ -116,6 +116,7 @@ impl App {
                 codex_home,
                 &self.root,
                 &self.config.project_key,
+                &self.config.semantic_providers,
                 install_codex,
             )?)?
         );
@@ -132,6 +133,7 @@ impl App {
             codex_home,
             &self.root,
             &self.config.project_key,
+            &self.config.semantic_providers,
         );
         println!("{}", pretty_json(&report)?);
         if report.is_ready() {
@@ -326,6 +328,121 @@ impl App {
                 provider,
                 input,
             )?)?
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_provider(
+        &self,
+        install_root: Option<&Path>,
+        profile: &str,
+        executable: &Path,
+        script: Option<&Path>,
+        replace: bool,
+        trust_local_executable: bool,
+        timeout_seconds: u64,
+    ) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&provider::bind(
+                install_root,
+                &self.root,
+                &self.config.project_key,
+                &self.config.semantic_providers,
+                profile,
+                executable,
+                script,
+                replace,
+                trust_local_executable,
+                timeout_seconds,
+            )?)?
+        );
+        Ok(())
+    }
+
+    pub fn unbind_provider(
+        &self,
+        install_root: Option<&Path>,
+        profile: &str,
+    ) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&provider::unbind(
+                install_root,
+                &self.config.project_key,
+                profile,
+            )?)?
+        );
+        Ok(())
+    }
+
+    pub fn list_providers(&self, install_root: Option<&Path>) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&provider::list(
+                install_root,
+                &self.root,
+                &self.config.project_key,
+                &self.config.semantic_providers,
+            )?)?
+        );
+        Ok(())
+    }
+
+    pub fn index_with_provider(
+        &self,
+        install_root: Option<&Path>,
+        profile: &str,
+        timeout_seconds: u64,
+    ) -> Result<(), AppError> {
+        let run = provider::execute(
+            install_root,
+            &self.root,
+            &self.config.project_key,
+            &self.config.semantic_providers,
+            profile,
+            timeout_seconds,
+        )?;
+        let prepared = scip_index::prepare(
+            &self.root,
+            &self.config.project_key,
+            &self.config.language_profiles,
+            &self.config.semantic_providers,
+            profile,
+            run.output_path(),
+        );
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                provider::record_import_failure(install_root, &run, &error)?;
+                return Err(error);
+            }
+        };
+        let current_fingerprint = git::worktree_fingerprint(&self.root)?;
+        if current_fingerprint != run.source_fingerprint() {
+            let error = AppError::Provider(
+                "源码在 Provider 输出验证后再次变化；拒绝提交 semantic snapshot".to_owned(),
+            );
+            provider::record_import_failure(install_root, &run, &error)?;
+            return Err(error);
+        }
+        provider::record_import_prepared(install_root, &run)?;
+        let imported = match scip_index::commit(&self.store, prepared) {
+            Ok(imported) => imported,
+            Err(error) => {
+                provider::record_import_failure(install_root, &run, &error)?;
+                return Err(error);
+            }
+        };
+        let _ = provider::record_import_committed(install_root, &run);
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "execution": run.report(),
+                "index": imported,
+            }))?
         );
         Ok(())
     }

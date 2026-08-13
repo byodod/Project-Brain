@@ -4,7 +4,7 @@ use brain_core::{
     ProjectLanguageProfile, SemanticProviderFormat, SemanticProviderProfile, path_has_prefix,
 };
 use brain_scip::{
-    ScipImportProfile, ScipImportStats, ScipLanguageCapabilities, ScipLanguageMapping,
+    ScipImport, ScipImportProfile, ScipImportStats, ScipLanguageCapabilities, ScipLanguageMapping,
 };
 use brain_store::{BrainStore, SemanticApplyResult};
 use brain_symbols::{ProviderDescriptor, SourceLanguage};
@@ -29,6 +29,12 @@ pub struct ScipIndexReport {
     pub apply: SemanticApplyResult,
 }
 
+pub struct PreparedScipIndex {
+    project_key: String,
+    provider_profile: String,
+    imported: ScipImport,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate(
     root: &Path,
@@ -39,6 +45,25 @@ pub fn evaluate(
     provider_profile_id: &str,
     input: &Path,
 ) -> Result<ScipIndexReport, AppError> {
+    let prepared = prepare(
+        root,
+        project_key,
+        language_profiles,
+        provider_profiles,
+        provider_profile_id,
+        input,
+    )?;
+    commit(store, prepared)
+}
+
+pub fn prepare(
+    root: &Path,
+    project_key: &str,
+    language_profiles: &[ProjectLanguageProfile],
+    provider_profiles: &[SemanticProviderProfile],
+    provider_profile_id: &str,
+    input: &Path,
+) -> Result<PreparedScipIndex, AppError> {
     let configured = provider_profiles
         .iter()
         .find(|profile| profile.id == provider_profile_id)
@@ -80,25 +105,36 @@ pub fn evaluate(
     let imported =
         brain_scip::import_file(root, project_key, &head_revision, input, &import_profile)?;
     validate_project_roots(&imported.snapshot, language_profiles)?;
+    Ok(PreparedScipIndex {
+        project_key: project_key.to_owned(),
+        provider_profile: configured.id.clone(),
+        imported,
+    })
+}
+
+pub fn commit(
+    store: &BrainStore,
+    prepared: PreparedScipIndex,
+) -> Result<ScipIndexReport, AppError> {
     let apply = store.apply_semantic_snapshot(
-        &imported.snapshot,
-        &configured.id,
-        &imported.lineage_observations,
+        &prepared.imported.snapshot,
+        &prepared.provider_profile,
+        &prepared.imported.lineage_observations,
         &[],
     )?;
     Ok(ScipIndexReport {
         schema_version: brain_core::CURRENT_SCHEMA_VERSION,
         experimental: true,
-        project_key: project_key.to_owned(),
-        provider_profile: configured.id.clone(),
-        provider: imported.snapshot.provider,
-        capabilities: imported.capabilities,
-        producer_name: imported.producer_name,
-        producer_version: imported.producer_version,
-        languages: imported.languages,
-        source_revision: imported.snapshot.source_revision,
-        stats: imported.stats,
-        lineage_observations: u64::try_from(imported.lineage_observations.len())
+        project_key: prepared.project_key,
+        provider_profile: prepared.provider_profile,
+        provider: prepared.imported.snapshot.provider,
+        capabilities: prepared.imported.capabilities,
+        producer_name: prepared.imported.producer_name,
+        producer_version: prepared.imported.producer_version,
+        languages: prepared.imported.languages,
+        source_revision: prepared.imported.snapshot.source_revision,
+        stats: prepared.imported.stats,
+        lineage_observations: u64::try_from(prepared.imported.lineage_observations.len())
             .unwrap_or(u64::MAX),
         apply,
     })
