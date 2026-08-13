@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     analyze,
+    claude::{self, ClaudeHookInput},
     codex::{self, CodexHookInput},
     error::AppError,
     git, index, provider, reconcile, scip_index, setup,
@@ -30,6 +31,7 @@ const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum AgentKind {
     Codex,
+    ClaudeCode,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -80,6 +82,12 @@ impl App {
                     pretty_json(&setup::install_codex_hooks(install_root, codex_home)?)?
                 );
             }
+            AgentKind::ClaudeCode => {
+                return Err(AppError::Setup(
+                    "Claude Code adapter 已可直接运行；用户级 Hook 原子安装器尚未在本提交启用"
+                        .to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -100,6 +108,11 @@ impl App {
                         force,
                     )?)?
                 );
+            }
+            AgentKind::ClaudeCode => {
+                return Err(AppError::Setup(
+                    "Claude Code 用户级 Hook 安装器尚未启用，没有可卸载的托管集成".to_owned(),
+                ));
             }
         }
         Ok(())
@@ -209,12 +222,52 @@ impl App {
                 println!("{}", pretty_json(&output)?);
                 Ok(())
             }
+            AgentKind::ClaudeCode => {
+                let input: ClaudeHookInput = match read_stdin_json_limited(MAX_HOOK_INPUT_BYTES) {
+                    Ok(input) => input,
+                    Err(_) => return Ok(()),
+                };
+                let Some((root, registered_project_key)) =
+                    setup::registered_project_for_cwd(install_root, Path::new(input.cwd()))?
+                else {
+                    return Ok(());
+                };
+                let app = Self::open(Some(root))?;
+                if app.config.project_key != registered_project_key {
+                    let error = format!(
+                        "本机注册 project_key={} 与仓库 project_key={} 不一致",
+                        registered_project_key, app.config.project_key
+                    );
+                    if let Some(output) = claude::failure_output(event, &input, &error) {
+                        println!("{}", pretty_json(&output)?);
+                        return Ok(());
+                    }
+                    return Err(AppError::Setup(error));
+                }
+                let provider_trust = provider::trust_status(
+                    install_root,
+                    &app.root,
+                    &app.config.project_key,
+                    &app.config.semantic_providers,
+                );
+                let output = claude::handle_with_provider_trust(
+                    &app.root,
+                    &app.config,
+                    &app.store,
+                    &provider_trust,
+                    event,
+                    &input,
+                )?;
+                println!("{}", pretty_json(&output)?);
+                Ok(())
+            }
         }
     }
 
     pub fn capabilities(agent: AgentKind) -> Result<(), AppError> {
         let capabilities = match agent {
             AgentKind::Codex => codex::capabilities(),
+            AgentKind::ClaudeCode => claude::capabilities(),
         };
         println!("{}", pretty_json(&capabilities)?);
         Ok(())
@@ -326,6 +379,50 @@ impl App {
                     &app.config.semantic_providers,
                 );
                 let output = codex::handle_with_provider_trust(
+                    &app.root,
+                    &app.config,
+                    &app.store,
+                    &provider_trust,
+                    event,
+                    &input,
+                )?;
+                println!("{}", pretty_json(&output)?);
+                Ok(())
+            }
+            AgentKind::ClaudeCode => {
+                let input: ClaudeHookInput = match read_stdin_json() {
+                    Ok(input) => input,
+                    Err(error) => {
+                        if let Some(output) = claude::failure_output(
+                            event,
+                            &ClaudeHookInput::default(),
+                            &error.to_string(),
+                        ) {
+                            println!("{}", pretty_json(&output)?);
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
+                };
+                let app = match Self::open(explicit_root) {
+                    Ok(app) => app,
+                    Err(error) => {
+                        if let Some(output) =
+                            claude::failure_output(event, &input, &error.to_string())
+                        {
+                            println!("{}", pretty_json(&output)?);
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
+                };
+                let provider_trust = provider::trust_status(
+                    install_root,
+                    &app.root,
+                    &app.config.project_key,
+                    &app.config.semantic_providers,
+                );
+                let output = claude::handle_with_provider_trust(
                     &app.root,
                     &app.config,
                     &app.store,

@@ -160,13 +160,18 @@ Adapter 只负责：
 
 Adapter 不得自行重新解释某条项目规则。
 
-当前 Codex adapter 覆盖 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`
-和 `Stop`。能力矩阵通过 `project-brain capabilities codex` 输出。能力模型明确保留 Prime Agent
+当前 Codex 与 Claude Code adapter 都覆盖 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、
+`PostToolUse` 和 `Stop`。两者共享已确认的 vendor 字段子集和 outcome 映射，但必须使用不同的
+adapter identity、event ID namespace 与 operation ID namespace，不能跨 vendor 去重。能力矩阵通过
+`project-brain capabilities codex` 和 `project-brain capabilities claude-code` 输出。能力模型明确保留 Prime Agent
 的 `continue_after_stop=unsupported`，不把独立 runtime 的 `agent_end` 假装成 Codex Stop。
 当前 `IntentDeclared` 只进入审计，尚未接入独立的意图规则模型，因此 Codex 有效能力如实报告
 `deny_intent=unsupported`；核心协议保留 `Deny` 类型供后续 adapter/rule 实现使用。
 `PostToolUse.tool_response` 只有存在可识别的 success、exit code、error 或 status 证据时才映射
 为 succeeded/failed，否则记录 unknown，不从事件名称猜测成功。
+
+Claude Code adapter v1 当前只提供直接 `hook/dispatch` 协议入口。用户级配置安装、
+`SubagentStart` 与 `SessionEnd` 不在这一提交中；未实现的 lifecycle 不会被折叠成现有五类事件。
 
 ## AnalysisReport
 

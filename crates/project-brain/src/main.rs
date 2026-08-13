@@ -1,5 +1,6 @@
 mod analyze;
 mod app;
+mod claude;
 mod codex;
 mod error;
 mod git;

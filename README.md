@@ -7,7 +7,7 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - `ALLOW / ALLOW_WITH_CONTEXT / BLOCK / ESCALATE` 四态规则引擎；
 - 带 authority、strength、scope 和 lifecycle 的版本化规则模型；
 - Project-scoped Internal Hook Protocol v1；
-- Codex `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Stop` 协议适配；
+- Codex 与 Claude Code `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Stop` 协议适配；
 - 按项目和 adapter 隔离、可重放的 SQLite 本地审计记录；
 - Git Change Envelope 范围核对；
 - Codex `Stop` 自动 Change Envelope 对账与防循环保护；
@@ -16,7 +16,7 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - 按项目显式配置的 SCIP 导入与机器级安全 Runner，首批契约覆盖 rust-analyzer、scip-dotnet 与 scip-python；
 - 开放 language ID、逐文档语言映射和四态语义能力声明；
 - Project-scoped semantic lineage ledger、不可变证据与 append-only 显式裁决；
-- SQLite schema v1→v8 迁移、按项目隔离的符号 removed 历史与幂等增量更新；
+- SQLite schema v1→v11 迁移、按项目隔离的符号 removed 历史与幂等增量更新；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
 ## 核心原则
@@ -198,6 +198,16 @@ project-brain uninstall-hooks codex
 ```text
 project-brain capabilities codex
 ```
+
+Claude Code 的直接协议适配器使用独立的 adapter identity、事件幂等域和审计记录：
+
+```text
+project-brain capabilities claude-code
+project-brain hook claude-code pre-tool-use
+```
+
+本阶段只启用直接协议入口；Claude Code 用户级 `settings.json` 原子安装器尚未开放，
+`install-hooks claude-code` 会明确拒绝，而不会写入未经完整漂移测试的配置。
 
 手工验证适配器：
 
@@ -539,7 +549,8 @@ crates/
 
 ## 当前限制
 
-- 当前只提供 Codex 适配器；Claude Code 和 Prime Agent 尚未实现。
+- Codex 已提供直接适配器和用户级 Hook 安装器；Claude Code 已提供直接适配器，但用户级 Hook
+  安装器尚未启用；Prime Agent 仍未实现。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。

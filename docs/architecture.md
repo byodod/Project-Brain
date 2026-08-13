@@ -190,12 +190,13 @@ external diff，避免分析动作执行仓库配置中的外部程序。
 
 公共协议统一治理语义，不统一 vendor JSON。Codex/Claude Code 可以拒绝工具并要求 Stop 后继续；
 Prime Agent 是独立 runtime，当前已确认的 Extension `agent_end` 不具备同等 Stop continuation
-契约，因此能力模型必须报告 unsupported。当前提交只实现 Codex adapter，先用真实生命周期压力
-验证协议；Claude Code 与 Prime Agent 不在本阶段实现。
+契约，因此能力模型必须报告 unsupported。Codex adapter 已包含生产安装器；Claude Code adapter v1
+先复用五个已确认 lifecycle 的字段子集，但使用独立身份与幂等域，且暂不声称用户级安装、
+`SubagentStart` 或 `SessionEnd` 已完成。Prime Agent 仍按独立 runtime 留在后续阶段。
 
 ## 下一阶段
 
-1. Internal Hook Protocol v1 与 Codex adapter 已加入文件和 symbol scope；继续在真实项目验证项目
+1. Internal Hook Protocol v1、Codex adapter 与 Claude Code direct adapter 已加入文件和 symbol scope；继续在真实项目验证项目
    隔离、重放、并发交错、Provider 漂移降级、Stop 防循环与长会话延迟。
 2. 已接入机器级 SCIP Runner、complete-only commit 与重复运行稳定性证明；真实 rust-analyzer
    workspace 结果已证明非确定，且 package root 会重新提升到 workspace root，因此不启用假的
@@ -203,7 +204,8 @@ Prime Agent 是独立 runtime，当前已确认的 Extension `agent_end` 不具�
    producer 行为的合成 fixture 固定 C#/VB、空 Python language、未指定 kind 与 implementation 契约。
 3. Semantic lineage 裁决与 symbol-scoped rules 已实现；下一步扩展 symbol set、split/merge 和调用图
    影响面，但仍不允许自动确认或 LLM hard block。
-4. 内部协议经验证后实现 Claude Code 与 Prime Agent adapter；Prime 继续按独立 runtime 处理。
+4. 为 Claude Code direct adapter 增加原子用户级安装和真实进程 fixture；之后再研究 Prime Agent
+   独立 runtime 接入，不把它伪装成 Hook 等价物。
 5. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
    直接 hard block。
 

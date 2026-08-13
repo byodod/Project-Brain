@@ -59,7 +59,7 @@ impl CodexHookInput {
 
 #[derive(Debug, Serialize)]
 #[serde(transparent)]
-pub struct CodexHookOutput(Value);
+pub struct CodexHookOutput(pub(crate) Value);
 
 pub const fn capabilities() -> AdapterCapabilities {
     AdapterCapabilities::codex()
@@ -86,8 +86,41 @@ pub fn handle_with_provider_trust(
     event: HookEvent,
     input: &CodexHookInput,
 ) -> Result<CodexHookOutput, AppError> {
+    handle_vendor_with_provider_trust(
+        root,
+        config,
+        store,
+        provider_trust,
+        event,
+        input,
+        AdapterKind::Codex,
+        CODEX_ADAPTER_VERSION,
+        "codex",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_vendor_with_provider_trust(
+    root: &Path,
+    config: &BrainConfig,
+    store: &BrainStore,
+    provider_trust: &BTreeMap<String, ProviderTrustStatus>,
+    event: HookEvent,
+    input: &CodexHookInput,
+    adapter_kind: AdapterKind,
+    adapter_version: u16,
+    identity_namespace: &'static str,
+) -> Result<CodexHookOutput, AppError> {
     let started = Instant::now();
-    let internal_event = match to_internal_event(root, config, event, input) {
+    let internal_event = match to_internal_event(
+        root,
+        config,
+        event,
+        input,
+        adapter_kind,
+        adapter_version,
+        identity_namespace,
+    ) {
         Ok(internal_event) => internal_event,
         Err(error) => {
             if let Some(output) = failure_output(event, input, &error.to_string()) {
@@ -135,6 +168,9 @@ fn to_internal_event(
     config: &BrainConfig,
     event: HookEvent,
     input: &CodexHookInput,
+    adapter_kind: AdapterKind,
+    adapter_version: u16,
+    identity_namespace: &'static str,
 ) -> Result<InternalHookEvent, AppError> {
     let cwd = if input.cwd.trim().is_empty() {
         root.to_string_lossy().into_owned()
@@ -142,7 +178,10 @@ fn to_internal_event(
         input.cwd.clone()
     };
     let session_key = if input.session_id.trim().is_empty() {
-        hash_id("codex_session", &[&config.project_key, &cwd])
+        hash_id(
+            &format!("{identity_namespace}_session"),
+            &[&config.project_key, &cwd],
+        )
     } else {
         input.session_id.clone()
     };
@@ -157,8 +196,13 @@ fn to_internal_event(
             origin: IntentOrigin::Interactive,
         }),
         HookEvent::PreToolUse => {
-            let (operation_id, tool_name, action) =
-                normalized_tool(root, &config.project_key, &session_key, input);
+            let (operation_id, tool_name, action) = normalized_tool(
+                root,
+                &config.project_key,
+                &session_key,
+                input,
+                identity_namespace,
+            );
             HookEventPayload::ToolAboutToRun(ToolAboutToRun {
                 operation_id,
                 tool_name,
@@ -166,8 +210,13 @@ fn to_internal_event(
             })
         }
         HookEvent::PostToolUse => {
-            let (operation_id, tool_name, action) =
-                normalized_tool(root, &config.project_key, &session_key, input);
+            let (operation_id, tool_name, action) = normalized_tool(
+                root,
+                &config.project_key,
+                &session_key,
+                input,
+                identity_namespace,
+            );
             HookEventPayload::ToolFinished(ToolFinished {
                 operation_id,
                 tool_name,
@@ -181,16 +230,21 @@ fn to_internal_event(
             vendor_loop_active: input.stop_hook_active,
         }),
     };
-    let (event_id, identity_quality) =
-        event_identity(event, input, &config.project_key, &session_key)?;
+    let (event_id, identity_quality) = event_identity(
+        event,
+        input,
+        &config.project_key,
+        &session_key,
+        identity_namespace,
+    )?;
     let event = InternalHookEvent {
         protocol_version: HOOK_PROTOCOL_VERSION,
         project_key: config.project_key.clone(),
         event_id,
         idempotency: IdempotencyMetadata { identity_quality },
         adapter: AdapterIdentity {
-            kind: AdapterKind::Codex,
-            adapter_version: CODEX_ADAPTER_VERSION,
+            kind: adapter_kind,
+            adapter_version,
         },
         session_key,
         cwd,
@@ -206,6 +260,7 @@ fn event_identity(
     input: &CodexHookInput,
     project_key: &str,
     session_key: &str,
+    identity_namespace: &'static str,
 ) -> Result<(String, EventIdentityQuality), AppError> {
     let event_name = match event {
         HookEvent::SessionStart => "session_opened",
@@ -233,7 +288,7 @@ fn event_identity(
     if let Some((stable_key, quality)) = stable_vendor_key {
         return Ok((
             hash_id_bytes(
-                "codex_event",
+                &format!("{identity_namespace}_event"),
                 &[
                     project_key.as_bytes(),
                     session_key.as_bytes(),
@@ -248,7 +303,7 @@ fn event_identity(
     let sequence = DELIVERY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     Ok((
         hash_id_bytes(
-            "codex_event",
+            &format!("{identity_namespace}_event"),
             &[
                 project_key.as_bytes(),
                 session_key.as_bytes(),
@@ -267,6 +322,7 @@ fn normalized_tool(
     project_key: &str,
     session_key: &str,
     input: &CodexHookInput,
+    identity_namespace: &'static str,
 ) -> (String, String, ToolAction) {
     let command = input
         .tool_input
@@ -290,7 +346,7 @@ fn normalized_tool(
     let operation_id = if input.tool_use_id.trim().is_empty() {
         let action_json = serde_json::to_vec(&action).unwrap_or_default();
         hash_id_bytes(
-            "codex_operation",
+            &format!("{identity_namespace}_operation"),
             &[
                 input.session_id.as_bytes(),
                 project_key.as_bytes(),
@@ -302,7 +358,7 @@ fn normalized_tool(
         )
     } else {
         hash_id(
-            "codex_operation",
+            &format!("{identity_namespace}_operation"),
             &[project_key, session_key, &input.tool_use_id],
         )
     };
