@@ -3,6 +3,7 @@ mod app;
 mod codex;
 mod error;
 mod git;
+mod index;
 mod reconcile;
 
 use std::{path::PathBuf, process::ExitCode};
@@ -48,6 +49,21 @@ enum Command {
         base: String,
     },
 
+    /// 为当前工作区建立完整的 Provider-neutral 符号图快照
+    Index,
+
+    /// 查询本地符号图
+    Symbols {
+        #[arg(long)]
+        path: Option<String>,
+
+        #[arg(long)]
+        include_removed: bool,
+
+        #[arg(long, default_value_t = 200)]
+        limit: u32,
+    },
+
     /// 输出最近的本地 Hook 审计记录
     Audit {
         #[arg(long, default_value_t = 20)]
@@ -67,6 +83,13 @@ fn main() -> ExitCode {
             App::open(cli.project_root).and_then(|app| app.reconcile(&base, &envelope))
         }
         Command::Analyze { base } => App::open(cli.project_root).and_then(|app| app.analyze(&base)),
+        Command::Index => App::open(cli.project_root).and_then(|app| app.index()),
+        Command::Symbols {
+            path,
+            include_removed,
+            limit,
+        } => App::open(cli.project_root)
+            .and_then(|app| app.symbols(path.as_deref(), include_removed, limit)),
         Command::Audit { limit } => App::open(cli.project_root).and_then(|app| app.audit(limit)),
     };
 

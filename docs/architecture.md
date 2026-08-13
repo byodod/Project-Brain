@@ -37,6 +37,26 @@ Git zero-context diff
               └── removed_symbols
 ```
 
+完整仓库语义基础走 Provider-neutral 快照路径：
+
+```text
+Tracked + unignored files
+          │
+          ▼
+  Symbol Provider
+  ├── Tree-sitter Rust: syntax_fallback
+  └── future semantic provider
+          │ SymbolSnapshot
+          ▼
+  SQLite derived graph
+  ├── active nodes
+  ├── removed history
+  └── lexical/semantic edges
+```
+
+`brain-symbols` 只定义 Provider、节点、边、快照和身份质量；它不依赖 Tree-sitter、
+Git 或 SQLite。`brain-analyzer` 是 Provider，`brain-store` 只消费完整快照。
+
 `brain-core` 不依赖文件系统、Git、SQLite 或任何 Agent SDK。相同输入、配置和 schema_version 必须产生相同决策。
 
 ## 权威来源
@@ -49,10 +69,12 @@ Git zero-context diff
 
 .project-brain/brain.db
         │
-        └── audit_events 本地派生记录、不进入版本控制
+        ├── audit_events 本地派生记录、不进入版本控制
+        └── symbol graph 可从工作区完整重建的派生索引
 ```
 
-后续加入符号图时，也应能从仓库重新推导；SQLite 中的代码事实不能成为不可恢复的唯一来源。
+SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照以事务应用；快照中消失的节点
+进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
 
 ## 阻断权限
 
@@ -76,8 +98,13 @@ external diff，避免分析动作执行仓库配置中的外部程序。
 
 ## 下一阶段
 
-1. 增加事件幂等键和 schema migration 测试。
-2. 把 changed-symbol 纳入符号级 Change Envelope 与规则 scope。
-3. 增加 Claude Code 和 Prime Agent 适配器；核心协议保持不变。
-4. 扩展更多语言 grammar，并通过语言原生分析器补足跨文件语义解析。
-5. 最后才加入只读、可拔插的 Semantic Sentinel。
+1. 先拆分 runtime-neutral 的 event phase、verdict、effect 与 adapter receipt，并补齐幂等、
+   恢复、Stop continuation cap 和 sidecar 最小权限边界。
+2. 在公共 capability negotiation 之上增加 Claude Code 和 Prime Agent 适配器；Goal 与
+   Heartbeat 分别建模为 WorkIntent、WakeupSchedule，不伪装成 Hook。
+3. 消费 rust-analyzer SCIP 作为 Rust semantic Provider，并由 Brain 维护独立的
+   IdentityTransition/lineage；不自建解析器或类型检查器。
+4. 把符号图纳入符号级 Change Envelope 与规则 scope，再试点 C#/TypeScript/Python。
+5. 最后才加入只读、可拔插且首发仅 inject 的 Semantic Sentinel；LLM-only 结论永不 hard block。
+
+相关决策见 [ADR-0001](adr/0001-provider-neutral-symbol-identity.md)。

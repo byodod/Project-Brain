@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 brain-core = { path = "../brain-core" }
+brain-symbols = { path = "../brain-symbols" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

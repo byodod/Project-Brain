@@ -11,6 +11,8 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - Git Change Envelope 范围核对；
 - Codex `Stop` 自动 Change Envelope 对账与防循环保护；
 - 基于 Tree-sitter 的 Rust changed-symbol 与纯删除符号提取；
+- Provider-neutral 符号身份协议、完整工作区快照与本地派生符号图；
+- SQLite schema v1→v2 迁移、符号 removed 历史与幂等增量更新；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
 ## 核心原则
@@ -20,6 +22,7 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 3. `agent_inference` 和 `observed_pattern` 只能提供上下文或升级为待决策事项。
 4. SQLite 是本地审计和派生状态，不是仓库规则的权威来源。
 5. `PostToolUse` 无法撤销已经发生的副作用，只能阻止 Agent 把结果视为完成。
+6. 语法 Provider 的身份必须标记为 `syntax_fallback`，不得冒充跨 rename/move 稳定语义。
 
 ## 构建与测试
 
@@ -146,6 +149,26 @@ project-brain analyze --base HEAD
 纯删除 hunk 从 Git 基线读取旧源码，因此删除函数不会丢失。当前同时报告叶级符号和词法所有者，
 例如 `impl Worker` 与 `impl Worker::run`。
 
+## 符号图
+
+对当前工作区的已跟踪与未忽略、未跟踪 Rust 文件建立完整快照：
+
+```text
+project-brain index
+```
+
+重复执行相同快照是幂等的；消失的符号保留为 `removed` 历史。查询当前符号：
+
+```text
+project-brain symbols --path crates/brain-core --limit 50
+```
+
+需要查看历史时增加 `--include-removed`。当前 Tree-sitter Provider 明确输出
+`identity_quality: syntax_fallback`：相同路径、种类和限定名具有可重复 ID，但 rename/move
+会产生新 ID，Runtime 不会自动声称其 lineage 相同。快照 revision 还覆盖所有受支持源文件
+的内容摘要和语法错误状态，因此无符号文件的变化也可检测；没有首个 commit 的仓库使用显式
+unborn HEAD 标记。未来 SCIP 等语义 Provider 可接入同一协议，跨快照 lineage 由 Brain 自己维护。
+
 ## Workspace
 
 ```text
@@ -153,6 +176,7 @@ crates/
 ├── brain-analyzer/   # Tree-sitter changed-symbol 提取
 ├── brain-core/       # 协议、规则验证、确定性决策
 ├── brain-store/      # SQLite schema 与审计
+├── brain-symbols/    # Provider-neutral 符号、边、快照与身份协议
 └── project-brain/    # CLI、Git、Codex Hook 适配
 ```
 
@@ -165,6 +189,8 @@ crates/
 
 - 当前只提供 Codex 适配器；Claude Code 和 Prime Agent 尚未实现。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
-- changed-symbol 当前只支持 Rust；LSP/SCIP、跨文件引用和符号图尚未接入。
+- changed-symbol 与图 Provider 当前只支持 Rust；LSP/SCIP 和跨文件语义引用尚未接入。
+- 当前图只有 Tree-sitter 可确定的词法 `contains` 边；调用、引用、实现关系需要语义 Provider。
+- syntax fallback 不自动关联 rename/move lineage；这必须由语义证据或显式确认完成。
 - `Stop` 自动对账只核对文件范围；符号级 Change Envelope 约束尚未加入。
 - Semantic Sentinel / Architecture Judge 尚未加入；这是有意的 V0 边界。

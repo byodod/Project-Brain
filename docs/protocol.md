@@ -102,3 +102,53 @@ Adapter 不得自行重新解释某条项目规则。
 
 行号为一基、闭区间。`has_syntax_errors` 不会阻止输出 Tree-sitter 可恢复的局部结果，
 但调用方不得把存在语法错误的结果提升为强阻断事实。
+
+## SymbolSnapshot
+
+符号协议独立使用 `protocol_version`。Provider 必须声明身份质量：
+
+```json
+{
+  "protocol_version": 1,
+  "provider": {
+    "id": "tree-sitter-rust-syntax",
+    "version": "0.1.0+tree-sitter-rust-0.24.2",
+    "identity_quality": "syntax_fallback"
+  },
+  "source_revision": "worktree_v2_<sha256>",
+  "sources": [
+    {
+      "path": "src/lib.rs",
+      "language": "rust",
+      "content_fingerprint": "sha256_<digest>",
+      "has_syntax_errors": false
+    }
+  ],
+  "symbols": [],
+  "edges": []
+}
+```
+
+`SymbolNode.id` 是 Provider ID 与不歧义 `provider_key` 的摘要。它保证同一个 Provider
+声明下可重复，不表示跨 Provider 的全局真相。Provider ID 同时定义 `provider_key` 的
+语义契约：破坏性 key 变更必须使用新 ID；兼容的实现或工具链升级只更新 version，
+以保持已有符号身份。
+
+身份质量：
+
+- `syntax_fallback`：路径、声明种类、限定名与 occurrence 驱动；rename/move 后产生新 ID。
+- `semantic`：由语言语义 Provider 给出；其跨版本保证必须由对应 Provider contract 定义。
+
+`source_revision` 覆盖 HEAD（unborn 仓库使用显式 symbolic-ref 标记）、Provider、全部受支持
+源文件的路径/语言/原始内容摘要/语法错误状态，以及节点和边。无符号文件的变化也必须改变 revision。
+
+完整快照的规则：
+
+1. 源文件路径必须规范化且唯一，摘要必须是完整 SHA-256；
+2. 所有节点必须对应源文件清单中的路径；
+3. 所有节点与边必须属于同一个 Provider；
+4. 边不得引用快照外节点；
+5. 输入节点必须为 `active`；
+6. 应用快照时，旧的 active 节点若消失则转为 `removed`；
+7. 相同快照重复应用必须得到全量 `unchanged`；
+8. 任何 rename/move lineage 都不能仅由 `syntax_fallback` 自动批准。

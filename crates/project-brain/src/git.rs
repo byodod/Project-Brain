@@ -31,7 +31,7 @@ pub fn changed_files(root: &Path, base: &str) -> Result<Vec<String>, AppError> {
         .output()?;
     ensure_success(&diff)?;
 
-    let mut files = parse_null_paths(&diff.stdout);
+    let mut files = parse_null_paths(&diff.stdout)?;
     files.extend(untracked_files(root)?);
     Ok(files.into_iter().collect())
 }
@@ -42,7 +42,57 @@ pub fn untracked_files(root: &Path) -> Result<BTreeSet<String>, AppError> {
         .args(["ls-files", "--others", "--exclude-standard", "-z"])
         .output()?;
     ensure_success(&output)?;
-    Ok(parse_null_paths(&output.stdout))
+    parse_null_paths(&output.stdout)
+}
+
+pub fn repository_files(root: &Path) -> Result<Vec<String>, AppError> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .output()?;
+    ensure_success(&output)?;
+    Ok(parse_null_paths(&output.stdout)?.into_iter().collect())
+}
+
+pub fn head_revision(root: &Path) -> Result<String, AppError> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        .output()?;
+    if output.status.success() {
+        return String::from_utf8(output.stdout)
+            .map(|revision| revision.trim().to_owned())
+            .map_err(|_| AppError::Git("HEAD revision 不是 UTF-8".to_owned()));
+    }
+
+    let symbolic = Command::new("git")
+        .current_dir(root)
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .output()?;
+    if !symbolic.status.success() {
+        return Err(AppError::Git(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    let reference = String::from_utf8(symbolic.stdout)
+        .map_err(|_| AppError::Git("HEAD symbolic ref 不是 UTF-8".to_owned()))?;
+    let reference = reference.trim();
+    let existing = Command::new("git")
+        .current_dir(root)
+        .args(["show-ref", "--verify", "--quiet", reference])
+        .output()?;
+    if existing.status.code() == Some(1) {
+        return Ok(format!("unborn:{reference}"));
+    }
+    Err(AppError::Git(
+        String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    ))
 }
 
 pub fn diff_hunks(root: &Path, base: &str, path: &str) -> Result<Vec<DiffHunk>, AppError> {
@@ -75,7 +125,9 @@ pub fn file_at_revision(root: &Path, base: &str, path: &str) -> Result<Option<St
         .args(["show", "--no-ext-diff", "--format=", &spec])
         .output()?;
     if output.status.success() {
-        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+        return String::from_utf8(output.stdout)
+            .map(Some)
+            .map_err(|_| AppError::NonUtf8Source(path.to_owned()));
     }
     let error = String::from_utf8_lossy(&output.stderr);
     if error.contains("does not exist in") || error.contains("exists on disk, but not in") {
@@ -122,22 +174,41 @@ fn ensure_success(output: &Output) -> Result<(), AppError> {
     ))
 }
 
-fn parse_null_paths(bytes: &[u8]) -> BTreeSet<String> {
+fn parse_null_paths(bytes: &[u8]) -> Result<BTreeSet<String>, AppError> {
     bytes
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-        .map(|path| normalize_project_path(&String::from_utf8_lossy(path)))
+        .map(|path| {
+            String::from_utf8(path.to_vec())
+                .map(|path| normalize_project_path(&path))
+                .map_err(|_| AppError::NonUtf8GitPath)
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DiffHunk, parse_hunk_header, parse_null_paths};
+    use std::{
+        fs,
+        path::PathBuf,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{DiffHunk, head_revision, parse_hunk_header, parse_null_paths};
     use brain_analyzer::LineRange;
+
+    fn test_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("project-brain-git-{}-{nonce}", std::process::id()))
+    }
 
     #[test]
     fn parses_and_sorts_null_delimited_git_paths() {
-        let paths = parse_null_paths(b"src/z.rs\0src/a.rs\0");
+        let paths = parse_null_paths(b"src/z.rs\0src/a.rs\0").unwrap();
         assert_eq!(
             paths.into_iter().collect::<Vec<_>>(),
             vec!["src/a.rs".to_owned(), "src/z.rs".to_owned()]
@@ -160,5 +231,27 @@ mod tests {
                 new: None,
             })
         );
+    }
+
+    #[test]
+    fn rejects_non_utf8_paths_instead_of_aliasing_them() {
+        assert!(parse_null_paths(b"src/\xff.rs\0").is_err());
+    }
+
+    #[test]
+    fn represents_an_unborn_head_without_requiring_a_commit() {
+        let root = test_root();
+        fs::create_dir_all(&root).unwrap();
+        let init = Command::new("git")
+            .current_dir(&root)
+            .arg("init")
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+
+        let revision = head_revision(&root).unwrap();
+        assert!(revision.starts_with("unborn:refs/heads/"));
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

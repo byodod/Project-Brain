@@ -6,7 +6,7 @@ use std::{
 
 use brain_core::{
     ActionDescriptor, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, DecisionKind, MemoryStatus,
-    Rule, RuleEffect, RuleEngine, RuleStrength, StopReconcileConfig,
+    Rule, RuleEffect, RuleEngine, RuleStrength, StopReconcileConfig, normalize_project_path,
 };
 use brain_store::BrainStore;
 use clap::ValueEnum;
@@ -15,7 +15,7 @@ use crate::{
     analyze,
     codex::{self, CodexHookInput},
     error::AppError,
-    reconcile,
+    index, reconcile,
 };
 
 const BRAIN_DIRECTORY: &str = ".project-brain";
@@ -114,6 +114,32 @@ impl App {
 
     pub fn analyze(&self, base: &str) -> Result<(), AppError> {
         println!("{}", pretty_json(&analyze::evaluate(&self.root, base)?)?);
+        Ok(())
+    }
+
+    pub fn index(&self) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&index::evaluate(&self.root, &self.store)?)?
+        );
+        Ok(())
+    }
+
+    pub fn symbols(
+        &self,
+        path: Option<&str>,
+        include_removed: bool,
+        limit: u32,
+    ) -> Result<(), AppError> {
+        let normalized_path = path.map(normalize_project_path);
+        println!(
+            "{}",
+            pretty_json(&self.store.list_symbols(
+                normalized_path.as_deref(),
+                include_removed,
+                limit,
+            )?)?
+        );
         Ok(())
     }
 

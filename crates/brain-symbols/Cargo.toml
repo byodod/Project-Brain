@@ -1,5 +1,5 @@
 [package]
-name = "brain-analyzer"
+name = "brain-symbols"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,11 +7,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-brain-symbols = { path = "../brain-symbols" }
 serde.workspace = true
-thiserror.workspace = true
-tree-sitter.workspace = true
-tree-sitter-rust.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

@@ -10,6 +10,7 @@ authors.workspace = true
 brain-analyzer = { path = "../brain-analyzer" }
 brain-core = { path = "../brain-core" }
 brain-store = { path = "../brain-store" }
+brain-symbols = { path = "../brain-symbols" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
