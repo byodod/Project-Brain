@@ -185,6 +185,16 @@ enum ProviderCommand {
         timeout_seconds: u64,
     },
 
+    /// 重复运行 Provider 并比较完整文档集合与语义指纹；不会提交 semantic snapshot
+    VerifyStability {
+        #[arg(long)]
+        profile: String,
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u8).range(2..=20))]
+        runs: u8,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
+    },
+
     /// 检查最新语义快照对声明源码的实际覆盖；partial/stale 返回非零
     Coverage {
         /// 同时要求每个 profile 已索引且覆盖率可验证为 complete
@@ -399,6 +409,16 @@ fn main() -> ExitCode {
                 } => {
                     app.index_with_provider(cli.install_root.as_deref(), &profile, timeout_seconds)
                 }
+                ProviderCommand::VerifyStability {
+                    profile,
+                    runs,
+                    timeout_seconds,
+                } => app.verify_provider_stability(
+                    cli.install_root.as_deref(),
+                    &profile,
+                    runs,
+                    timeout_seconds,
+                ),
                 ProviderCommand::Coverage { require_indexed } => {
                     app.provider_coverage(require_indexed)
                 }

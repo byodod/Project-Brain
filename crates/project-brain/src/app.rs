@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env, fs,
     io::{self, Read},
     path::{Path, PathBuf},
@@ -495,6 +496,144 @@ impl App {
             }))?
         );
         Ok(())
+    }
+
+    pub fn verify_provider_stability(
+        &self,
+        install_root: Option<&Path>,
+        profile: &str,
+        runs: u8,
+        timeout_seconds: u64,
+    ) -> Result<(), AppError> {
+        let mut observations = Vec::with_capacity(usize::from(runs));
+        let mut baseline_documents: Option<BTreeSet<String>> = None;
+        let mut divergent_document_sample = BTreeSet::new();
+        let mut document_sets_equal = true;
+        let mut semantic_snapshots_equal = true;
+        let mut all_complete = true;
+        let mut baseline_semantic_fingerprint: Option<String> = None;
+        let mut baseline_source_fingerprint: Option<String> = None;
+        let mut baseline_provider_binding: Option<(String, u64, String)> = None;
+
+        for run_number in 1..=runs {
+            let (run, prepared) =
+                self.prepare_provider_stability_run(install_root, profile, timeout_seconds)?;
+            let current_source = run.source_fingerprint().to_owned();
+            if baseline_source_fingerprint
+                .as_ref()
+                .is_some_and(|baseline| baseline != &current_source)
+            {
+                let error =
+                    AppError::Provider("稳定性验证期间源码指纹发生变化；所有观测作废".to_owned());
+                provider::record_import_failure(install_root, &run, &error)?;
+                return Err(error);
+            }
+            baseline_source_fingerprint.get_or_insert(current_source);
+            let current_binding = (
+                run.registration_id().to_owned(),
+                run.registration_revision(),
+                run.executable_sha256().to_owned(),
+            );
+            if baseline_provider_binding
+                .as_ref()
+                .is_some_and(|baseline| baseline != &current_binding)
+            {
+                let error = AppError::Provider(
+                    "稳定性验证期间 Provider 绑定、revision 或 executable SHA-256 发生变化；所有观测作废"
+                        .to_owned(),
+                );
+                provider::record_import_failure(install_root, &run, &error)?;
+                return Err(error);
+            }
+            baseline_provider_binding.get_or_insert(current_binding);
+
+            let evidence = prepared.stability_evidence();
+            let documents = prepared.document_paths();
+            if let Some(baseline) = &baseline_documents {
+                if baseline != &documents {
+                    document_sets_equal = false;
+                    divergent_document_sample
+                        .extend(baseline.symmetric_difference(&documents).take(200).cloned());
+                }
+            } else {
+                baseline_documents = Some(documents);
+            }
+            if baseline_semantic_fingerprint
+                .as_ref()
+                .is_some_and(|baseline| baseline != &evidence.semantic_snapshot_fingerprint)
+            {
+                semantic_snapshots_equal = false;
+            }
+            baseline_semantic_fingerprint
+                .get_or_insert_with(|| evidence.semantic_snapshot_fingerprint.clone());
+            all_complete &= evidence.coverage_status == "complete";
+            provider::record_stability_observed(install_root, &run)?;
+            observations.push(serde_json::json!({
+                "run": run_number,
+                "execution": run.report(),
+                "evidence": evidence,
+            }));
+        }
+
+        let status = if document_sets_equal && semantic_snapshots_equal && all_complete {
+            "stable_complete"
+        } else if !document_sets_equal || !semantic_snapshots_equal {
+            "nondeterministic"
+        } else {
+            "stable_incomplete"
+        };
+        let report = serde_json::json!({
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "project_key": self.config.project_key,
+            "provider_profile": profile,
+            "status": status,
+            "runs_requested": runs,
+            "document_sets_equal": document_sets_equal,
+            "semantic_snapshots_equal": semantic_snapshots_equal,
+            "all_runs_coverage_complete": all_complete,
+            "divergent_document_sample": divergent_document_sample,
+            "snapshot_committed": false,
+            "observations": observations,
+        });
+        println!("{}", pretty_json(&report)?);
+        if status == "stable_complete" {
+            Ok(())
+        } else {
+            Err(AppError::Provider(format!(
+                "Provider 稳定性验证未通过：status={status}；未提交 semantic snapshot"
+            )))
+        }
+    }
+
+    fn prepare_provider_stability_run(
+        &self,
+        install_root: Option<&Path>,
+        profile: &str,
+        timeout_seconds: u64,
+    ) -> Result<(provider::ProviderRun, scip_index::PreparedScipIndex), AppError> {
+        let run = provider::execute(
+            install_root,
+            &self.root,
+            &self.config.project_key,
+            &self.config.semantic_providers,
+            profile,
+            timeout_seconds,
+        )?;
+        let prepared = match scip_index::prepare(
+            &self.root,
+            &self.config.project_key,
+            &self.config.language_profiles,
+            &self.config.semantic_providers,
+            profile,
+            run.output_path(),
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                provider::record_import_failure(install_root, &run, &error)?;
+                return Err(error);
+            }
+        };
+        Ok((run, prepared))
     }
 
     pub fn provider_coverage(&self, require_indexed: bool) -> Result<(), AppError> {

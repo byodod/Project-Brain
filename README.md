@@ -353,7 +353,20 @@ Node entrypoint 哈希，关闭 stdin，使用环境白名单和净化后的 `PA
 每次导入同时输出 `coverage`：Project Brain 把 Git 已跟踪及未忽略文件与 Provider 实际 Document
 逐语言比较。Rust、Python、C#、Visual Basic、F# 使用显式扩展名契约；自定义语言不会被猜测，
 而是报告 `unverifiable`。报告包含 expected/indexed/provider document 数量以及最多 200 条缺失和
-Provider-only 路径样本。`partial` 仍允许保存可用的语义事实，但绝不能被误读成全仓覆盖。
+Provider-only 路径样本。只有 `complete` 可以提交为 semantic snapshot；`partial` 与
+`unverifiable` 会在写入 SQLite 前失败，因此不会替换 latest semantic snapshot，也不能产生新的
+hard semantic truth。
+
+对不稳定或刚升级的 Provider，先执行只读稳定性验证：
+
+```text
+project-brain provider verify-stability --profile rust-main --runs 5 --timeout-seconds 300
+```
+
+该命令固定同一源码指纹、机器绑定 revision 与 executable SHA-256，逐次比较完整 Document 路径集合
+和完整 provider-neutral semantic snapshot 指纹。只有所有运行均 `complete` 且两类指纹都一致时返回
+成功；任何不完整或非确定性结果都返回非零。原始 Provider audit 会保留，但命令永远不提交快照，
+也不会把多次失败结果取并集。
 
 如果 `.scip` 由 CI 或其他流程生成，仍可按项目内稳定 profile ID 手工导入：
 

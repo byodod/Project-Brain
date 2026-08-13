@@ -14,6 +14,7 @@ use brain_store::{
 };
 use brain_symbols::{ProviderDescriptor, SourceFileState, SourceLanguage};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::{error::AppError, git};
 
@@ -42,6 +43,14 @@ pub struct PreparedScipIndex {
     imported: ScipImport,
     source: SemanticSnapshotSource,
     coverage: SemanticCoverageReport,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ScipStabilityEvidence {
+    pub semantic_snapshot_fingerprint: String,
+    pub document_manifest_hash: String,
+    pub document_count: u64,
+    pub coverage_status: &'static str,
 }
 
 const COVERAGE_PATH_SAMPLE_LIMIT: usize = 200;
@@ -108,6 +117,24 @@ impl PreparedScipIndex {
             executable_sha256.to_owned(),
             artifact_sha256.to_owned(),
         );
+    }
+
+    pub fn stability_evidence(&self) -> ScipStabilityEvidence {
+        ScipStabilityEvidence {
+            semantic_snapshot_fingerprint: self.imported.snapshot.source_revision.clone(),
+            document_manifest_hash: document_manifest_hash(&self.imported.snapshot.sources),
+            document_count: u64::try_from(self.imported.snapshot.sources.len()).unwrap_or(u64::MAX),
+            coverage_status: self.coverage.status,
+        }
+    }
+
+    pub fn document_paths(&self) -> BTreeSet<String> {
+        self.imported
+            .snapshot
+            .sources
+            .iter()
+            .map(|source| source.path.clone())
+            .collect()
     }
 }
 
@@ -193,6 +220,7 @@ pub fn commit(
     store: &BrainStore,
     prepared: PreparedScipIndex,
 ) -> Result<ScipIndexReport, AppError> {
+    ensure_committable_coverage(&prepared.coverage)?;
     let apply = store.apply_semantic_snapshot(
         &prepared.imported.snapshot,
         &prepared.provider_profile,
@@ -218,6 +246,33 @@ pub fn commit(
             .unwrap_or(u64::MAX),
         apply,
     })
+}
+
+fn ensure_committable_coverage(coverage: &SemanticCoverageReport) -> Result<(), AppError> {
+    if coverage.status == "complete" {
+        return Ok(());
+    }
+    Err(AppError::ScipProfileMismatch(format!(
+        "semantic coverage={}；仅 complete 快照可以成为治理事实（indexed={}/{}, missing_sample={:?}）",
+        coverage.status,
+        coverage.indexed_source_files,
+        coverage.expected_source_files,
+        coverage.missing_source_file_sample
+    )))
+}
+
+fn document_manifest_hash(sources: &[SourceFileState]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"project-brain/scip-document-manifest/v1\0");
+    let paths = sources
+        .iter()
+        .map(|source| source.path.as_str())
+        .collect::<BTreeSet<_>>();
+    for path in paths {
+        digest.update(u64::try_from(path.len()).unwrap_or(u64::MAX).to_le_bytes());
+        digest.update(path.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 pub fn doctor_coverage(
@@ -751,7 +806,9 @@ mod tests {
     };
 
     use super::{
-        doctor_coverage, evaluate_coverage_from_files, import_profile, validate_project_roots,
+        LanguageCoverageReport, SemanticCoverageReport, doctor_coverage, document_manifest_hash,
+        ensure_committable_coverage, evaluate_coverage_from_files, import_profile,
+        validate_project_roots,
     };
     use crate::git;
 
@@ -838,6 +895,59 @@ mod tests {
         assert_eq!(report.indexed_source_files, 1);
         assert_eq!(report.missing_source_file_sample, vec!["src/b.py"]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn only_complete_coverage_can_be_committed() {
+        let report = |status| SemanticCoverageReport {
+            status,
+            expected_source_files: 2,
+            indexed_source_files: if status == "complete" { 2 } else { 1 },
+            provider_documents: 2,
+            missing_source_files: u64::from(status != "complete"),
+            missing_source_file_sample: if status == "complete" {
+                Vec::new()
+            } else {
+                vec!["src/missing.rs".to_owned()]
+            },
+            provider_only_files: 0,
+            provider_only_file_sample: Vec::new(),
+            languages: vec![LanguageCoverageReport {
+                language: "rust".to_owned(),
+                status,
+                expected_source_files: 2,
+                indexed_source_files: 1,
+                provider_documents: 1,
+                missing_source_files: 1,
+                missing_source_file_sample: vec!["src/missing.rs".to_owned()],
+                provider_only_files: 0,
+                provider_only_file_sample: Vec::new(),
+                recognized_extensions: vec!["rs"],
+            }],
+        };
+
+        assert!(ensure_committable_coverage(&report("complete")).is_ok());
+        assert!(ensure_committable_coverage(&report("partial")).is_err());
+        assert!(ensure_committable_coverage(&report("unverifiable")).is_err());
+    }
+
+    #[test]
+    fn stability_document_manifest_is_order_independent_and_path_sensitive() {
+        let first =
+            SourceFileState::from_source("src/a.rs", SourceLanguage::rust(), b"fn a() {}", false);
+        let second =
+            SourceFileState::from_source("src/b.rs", SourceLanguage::rust(), b"fn b() {}", false);
+        assert_eq!(
+            document_manifest_hash(&[first.clone(), second.clone()]),
+            document_manifest_hash(&[second.clone(), first])
+        );
+        assert_ne!(
+            document_manifest_hash(std::slice::from_ref(&second)),
+            document_manifest_hash(&[SourceFileState {
+                path: "src/c.rs".to_owned(),
+                ..second
+            }])
+        );
     }
 
     #[test]

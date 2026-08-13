@@ -316,6 +316,11 @@ Git 已跟踪及未忽略、位于声明 roots 且扩展名属于该 language �
 未知 language 必须报告 `unverifiable`，不得猜扩展名。已有快照的 `partial` 或与当前 worktree/HEAD
 不一致的 `stale` 会使显式 `doctor` 降级；从未索引则只报告 `not_indexed` warning。
 
+新导入只有 `complete` 才能进入 snapshot transaction。`partial` 与 `unverifiable` 在 store mutation
+之前失败，不能更新 latest semantic snapshot。稳定性验证必须在相同源码指纹、Provider registration
+revision 与 executable SHA-256 下重复运行，分别比较完整 Document path set 和完整 semantic snapshot
+fingerprint；诊断重试不得把多次不完整输出取并集。
+
 ## Symbol scope 与证据等级
 
 仓库规则通过 `symbol_scopes` 固定 provider profile/contract、language、anchor snapshot/symbol 和

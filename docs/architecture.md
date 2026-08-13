@@ -140,6 +140,10 @@ Source manifest 与新快照在同一 SQLite 事务内写入，并保存路径/l
 摘要。旧库迁移绝不从“仍有 symbol 的文件”推断完整文档集合；只有真实重跑完整 Provider 输入才可
 补录。索引报告与显式 doctor 将 manifest 和 Git 当前文件集合比较，区分 complete、partial、stale、
 not_indexed 与 unverifiable，避免“Provider 成功退出”等价于“全仓源码已覆盖”的错误推论。
+新 Provider 输出只有覆盖率为 complete 才允许进入 snapshot transaction；partial/unverifiable 只留下
+机器级运行审计。`provider verify-stability` 以 workspace index 为快速路径，固定源码与 executable
+身份后重复比较 Document manifest 和完整 semantic snapshot 指纹，且永不提交观测结果。多次失败
+workspace run 的 union 不构成一致的语义世界，因此协议明确禁止。
 
 ## 阻断权限
 
@@ -180,8 +184,9 @@ Prime Agent 是独立 runtime，当前已确认的 Extension `agent_end` 不具�
 
 1. Internal Hook Protocol v1 与 Codex adapter 已加入文件和 symbol scope；继续在真实项目验证项目
    隔离、重放、并发交错、Provider 漂移降级、Stop 防循环与长会话延迟。
-2. 已接入机器级 SCIP Runner：Rust 用真实 rust-analyzer 端到端验证；.NET/Python 先用符合 producer
-   行为的合成 fixture 固定 C#/VB、空 Python language、未指定 kind 与 implementation 契约。
+2. 已接入机器级 SCIP Runner、complete-only commit 与重复运行稳定性证明；下一步先验证包含已知 SCIP
+   顺序修复的 rust-analyzer，再决定是否启用显式 package-shard fallback。.NET/Python 继续用符合
+   producer 行为的合成 fixture 固定 C#/VB、空 Python language、未指定 kind 与 implementation 契约。
 3. Semantic lineage 裁决与 symbol-scoped rules 已实现；下一步扩展 symbol set、split/merge 和调用图
    影响面，但仍不允许自动确认或 LLM hard block。
 4. 内部协议经验证后实现 Claude Code 与 Prime Agent adapter；Prime 继续按独立 runtime 处理。

@@ -259,6 +259,10 @@ impl ProviderRun {
     pub fn artifact_sha256(&self) -> &str {
         &self.report.artifact_sha256
     }
+
+    pub fn registration_revision(&self) -> u64 {
+        self.report.registration_revision
+    }
 }
 
 impl Drop for ProviderRun {
@@ -761,6 +765,19 @@ pub fn record_import_committed(
         explicit_install_root,
         run,
         "semantic_commit",
+        "success",
+        None,
+    )
+}
+
+pub fn record_stability_observed(
+    explicit_install_root: Option<&Path>,
+    run: &ProviderRun,
+) -> Result<(), AppError> {
+    record_import_event(
+        explicit_install_root,
+        run,
+        "stability_probe",
         "success",
         None,
     )
