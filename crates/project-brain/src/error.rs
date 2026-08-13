@@ -52,6 +52,9 @@ pub enum AppError {
     #[error("语义 Provider 执行失败：{0}")]
     Provider(String),
 
+    #[error("规则治理操作失败：{0}")]
+    Governance(String),
+
     #[error("Project Brain doctor 检查未通过：{0}")]
     DoctorDegraded(String),
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -121,6 +122,87 @@ pub struct ProviderDoctorReport {
     pub issues: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProviderTrustStatus {
+    pub profile_id: String,
+    pub ready: bool,
+    pub registration_id: Option<String>,
+    pub executable_sha256: Option<String>,
+    pub issue: Option<String>,
+}
+
+pub fn trust_status(
+    explicit_install_root: Option<&Path>,
+    project_root: &Path,
+    project_key: &str,
+    profiles: &[SemanticProviderProfile],
+) -> BTreeMap<String, ProviderTrustStatus> {
+    if profiles.is_empty() {
+        return BTreeMap::new();
+    }
+    let registry = resolve_install_root(explicit_install_root)
+        .and_then(|root| read_registry(&root))
+        .map_err(|error| error.to_string());
+    let canonical_root = project_root
+        .canonicalize()
+        .map_err(|error| error.to_string());
+    profiles
+        .iter()
+        .map(|profile| {
+            let status = match (&registry, &canonical_root) {
+                (Ok(registry), Ok(root)) => {
+                    let binding = registry.bindings.iter().find(|binding| {
+                        binding.project_key == project_key && binding.profile_id == profile.id
+                    });
+                    if let Some(binding) = binding {
+                        let issue = validate_binding(binding, profile)
+                            .and_then(|()| {
+                                reject_repository_artifact(
+                                    root,
+                                    &binding.executable,
+                                    "Provider executable",
+                                )?;
+                                if let Some(script) = &binding.launcher_script {
+                                    reject_repository_artifact(
+                                        root,
+                                        script,
+                                        "Provider launcher script",
+                                    )?;
+                                }
+                                Ok(())
+                            })
+                            .err()
+                            .map(|error| error.to_string());
+                        ProviderTrustStatus {
+                            profile_id: profile.id.clone(),
+                            ready: issue.is_none(),
+                            registration_id: Some(binding.registration_id.clone()),
+                            executable_sha256: Some(binding.executable.sha256.clone()),
+                            issue,
+                        }
+                    } else {
+                        ProviderTrustStatus {
+                            profile_id: profile.id.clone(),
+                            ready: false,
+                            registration_id: None,
+                            executable_sha256: None,
+                            issue: Some(format!("provider profile={} 尚未在本机绑定", profile.id)),
+                        }
+                    }
+                }
+                (Err(error), _) | (_, Err(error)) => ProviderTrustStatus {
+                    profile_id: profile.id.clone(),
+                    ready: false,
+                    registration_id: None,
+                    executable_sha256: None,
+                    issue: Some(error.clone()),
+                },
+            };
+            (profile.id.clone(), status)
+        })
+        .collect()
+}
+
 #[derive(Debug, Serialize)]
 struct ProviderAuditRecord<'a> {
     schema_version: u32,
@@ -164,6 +246,18 @@ impl ProviderRun {
 
     pub fn source_fingerprint(&self) -> &str {
         &self.report.source_fingerprint_after
+    }
+
+    pub fn registration_id(&self) -> &str {
+        &self.report.registration_id
+    }
+
+    pub fn executable_sha256(&self) -> &str {
+        &self.report.executable_sha256
+    }
+
+    pub fn artifact_sha256(&self) -> &str {
+        &self.report.artifact_sha256
     }
 }
 
@@ -1355,8 +1449,9 @@ mod tests {
     use sha2::Digest as _;
 
     use super::{
-        MAX_CAPTURE_BYTES, ProviderArtifact, ProviderBinding, drain_bounded, pinned_artifact,
-        provider_arguments, reject_repository_artifact, validate_binding, verify_probe_identity,
+        MAX_CAPTURE_BYTES, PROVIDER_SCHEMA_VERSION, ProviderArtifact, ProviderBinding,
+        ProviderRegistry, drain_bounded, pinned_artifact, provider_arguments,
+        reject_repository_artifact, trust_status, validate_binding, verify_probe_identity,
     };
 
     fn profile(producer: &str) -> SemanticProviderProfile {
@@ -1428,6 +1523,71 @@ mod tests {
         validate_binding(&binding, &profile("scip-python")).unwrap();
         fs::write(&executable, b"two").unwrap();
         assert!(validate_binding(&binding, &profile("scip-python")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hook_trust_status_requires_current_registration_and_executable_hash() {
+        let nonce = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "project-brain-provider-hook-trust-{}-{nonce}",
+            std::process::id()
+        ));
+        let project = root.join("project");
+        let install = root.join("install");
+        let tools = root.join("tools");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(install.join("state")).unwrap();
+        fs::create_dir_all(&tools).unwrap();
+        let executable = tools.join("scip-python-provider.bin");
+        fs::write(&executable, b"trusted").unwrap();
+        let binding = ProviderBinding {
+            registration_id: "registration-one".to_owned(),
+            revision: 1,
+            project_key: "project".to_owned(),
+            profile_id: "main".to_owned(),
+            producer: "scip-python".to_owned(),
+            executable: ProviderArtifact {
+                canonical_path: executable.canonicalize().unwrap(),
+                sha256: super::hash_file(&executable).unwrap(),
+            },
+            launcher_script: None,
+            resolved_version: "1".to_owned(),
+        };
+        let registry = ProviderRegistry {
+            schema_version: PROVIDER_SCHEMA_VERSION,
+            bindings: vec![binding],
+        };
+        fs::write(
+            install.join("state/providers.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+
+        let ready = trust_status(
+            Some(&install),
+            &project,
+            "project",
+            &[profile("scip-python")],
+        );
+        assert!(ready["main"].ready);
+        assert_eq!(
+            ready["main"].registration_id.as_deref(),
+            Some("registration-one")
+        );
+
+        fs::write(&executable, b"drifted").unwrap();
+        let drifted = trust_status(
+            Some(&install),
+            &project,
+            "project",
+            &[profile("scip-python")],
+        );
+        assert!(!drifted["main"].ready);
+        assert!(drifted["main"].issue.as_deref().unwrap().contains("漂移"));
         fs::remove_dir_all(root).unwrap();
     }
 

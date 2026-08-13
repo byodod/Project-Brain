@@ -231,6 +231,25 @@ pub struct ToolAction {
     pub target_files: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// 只有 adapter 能从结构化工具输入确定影响范围时才填写。shell 文本和无法
+    /// 唯一定位的 patch/edit 保持为空，因此不得获得符号级硬门控资格。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deterministic_impacts: Vec<ToolImpact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolImpact {
+    pub path: String,
+    #[serde(default)]
+    pub whole_file: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ranges: Vec<ToolLineRange>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolLineRange {
+    pub start_line: usize,
+    pub end_line: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

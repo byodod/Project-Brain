@@ -50,6 +50,7 @@ impl BrainConfig {
 
         for rule in &self.rules {
             rule.validate()?;
+            validate_rule_symbol_scopes(rule, &self.semantic_providers)?;
         }
         if self.stop_reconcile.enabled {
             if self.stop_reconcile.base.trim().is_empty() {
@@ -265,9 +266,95 @@ pub struct Rule {
     pub operations: Vec<String>,
     #[serde(default)]
     pub operation_contains: Vec<String>,
+    /// 绑定到已提交 semantic snapshot 的符号锚点。Runtime 只能沿人工确认的
+    /// lineage 解析，绝不能为 rename/move 猜造稳定 ID。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symbol_scopes: Vec<RuleSymbolScope>,
     pub message: String,
     #[serde(default)]
     pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RuleSymbolScope {
+    pub provider_profile_id: String,
+    pub provider_contract_id: String,
+    pub language_id: String,
+    pub anchor_snapshot_fingerprint: String,
+    pub anchor_symbol_id: String,
+    pub resolution_policy: SymbolResolutionPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum SymbolResolutionPolicy {
+    ConfirmedLineageOnly,
+}
+
+fn validate_rule_symbol_scopes(
+    rule: &Rule,
+    providers: &[SemanticProviderProfile],
+) -> Result<(), CoreError> {
+    let mut unique = std::collections::BTreeSet::new();
+    for scope in &rule.symbol_scopes {
+        let profile = providers
+            .iter()
+            .find(|profile| profile.id == scope.provider_profile_id)
+            .ok_or_else(|| CoreError::InvalidRule {
+                rule_id: rule.id.clone(),
+                reason: format!(
+                    "symbol scope 引用了未知 provider profile={:?}",
+                    scope.provider_profile_id
+                ),
+            })?;
+        if scope.provider_contract_id.trim().is_empty() || scope.provider_contract_id.len() > 192 {
+            return Err(CoreError::InvalidRule {
+                rule_id: rule.id.clone(),
+                reason: format!(
+                    "symbol scope 的 provider_contract_id={:?} 无效",
+                    scope.provider_contract_id
+                ),
+            });
+        }
+        let language = scope.language_id.trim().to_ascii_lowercase();
+        if !profile
+            .language_mappings
+            .iter()
+            .any(|mapping| mapping.language.eq_ignore_ascii_case(&language))
+        {
+            return Err(CoreError::InvalidRule {
+                rule_id: rule.id.clone(),
+                reason: format!(
+                    "symbol scope 的 language_id={:?} 不属于 provider profile={} 的映射",
+                    scope.language_id, profile.id
+                ),
+            });
+        }
+        if scope.anchor_snapshot_fingerprint.trim().is_empty()
+            || scope.anchor_snapshot_fingerprint.len() > 160
+            || scope.anchor_symbol_id.trim().is_empty()
+            || scope.anchor_symbol_id.len() > 160
+        {
+            return Err(CoreError::InvalidRule {
+                rule_id: rule.id.clone(),
+                reason: "symbol scope 缺少合法 snapshot/symbol 锚点".to_owned(),
+            });
+        }
+        let key = (
+            scope.provider_profile_id.clone(),
+            scope.provider_contract_id.clone(),
+            language,
+            scope.anchor_snapshot_fingerprint.clone(),
+            scope.anchor_symbol_id.clone(),
+        );
+        if !unique.insert(key) {
+            return Err(CoreError::InvalidRule {
+                rule_id: rule.id.clone(),
+                reason: "存在重复 symbol scope".to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl Rule {
@@ -407,6 +494,24 @@ pub struct Evidence {
     pub message: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub rationale: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade: Option<EvidenceGrade>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceGrade {
+    DeterministicPath,
+    SemanticDirect,
+    SemanticConfirmedLineage,
+    SemanticBaselineDiff,
+    AdvisorySyntax,
+    Inferred,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

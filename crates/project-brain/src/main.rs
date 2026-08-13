@@ -122,6 +122,12 @@ enum Command {
         command: LineageCommand,
     },
 
+    /// 管理仓库规则的 semantic symbol scope
+    Rules {
+        #[command(subcommand)]
+        command: RulesCommand,
+    },
+
     /// 查询本地符号图
     Symbols {
         #[arg(long)]
@@ -213,6 +219,10 @@ enum LineageCommand {
 
         #[arg(long)]
         supersede: Option<String>,
+
+        /// 确认本次不可自动推导的裁决来自显式人工决定
+        #[arg(long)]
+        human_confirmed: bool,
     },
 
     /// 显式拒绝尚未裁决的候选
@@ -228,6 +238,54 @@ enum LineageCommand {
 
         #[arg(long)]
         reason: Option<String>,
+
+        /// 确认本次不可自动推导的裁决来自显式人工决定
+        #[arg(long)]
+        human_confirmed: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RulesCommand {
+    /// 把一条仓库规则绑定到明确的 semantic snapshot/symbol 锚点
+    BindSymbol {
+        #[arg(long)]
+        rule: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        contract: String,
+        #[arg(long)]
+        language: String,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        symbol: String,
+        /// 确认锚点选择来自显式人工决定
+        #[arg(long)]
+        human_confirmed: bool,
+    },
+    /// 删除一条规则上的精确 semantic symbol scope
+    UnbindSymbol {
+        #[arg(long)]
+        rule: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        contract: String,
+        #[arg(long)]
+        language: String,
+        #[arg(long)]
+        snapshot: String,
+        #[arg(long)]
+        symbol: String,
+        #[arg(long)]
+        human_confirmed: bool,
+    },
+    /// 列出规则锚点及其当前 confirmed-lineage 解析结果
+    SymbolScopes {
+        #[arg(long)]
+        rule: Option<String>,
     },
 }
 
@@ -294,7 +352,9 @@ fn main() -> ExitCode {
         Command::Doctor => App::open(cli.project_root)
             .and_then(|app| app.doctor(cli.install_root.as_deref(), cli.codex_home.as_deref())),
         Command::Preflight => App::open(cli.project_root).and_then(|app| app.preflight()),
-        Command::Hook { agent, event } => App::run_hook(cli.project_root, agent, event),
+        Command::Hook { agent, event } => {
+            App::run_hook(cli.project_root, cli.install_root.as_deref(), agent, event)
+        }
         Command::Capabilities { agent } => App::capabilities(agent),
         Command::Reconcile { base, envelope } => {
             App::open(cli.project_root).and_then(|app| app.reconcile(&base, &envelope))
@@ -352,24 +412,65 @@ fn main() -> ExitCode {
                 actor_ref,
                 reason,
                 supersede,
+                human_confirmed,
             } => app.confirm_lineage(
                 &candidate,
                 &request_id,
                 actor_ref.as_deref(),
                 reason.as_deref(),
                 supersede.as_deref(),
+                human_confirmed,
             ),
             LineageCommand::Reject {
                 candidate,
                 request_id,
                 actor_ref,
                 reason,
+                human_confirmed,
             } => app.reject_lineage(
                 &candidate,
                 &request_id,
                 actor_ref.as_deref(),
                 reason.as_deref(),
+                human_confirmed,
             ),
+        }),
+        Command::Rules { command } => App::open(cli.project_root).and_then(|app| match command {
+            RulesCommand::BindSymbol {
+                rule,
+                provider,
+                contract,
+                language,
+                snapshot,
+                symbol,
+                human_confirmed,
+            } => app.bind_rule_symbol(
+                &rule,
+                &provider,
+                &contract,
+                &language,
+                &snapshot,
+                &symbol,
+                human_confirmed,
+            ),
+            RulesCommand::UnbindSymbol {
+                rule,
+                provider,
+                contract,
+                language,
+                snapshot,
+                symbol,
+                human_confirmed,
+            } => app.unbind_rule_symbol(
+                &rule,
+                &provider,
+                &contract,
+                &language,
+                &snapshot,
+                &symbol,
+                human_confirmed,
+            ),
+            RulesCommand::SymbolScopes { rule } => app.rule_symbol_scopes(rule.as_deref()),
         }),
         Command::Symbols {
             path,

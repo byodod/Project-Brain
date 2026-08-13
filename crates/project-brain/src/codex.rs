@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -16,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use crate::provider;
+use crate::provider::ProviderTrustStatus;
 use crate::{app::HookEvent, error::AppError, protocol};
 
 const CODEX_ADAPTER_VERSION: u16 = 1;
@@ -61,10 +65,24 @@ pub const fn capabilities() -> AdapterCapabilities {
     AdapterCapabilities::codex()
 }
 
+#[cfg(test)]
 pub fn handle(
     root: &Path,
     config: &BrainConfig,
     store: &BrainStore,
+    event: HookEvent,
+    input: &CodexHookInput,
+) -> Result<CodexHookOutput, AppError> {
+    let provider_trust =
+        provider::trust_status(None, root, &config.project_key, &config.semantic_providers);
+    handle_with_provider_trust(root, config, store, &provider_trust, event, input)
+}
+
+pub fn handle_with_provider_trust(
+    root: &Path,
+    config: &BrainConfig,
+    store: &BrainStore,
+    provider_trust: &BTreeMap<String, ProviderTrustStatus>,
     event: HookEvent,
     input: &CodexHookInput,
 ) -> Result<CodexHookOutput, AppError> {
@@ -78,7 +96,7 @@ pub fn handle(
             return Err(error);
         }
     };
-    let outcome = match protocol::process(root, config, &internal_event) {
+    let outcome = match protocol::process(root, config, store, provider_trust, &internal_event) {
         Ok(outcome) => outcome,
         Err(error) => {
             let _ = store.record_adapter_failure(
@@ -267,6 +285,7 @@ fn normalized_tool(
         kind,
         target_files,
         command,
+        deterministic_impacts: deterministic_impacts(root, input),
     };
     let operation_id = if input.tool_use_id.trim().is_empty() {
         let action_json = serde_json::to_vec(&action).unwrap_or_default();
@@ -483,6 +502,74 @@ fn extract_target_files(tool_input: &Value) -> Vec<String> {
     targets
 }
 
+fn deterministic_impacts(root: &Path, input: &CodexHookInput) -> Vec<brain_core::ToolImpact> {
+    let tool = input.tool_name.to_ascii_lowercase();
+    if tool == "write" {
+        return extract_target_files(&input.tool_input)
+            .into_iter()
+            .map(|path| brain_core::ToolImpact {
+                path: make_project_relative(root, &path),
+                whole_file: true,
+                ranges: Vec::new(),
+            })
+            .collect();
+    }
+    if tool == "apply_patch" {
+        let mut impacts = Vec::new();
+        if let Some(command) = input.tool_input.get("command").and_then(Value::as_str) {
+            for line in command.lines() {
+                for marker in ["*** Add File:", "*** Delete File:"] {
+                    if let Some(path) = line.trim().strip_prefix(marker) {
+                        impacts.push(brain_core::ToolImpact {
+                            path: make_project_relative(root, path.trim()),
+                            whole_file: true,
+                            ranges: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+        impacts.sort_by(|left, right| left.path.cmp(&right.path));
+        impacts.dedup_by(|left, right| left.path == right.path);
+        return impacts;
+    }
+    if tool == "edit" {
+        let path = input
+            .tool_input
+            .get("file_path")
+            .or_else(|| input.tool_input.get("path"))
+            .and_then(Value::as_str);
+        let old = input.tool_input.get("old_string").and_then(Value::as_str);
+        if let (Some(path), Some(old)) = (path, old)
+            && !old.is_empty()
+        {
+            let relative = make_project_relative(root, path);
+            let absolute = root.join(&relative);
+            if let Ok(source) = std::fs::read_to_string(absolute) {
+                let matches = source.match_indices(old).collect::<Vec<_>>();
+                if matches.len() == 1 {
+                    let offset = matches[0].0;
+                    let start_line = source[..offset]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                        + 1;
+                    let end_line = start_line + old.bytes().filter(|byte| *byte == b'\n').count();
+                    return vec![brain_core::ToolImpact {
+                        path: relative,
+                        whole_file: false,
+                        ranges: vec![brain_core::ToolLineRange {
+                            start_line,
+                            end_line,
+                        }],
+                    }];
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
 fn extract_named_paths(object: &Map<String, Value>, targets: &mut Vec<String>) {
     for key in ["path", "file", "file_path", "target_file"] {
         if let Some(path) = object.get(key).and_then(Value::as_str) {
@@ -521,7 +608,11 @@ fn make_project_relative(root: &Path, path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        fs,
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use brain_core::{
         ActionKind, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, HookEventPayload,
@@ -531,7 +622,10 @@ mod tests {
     use brain_store::BrainStore;
     use serde_json::json;
 
-    use super::{CodexHookInput, classify_action, extract_target_files, failure_output, handle};
+    use super::{
+        CodexHookInput, classify_action, deterministic_impacts, extract_target_files,
+        failure_output, handle,
+    };
     use crate::app::HookEvent;
 
     fn config(project_key: &str) -> BrainConfig {
@@ -553,6 +647,7 @@ mod tests {
                 actions: vec![ActionKind::Delete],
                 operations: Vec::new(),
                 operation_contains: Vec::new(),
+                symbol_scopes: Vec::new(),
                 message: "protected".to_owned(),
                 rationale: String::new(),
             }],
@@ -892,5 +987,56 @@ mod tests {
             store.recent_adapter_audit("project_a", 10).unwrap().len(),
             2
         );
+    }
+
+    #[test]
+    fn structured_write_and_delete_have_whole_file_impacts_but_patch_update_does_not() {
+        let root = Path::new("C:/repo");
+        let write = CodexHookInput {
+            tool_name: "Write".to_owned(),
+            tool_input: json!({"file_path": "C:/repo/src/lib.rs", "content": "new"}),
+            ..CodexHookInput::default()
+        };
+        let write_impacts = deterministic_impacts(root, &write);
+        assert_eq!(write_impacts.len(), 1);
+        assert_eq!(write_impacts[0].path, "src/lib.rs");
+        assert!(write_impacts[0].whole_file);
+
+        let delete = CodexHookInput {
+            tool_name: "apply_patch".to_owned(),
+            tool_input: json!({"command": "*** Begin Patch\n*** Delete File: src/lib.rs\n*** End Patch"}),
+            ..CodexHookInput::default()
+        };
+        assert!(deterministic_impacts(root, &delete)[0].whole_file);
+
+        let update = CodexHookInput {
+            tool_name: "apply_patch".to_owned(),
+            tool_input: json!({"command": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"}),
+            ..CodexHookInput::default()
+        };
+        assert!(deterministic_impacts(root, &update).is_empty());
+    }
+
+    #[test]
+    fn edit_impact_requires_a_unique_old_string() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("project-brain-codex-edit-{nonce}"));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "one\ntarget\nthree\n").unwrap();
+        let unique = CodexHookInput {
+            tool_name: "Edit".to_owned(),
+            tool_input: json!({"file_path": root.join("src/lib.rs"), "old_string": "target", "new_string": "changed"}),
+            ..CodexHookInput::default()
+        };
+        let impacts = deterministic_impacts(&root, &unique);
+        assert_eq!(impacts[0].ranges[0].start_line, 2);
+        assert_eq!(impacts[0].ranges[0].end_line, 2);
+
+        fs::write(root.join("src/lib.rs"), "target\ntarget\n").unwrap();
+        assert!(deterministic_impacts(&root, &unique).is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -350,11 +350,16 @@ Node entrypoint 哈希，关闭 stdin，使用环境白名单和净化后的 `PA
 都会核对完整工作区内容指纹；源码变化、超时、非零退出、二进制漂移、链接输出、过大/非法 SCIP
 均不会提交 semantic snapshot。过程 provenance 与失败只写入机器级有界 JSONL audit。
 
-如果 `.scip` 由 CI 或其他可信流程生成，仍可按项目内稳定 profile ID 手工导入：
+如果 `.scip` 由 CI 或其他流程生成，仍可按项目内稳定 profile ID 手工导入：
 
 ```text
 project-brain index-scip --provider rust-main --input index.scip
 ```
+
+手工导入永远标记为 `offline_import`，可以用于查询、lineage 候选和 advisory，但不能单独获得
+Hook 硬阻断权。只有 `provider index` 通过当前机器已登记且哈希未漂移的 executable 产生的快照，
+才追加 `trusted_provider` attestation；证明同时固定 registration ID、executable SHA-256、SCIP
+artifact SHA-256、Git HEAD 与完整 worktree 指纹。
 
 一个 `.scip` 可以逐文档映射多种语言，例如同一 scip-dotnet 索引内的 C# 与 Visual Basic。
 Python 的空 `Document.language` 只有在 profile 显式声明 `raw_language: null` 和
@@ -381,12 +386,14 @@ project-brain lineage confirm \
   --candidate <candidate-id> \
   --request-id <request-id> \
   --actor-ref user@example \
-  --reason "confirmed rename"
+  --reason "confirmed rename" \
+  --human-confirmed
 
 project-brain lineage reject \
   --candidate <candidate-id> \
   --request-id <request-id> \
-  --reason "different responsibility"
+  --reason "different responsibility" \
+  --human-confirmed
 ```
 
 修正既有确认必须原子完成：
@@ -395,12 +402,50 @@ project-brain lineage reject \
 project-brain lineage confirm \
   --candidate <new-candidate-id> \
   --supersede <old-confirmed-candidate-id> \
-  --request-id <request-id>
+  --request-id <request-id> \
+  --human-confirmed
 ```
 
 状态为 `proposed / confirmed / rejected / superseded / invalidated`。Ambiguity 是候选组属性，
 不是状态。新快照、算法升级或置信度变化不会修改旧候选或人工裁决；裁决也不会修改 symbol ID、
 tombstone 或历史快照。
+
+## Symbol-scoped rules
+
+规则的 `symbol_scopes` 保存仓库可审查的历史锚点，而不是虚构一个跨重构永久不变的 ID。每个锚点
+固定 provider profile、实际 provider contract ID、language、snapshot fingerprint 和 symbol ID，
+解析策略当前只能是 `confirmed_lineage_only`。
+
+推荐先把新规则以 `status: proposed` 写入 `.project-brain/config.json`，运行可信 Provider 索引并从
+`provider index` / `symbols` 输出取得 contract、snapshot 和 symbol，然后由人工绑定：
+
+```text
+project-brain rules bind-symbol \
+  --rule ARCH-001 \
+  --provider rust-main \
+  --contract <provider-contract-id> \
+  --language rust \
+  --snapshot <snapshot-fingerprint> \
+  --symbol <symbol-id> \
+  --human-confirmed
+
+project-brain rules symbol-scopes --rule ARCH-001
+```
+
+审查并激活规则、提交配置后，必须再次执行 `provider index`。配置或 HEAD 变化会让旧 attestation
+过期；相同 semantic snapshot 的可信重跑会追加新的来源证明，而不会改写旧快照。删除精确锚点
+使用 `rules unbind-symbol` 的同组参数并显式提供 `--human-confirmed`。
+
+硬门控资格矩阵：
+
+- `PreToolUse`：最新解析必须是 direct semantic 或逐跳 confirmed lineage；来源必须是当前机器仍
+  ready 且 registration/executable hash 与 attestation 一致的 trusted Provider；HEAD/worktree 必须
+  新鲜；工具影响必须是结构化 whole-file Write/Delete，或 old string 唯一可定位的 Edit range。
+- `Stop`：必须有当前 clean `HEAD` 的 trusted semantic baseline，并由实际 Git hunk 与 definition
+  range 相交；纯插入也按基线插入位置计算。
+- apply_patch update、shell 文本、syntax fallback、proposed/ambiguous lineage、local symbol、离线
+  SCIP、过期快照、Provider 缺失/失败/二进制漂移都只能 warning/advisory，不能伪装成规则违规或
+  制造 Stop 循环。
 
 ## Workspace
 
@@ -435,5 +480,6 @@ crates/
 - syntax fallback 不自动关联 rename/move lineage；这必须由语义证据或显式确认完成。
 - semantic lineage 当前只支持同项目、同 provider profile/contract、同语言、相邻快照的一对一
   predecessor/successor；split/merge、跨 provider equivalence 和传递闭包不在本阶段。
-- `Stop` 自动对账只核对文件范围；符号级 Change Envelope 约束尚未加入。
+- Symbol scope 当前是一对一 definition 范围；split/merge、跨 provider equivalence、调用图影响面
+  和符号集合表达式尚未加入。
 - Semantic Sentinel / Architecture Judge 尚未加入；这是有意的 V0 边界。

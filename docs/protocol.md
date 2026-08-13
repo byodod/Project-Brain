@@ -274,6 +274,7 @@ SCIP 导入遵循以下 fail-closed 规则：
 Lineage 连接两个历史 observation，而不是合并或重命名 `SymbolNode`。持久化边界为：
 
 - `semantic_snapshots`：按项目、provider profile/contract 排序的不可变导入事实；
+- `semantic_snapshot_attestations`：同一快照在不同已验证 worktree 状态上的 append-only 来源证明；
 - `semantic_symbol_observations`：某次快照实际看到的 symbol；
 - `semantic_lineage_candidates`：endpoint 唯一、当前状态 materialization；
 - `semantic_lineage_evidence`：算法 ID、版本、输入摘要、结构化证据与置信度的 append-only 观察；
@@ -295,10 +296,30 @@ proposed | confirmed | rejected | superseded | invalidated
 1. 只比较同 project、provider profile、provider contract、language 的相邻 semantic snapshot；
 2. 只为旧快照 removed 与新快照 inserted symbol 生成候选；稳定 symbol ID 不产生 self-lineage；
 3. 新快照和算法重跑不改变旧 candidate state；只可追加去重后的 evidence；
-4. confirm/reject 只能来自显式用户命令，必须携带 request ID；同 request 同 payload 重放首次结果，
+4. confirm/reject 只能来自带 `--human-confirmed` 的显式用户命令，必须携带 request ID；同 request 同 payload 重放首次结果，
    同 request 不同 payload 拒绝；
 5. 一次裁决在单个事务内写 decision、执行 revision CAS、更新 materialized state；
 6. 同 snapshot pair 的 confirmed predecessor/successor 都是一对一；split/merge 留待独立协议；
 7. 不自动确认、拒绝竞争项、supersede、延伸传递 lineage、修改 symbol ID、恢复 tombstone、改写
    snapshot 或跨 provider 建 equivalence；
 8. 已导入但不是当前最新的历史 snapshot 不能重新应用为当前符号图。
+
+SQLite schema v6 保存 semantic snapshots、source attestations、symbol observations、candidate、evidence
+和 decision。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升为硬证据。同一
+snapshot 的可信重跑只追加 attestation，不改写 symbol observations 或人工 lineage 状态。
+
+## Symbol scope 与证据等级
+
+仓库规则通过 `symbol_scopes` 固定 provider profile/contract、language、anchor snapshot/symbol 和
+`confirmed_lineage_only` 策略。解析只能是 `direct_semantic`、逐跳
+`confirmed_lineage` 或 `unresolved`，不得从路径相似度、LLM 判断或候选置信度发明稳定身份。
+
+硬规则除 authority/strength/effect 权限外还必须满足：definition 非 local、provider symbol 在该
+snapshot 内唯一；最新来源是 `trusted_provider`；当前机器 binding 仍 ready 且 registration ID 与
+executable SHA-256 匹配；worktree/HEAD 新鲜。`PreToolUse` 还要求 whole-file 或唯一 Edit range 的
+确定性工具影响；`Stop` 则要求 clean `HEAD` baseline 与实际 Git hunk 相交。
+
+证据等级为 `deterministic_path`、`semantic_direct`、`semantic_confirmed_lineage`、
+`semantic_baseline_diff`、`advisory_syntax`、`inferred`、`unavailable`。offline SCIP、syntax fallback、
+proposed/ambiguous lineage、Provider 缺失/失败/二进制漂移和过期快照只能 advisory fail-open，不能
+伪装成 rule violation 或制造 Stop continuation 循环。

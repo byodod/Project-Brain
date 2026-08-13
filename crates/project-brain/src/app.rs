@@ -6,10 +6,11 @@ use std::{
 
 use brain_core::{
     ActionDescriptor, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, MemoryStatus,
-    ProjectLanguageProfile, Rule, RuleEffect, RuleEngine, RuleStrength, SemanticLanguageMapping,
-    SemanticProviderFormat, SemanticProviderProfile, StopReconcileConfig, normalize_project_path,
+    ProjectLanguageProfile, Rule, RuleEffect, RuleEngine, RuleStrength, RuleSymbolScope,
+    SemanticLanguageMapping, SemanticProviderFormat, SemanticProviderProfile, StopReconcileConfig,
+    SymbolResolutionPolicy, normalize_project_path,
 };
-use brain_store::BrainStore;
+use brain_store::{BrainStore, SemanticResolutionKind};
 use clap::ValueEnum;
 use sha2::{Digest, Sha256};
 
@@ -173,7 +174,20 @@ impl App {
                     }
                     return Err(AppError::Setup(error));
                 }
-                let output = codex::handle(&app.root, &app.config, &app.store, event, &input)?;
+                let provider_trust = provider::trust_status(
+                    install_root,
+                    &app.root,
+                    &app.config.project_key,
+                    &app.config.semantic_providers,
+                );
+                let output = codex::handle_with_provider_trust(
+                    &app.root,
+                    &app.config,
+                    &app.store,
+                    &provider_trust,
+                    event,
+                    &input,
+                )?;
                 println!("{}", pretty_json(&output)?);
                 Ok(())
             }
@@ -255,6 +269,7 @@ impl App {
 
     pub fn run_hook(
         explicit_root: Option<PathBuf>,
+        install_root: Option<&Path>,
         agent: AgentKind,
         event: HookEvent,
     ) -> Result<(), AppError> {
@@ -286,7 +301,20 @@ impl App {
                         return Err(error);
                     }
                 };
-                let output = codex::handle(&app.root, &app.config, &app.store, event, &input)?;
+                let provider_trust = provider::trust_status(
+                    install_root,
+                    &app.root,
+                    &app.config.project_key,
+                    &app.config.semantic_providers,
+                );
+                let output = codex::handle_with_provider_trust(
+                    &app.root,
+                    &app.config,
+                    &app.store,
+                    &provider_trust,
+                    event,
+                    &input,
+                )?;
                 println!("{}", pretty_json(&output)?);
                 Ok(())
             }
@@ -412,7 +440,7 @@ impl App {
             profile,
             run.output_path(),
         );
-        let prepared = match prepared {
+        let mut prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 provider::record_import_failure(install_root, &run, &error)?;
@@ -427,6 +455,11 @@ impl App {
             provider::record_import_failure(install_root, &run, &error)?;
             return Err(error);
         }
+        prepared.attest_trusted_provider(
+            run.registration_id(),
+            run.executable_sha256(),
+            run.artifact_sha256(),
+        );
         provider::record_import_prepared(install_root, &run)?;
         let imported = match scip_index::commit(&self.store, prepared) {
             Ok(imported) => imported,
@@ -497,7 +530,9 @@ impl App {
         actor_ref: Option<&str>,
         reason: Option<&str>,
         supersede_candidate_id: Option<&str>,
+        human_confirmed: bool,
     ) -> Result<(), AppError> {
+        require_human_confirmation(human_confirmed, "confirm lineage")?;
         println!(
             "{}",
             pretty_json(&self.store.confirm_lineage(
@@ -518,7 +553,9 @@ impl App {
         request_id: &str,
         actor_ref: Option<&str>,
         reason: Option<&str>,
+        human_confirmed: bool,
     ) -> Result<(), AppError> {
+        require_human_confirmation(human_confirmed, "reject lineage")?;
         println!(
             "{}",
             pretty_json(&self.store.reject_lineage(
@@ -530,6 +567,151 @@ impl App {
             )?)?
         );
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_rule_symbol(
+        &self,
+        rule_id: &str,
+        provider_profile_id: &str,
+        provider_contract_id: &str,
+        language_id: &str,
+        snapshot: &str,
+        symbol: &str,
+        human_confirmed: bool,
+    ) -> Result<(), AppError> {
+        require_human_confirmation(human_confirmed, "bind rule symbol")?;
+        let resolution = self.store.resolve_semantic_scope(
+            &self.config.project_key,
+            provider_profile_id,
+            provider_contract_id,
+            language_id,
+            snapshot,
+            symbol,
+        )?;
+        if resolution.kind == SemanticResolutionKind::Unresolved {
+            return Err(AppError::Governance(format!(
+                "拒绝绑定不可解析的 semantic 锚点：{}",
+                resolution.reason.as_deref().unwrap_or("unknown")
+            )));
+        }
+        let scope = RuleSymbolScope {
+            provider_profile_id: provider_profile_id.to_owned(),
+            provider_contract_id: provider_contract_id.to_owned(),
+            language_id: language_id.trim().to_ascii_lowercase(),
+            anchor_snapshot_fingerprint: snapshot.to_owned(),
+            anchor_symbol_id: symbol.to_owned(),
+            resolution_policy: SymbolResolutionPolicy::ConfirmedLineageOnly,
+        };
+        let mut config = self.config.clone();
+        let rule = config
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == rule_id)
+            .ok_or_else(|| AppError::Governance(format!("找不到 rule={rule_id:?}")))?;
+        if rule.symbol_scopes.contains(&scope) {
+            return Err(AppError::Governance("symbol scope 已存在".to_owned()));
+        }
+        rule.symbol_scopes.push(scope);
+        rule.symbol_scopes.sort();
+        self.write_config(&config)?;
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "project_key": self.config.project_key,
+                "rule_id": rule_id,
+                "resolution": resolution,
+                "updated": true,
+                "hard_gate_status": "reindex_required_after_final_config_and_head",
+            }))?
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn unbind_rule_symbol(
+        &self,
+        rule_id: &str,
+        provider_profile_id: &str,
+        provider_contract_id: &str,
+        language_id: &str,
+        snapshot: &str,
+        symbol: &str,
+        human_confirmed: bool,
+    ) -> Result<(), AppError> {
+        require_human_confirmation(human_confirmed, "unbind rule symbol")?;
+        let mut config = self.config.clone();
+        let rule = config
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == rule_id)
+            .ok_or_else(|| AppError::Governance(format!("找不到 rule={rule_id:?}")))?;
+        let before = rule.symbol_scopes.len();
+        rule.symbol_scopes.retain(|scope| {
+            !(scope.provider_profile_id == provider_profile_id
+                && scope.provider_contract_id == provider_contract_id
+                && scope.language_id.eq_ignore_ascii_case(language_id)
+                && scope.anchor_snapshot_fingerprint == snapshot
+                && scope.anchor_symbol_id == symbol)
+        });
+        if rule.symbol_scopes.len() == before {
+            return Err(AppError::Governance(
+                "找不到精确匹配的 symbol scope".to_owned(),
+            ));
+        }
+        self.write_config(&config)?;
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "project_key": self.config.project_key,
+                "rule_id": rule_id,
+                "updated": true,
+            }))?
+        );
+        Ok(())
+    }
+
+    pub fn rule_symbol_scopes(&self, rule_filter: Option<&str>) -> Result<(), AppError> {
+        let mut scopes = Vec::new();
+        for rule in &self.config.rules {
+            if rule_filter.is_some_and(|filter| filter != rule.id) {
+                continue;
+            }
+            for scope in &rule.symbol_scopes {
+                let resolution = self.store.resolve_semantic_scope(
+                    &self.config.project_key,
+                    &scope.provider_profile_id,
+                    &scope.provider_contract_id,
+                    &scope.language_id,
+                    &scope.anchor_snapshot_fingerprint,
+                    &scope.anchor_symbol_id,
+                )?;
+                scopes.push(serde_json::json!({
+                    "rule_id": rule.id,
+                    "scope": scope,
+                    "resolution": resolution,
+                }));
+            }
+        }
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "project_key": self.config.project_key,
+                "symbol_scopes": scopes,
+            }))?
+        );
+        Ok(())
+    }
+
+    fn write_config(&self, config: &BrainConfig) -> Result<(), AppError> {
+        config.validate()?;
+        let path = self.root.join(BRAIN_DIRECTORY).join(CONFIG_FILE);
+        let before = fs::read(&path)?;
+        let before_hash = format!("{:x}", Sha256::digest(&before));
+        setup::atomic_replace(&path, pretty_json(&config)?.as_bytes(), Some(&before_hash))
     }
 
     pub fn audit(&self, limit: u32) -> Result<(), AppError> {
@@ -544,6 +726,16 @@ impl App {
             }))?
         );
         Ok(())
+    }
+}
+
+fn require_human_confirmation(confirmed: bool, operation: &str) -> Result<(), AppError> {
+    if confirmed {
+        Ok(())
+    } else {
+        Err(AppError::Governance(format!(
+            "{operation} 改变人工治理事实，必须由操作者显式提供 --human-confirmed"
+        )))
     }
 }
 
@@ -576,6 +768,7 @@ fn initial_config(
                 actions: vec![brain_core::ActionKind::Delete],
                 operations: Vec::new(),
                 operation_contains: Vec::new(),
+                symbol_scopes: Vec::new(),
                 message: "禁止通过普通删除操作移除 Project Brain 的项目规则配置".to_owned(),
                 rationale: "规则控制面必须通过显式的规则修订流程变更".to_owned(),
             },
@@ -593,6 +786,7 @@ fn initial_config(
                 ],
                 operations: Vec::new(),
                 operation_contains: Vec::new(),
+                symbol_scopes: Vec::new(),
                 message:
                     "正在修改项目决策控制面；请保持 schema_version、authority 与 lifecycle 语义兼容"
                         .to_owned(),
@@ -612,6 +806,7 @@ fn initial_config(
                     ".project-brain/config.json".to_owned(),
                     ".project-brain\\config.json".to_owned(),
                 ],
+                symbol_scopes: Vec::new(),
                 message: "禁止通过 shell 删除 Project Brain 的项目规则配置".to_owned(),
                 rationale: "无结构化路径参数的 shell 删除需要单独匹配命令载荷".to_owned(),
             },

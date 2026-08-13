@@ -11,11 +11,13 @@ pub use hook::{
     EventIdentityQuality, FeedbackItem, FeedbackSeverity, GateDecision, HOOK_PROTOCOL_VERSION,
     HookEventKind, HookEventPayload, HookOutcomePayload, IdempotencyMetadata, IntentDeclared,
     IntentOrigin, InternalHookEvent, InternalHookOutcome, SessionOpenReason, SessionOpened,
-    StopDecision, TaskStopping, ToolAboutToRun, ToolAction, ToolFinished, ToolStatus,
+    StopDecision, TaskStopping, ToolAboutToRun, ToolAction, ToolFinished, ToolImpact,
+    ToolLineRange, ToolStatus,
 };
 pub use model::{
     ActionDescriptor, ActionKind, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, Decision,
-    DecisionKind, Evidence, MemoryStatus, ProjectLanguageProfile, Rule, RuleEffect, RuleStrength,
-    SemanticLanguageMapping, SemanticProviderFormat, SemanticProviderProfile, StopReconcileConfig,
+    DecisionKind, Evidence, EvidenceGrade, MemoryStatus, ProjectLanguageProfile, Rule, RuleEffect,
+    RuleStrength, RuleSymbolScope, SemanticLanguageMapping, SemanticProviderFormat,
+    SemanticProviderProfile, StopReconcileConfig, SymbolResolutionPolicy,
 };
 pub use path::{normalize_project_path, path_has_prefix};

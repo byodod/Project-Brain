@@ -15,6 +15,8 @@ use crate::error::AppError;
 pub struct DiffHunk {
     pub old: Option<LineRange>,
     pub new: Option<LineRange>,
+    pub old_start: usize,
+    pub new_start: usize,
 }
 
 pub fn changed_files(root: &Path, base: &str) -> Result<Vec<String>, AppError> {
@@ -105,6 +107,15 @@ pub fn worktree_fingerprint(root: &Path) -> Result<String, AppError> {
         digest.update([0]);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+pub fn worktree_is_clean(root: &Path) -> Result<bool, AppError> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()?;
+    ensure_success(&output)?;
+    Ok(output.stdout.is_empty())
 }
 
 struct DigestWriter<'a, D>(&'a mut D);
@@ -207,12 +218,17 @@ fn parse_hunk_header(line: &str) -> Option<DiffHunk> {
     let body = line.strip_prefix("@@ ")?;
     let end = body.find(" @@")?;
     let mut ranges = body[..end].split_whitespace();
-    let old = parse_diff_range(ranges.next()?, '-').ok()?;
-    let new = parse_diff_range(ranges.next()?, '+').ok()?;
-    Some(DiffHunk { old, new })
+    let (old_start, old) = parse_diff_range(ranges.next()?, '-').ok()?;
+    let (new_start, new) = parse_diff_range(ranges.next()?, '+').ok()?;
+    Some(DiffHunk {
+        old,
+        new,
+        old_start,
+        new_start,
+    })
 }
 
-fn parse_diff_range(value: &str, marker: char) -> Result<Option<LineRange>, ()> {
+fn parse_diff_range(value: &str, marker: char) -> Result<(usize, Option<LineRange>), ()> {
     let value = value.strip_prefix(marker).ok_or(())?;
     let (start, count) = value
         .split_once(',')
@@ -220,9 +236,9 @@ fn parse_diff_range(value: &str, marker: char) -> Result<Option<LineRange>, ()> 
     let start = start.parse::<usize>().map_err(|_| ())?;
     let count = count.parse::<usize>().map_err(|_| ())?;
     if count == 0 {
-        return Ok(None);
+        return Ok((start, None));
     }
-    Ok(Some(LineRange::new(start, start + count - 1)))
+    Ok((start, Some(LineRange::new(start, start + count - 1))))
 }
 
 fn ensure_success(output: &Output) -> Result<(), AppError> {
@@ -284,6 +300,8 @@ mod tests {
             Some(DiffHunk {
                 old: Some(LineRange::new(10, 11)),
                 new: Some(LineRange::new(12, 14)),
+                old_start: 10,
+                new_start: 12,
             })
         );
         assert_eq!(
@@ -291,6 +309,17 @@ mod tests {
             Some(DiffHunk {
                 old: Some(LineRange::new(7, 7)),
                 new: None,
+                old_start: 7,
+                new_start: 6,
+            })
+        );
+        assert_eq!(
+            parse_hunk_header("@@ -10,0 +11,2 @@"),
+            Some(DiffHunk {
+                old: None,
+                new: Some(LineRange::new(11, 12)),
+                old_start: 10,
+                new_start: 11,
             })
         );
     }

@@ -32,6 +32,9 @@ impl<'a> RuleEngine<'a> {
             .rules
             .iter()
             .filter(|rule| rule.status == MemoryStatus::Active)
+            // symbol scope 必须由带 snapshot/lineage 证据的 Runtime 路径解析；普通
+            // path engine 不能把 include_paths 为空的 symbol rule 误当成全局规则。
+            .filter(|rule| rule.symbol_scopes.is_empty())
             .filter(|rule| matches_rule(rule, action))
             .collect();
 
@@ -42,6 +45,9 @@ impl<'a> RuleEngine<'a> {
                 effect: rule.effect,
                 message: rule.message.clone(),
                 rationale: rule.rationale.clone(),
+                grade: Some(crate::EvidenceGrade::DeterministicPath),
+                symbol_id: None,
+                snapshot_fingerprint: None,
             })
             .collect();
 
@@ -138,7 +144,9 @@ mod tests {
     use super::RuleEngine;
     use crate::{
         ActionDescriptor, ActionKind, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, CoreError,
-        DecisionKind, MemoryStatus, Rule, RuleEffect, RuleStrength, StopReconcileConfig,
+        DecisionKind, MemoryStatus, ProjectLanguageProfile, Rule, RuleEffect, RuleStrength,
+        RuleSymbolScope, SemanticLanguageMapping, SemanticProviderFormat, SemanticProviderProfile,
+        StopReconcileConfig, SymbolResolutionPolicy,
     };
 
     fn action(kind: ActionKind, path: &str) -> ActionDescriptor {
@@ -167,6 +175,7 @@ mod tests {
             actions: vec![ActionKind::Modify],
             operations: Vec::new(),
             operation_contains: Vec::new(),
+            symbol_scopes: Vec::new(),
             message: format!("message for {id}"),
             rationale: String::new(),
         }
@@ -274,5 +283,47 @@ mod tests {
             .unwrap();
 
         assert_eq!(decision.decision, DecisionKind::Allow);
+    }
+
+    #[test]
+    fn symbol_scoped_rule_is_never_treated_as_a_global_path_rule() {
+        let mut symbol_rule = rule("symbol", RuleEffect::Block, RuleStrength::Hard);
+        symbol_rule.include_paths.clear();
+        symbol_rule.symbol_scopes = vec![RuleSymbolScope {
+            provider_profile_id: "rust-main".to_owned(),
+            provider_contract_id: "scip-contract".to_owned(),
+            language_id: "rust".to_owned(),
+            anchor_snapshot_fingerprint: "snapshot".to_owned(),
+            anchor_symbol_id: "symbol".to_owned(),
+            resolution_policy: SymbolResolutionPolicy::ConfirmedLineageOnly,
+        }];
+        let config = BrainConfig {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: "project_test".to_owned(),
+            project_name: "test".to_owned(),
+            language_profiles: vec![ProjectLanguageProfile {
+                language: "rust".to_owned(),
+                roots: Vec::new(),
+            }],
+            semantic_providers: vec![SemanticProviderProfile {
+                id: "rust-main".to_owned(),
+                format: SemanticProviderFormat::Scip,
+                producer: "rust-analyzer".to_owned(),
+                contract_version: 1,
+                language_mappings: vec![SemanticLanguageMapping {
+                    raw_language: Some("rust".to_owned()),
+                    language: "rust".to_owned(),
+                    allow_missing_language: false,
+                }],
+            }],
+            stop_reconcile: StopReconcileConfig::default(),
+            rules: vec![symbol_rule],
+        };
+        let decision = RuleEngine::new(&config)
+            .unwrap()
+            .evaluate(&action(ActionKind::Modify, "any/file.rs"))
+            .unwrap();
+        assert_eq!(decision.decision, DecisionKind::Allow);
+        assert!(decision.evidence.is_empty());
     }
 }

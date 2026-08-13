@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const DATABASE_SCHEMA_VERSION: i64 = 5;
+const DATABASE_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -94,6 +94,99 @@ pub struct SemanticApplyResult {
     pub snapshot_inserted: bool,
     pub candidates_inserted: u64,
     pub evidence_inserted: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SemanticSnapshotSource {
+    pub worktree_fingerprint: String,
+    pub head_revision: String,
+    pub worktree_clean: bool,
+    pub trust: SemanticSourceTrust,
+    pub provider_registration_id: Option<String>,
+    pub executable_sha256: Option<String>,
+    pub artifact_sha256: Option<String>,
+}
+
+impl SemanticSnapshotSource {
+    pub fn offline(
+        worktree_fingerprint: String,
+        head_revision: String,
+        worktree_clean: bool,
+    ) -> Self {
+        Self {
+            worktree_fingerprint,
+            head_revision,
+            worktree_clean,
+            trust: SemanticSourceTrust::OfflineImport,
+            provider_registration_id: None,
+            executable_sha256: None,
+            artifact_sha256: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn trusted_provider(
+        worktree_fingerprint: String,
+        head_revision: String,
+        worktree_clean: bool,
+        provider_registration_id: String,
+        executable_sha256: String,
+        artifact_sha256: String,
+    ) -> Self {
+        Self {
+            worktree_fingerprint,
+            head_revision,
+            worktree_clean,
+            trust: SemanticSourceTrust::TrustedProvider,
+            provider_registration_id: Some(provider_registration_id),
+            executable_sha256: Some(executable_sha256),
+            artifact_sha256: Some(artifact_sha256),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticSourceTrust {
+    OfflineImport,
+    TrustedProvider,
+}
+
+impl SemanticSourceTrust {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::OfflineImport => "offline_import",
+            Self::TrustedProvider => "trusted_provider",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "offline_import" => Some(Self::OfflineImport),
+            "trusted_provider" => Some(Self::TrustedProvider),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticResolutionKind {
+    DirectSemantic,
+    ConfirmedLineage,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SemanticScopeResolution {
+    pub kind: SemanticResolutionKind,
+    pub anchor_snapshot_fingerprint: String,
+    pub anchor_symbol_id: String,
+    pub latest_snapshot_fingerprint: Option<String>,
+    pub resolved_symbol: Option<SymbolNode>,
+    pub source: Option<SemanticSnapshotSource>,
+    pub lineage_decision_ids: Vec<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -283,6 +376,7 @@ impl BrainStore {
                  ON symbol_edges(project_key, target_id, status, kind);",
         )?;
         self.initialize_lineage_schema()?;
+        self.ensure_semantic_snapshot_source_columns()?;
         self.initialize_adapter_audit_schema()?;
         self.connection.execute(
             "INSERT INTO metadata(key, value) VALUES('schema_version', ?1)
@@ -350,11 +444,43 @@ impl BrainStore {
                  provider_profile_id TEXT NOT NULL,
                  provider_contract_id TEXT NOT NULL,
                  snapshot_fingerprint TEXT NOT NULL,
+                 worktree_fingerprint TEXT NOT NULL DEFAULT '',
+                 head_revision TEXT NOT NULL DEFAULT '',
+                 worktree_clean INTEGER NOT NULL DEFAULT 0 CHECK(worktree_clean IN (0, 1)),
+                 source_trust TEXT NOT NULL DEFAULT 'offline_import'
+                     CHECK(source_trust IN ('offline_import', 'trusted_provider')),
+                 provider_registration_id TEXT,
+                 executable_sha256 TEXT,
+                 artifact_sha256 TEXT,
                  created_at_unix_seconds INTEGER NOT NULL,
                  UNIQUE(project_key, provider_profile_id, provider_contract_id, snapshot_fingerprint)
              );
              CREATE INDEX IF NOT EXISTS idx_semantic_snapshot_latest
                  ON semantic_snapshots(project_key, provider_profile_id, provider_contract_id, sequence DESC);
+             CREATE TABLE IF NOT EXISTS semantic_snapshot_attestations (
+                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                 project_key TEXT NOT NULL,
+                 provider_profile_id TEXT NOT NULL,
+                 provider_contract_id TEXT NOT NULL,
+                 snapshot_fingerprint TEXT NOT NULL,
+                 worktree_fingerprint TEXT NOT NULL,
+                 head_revision TEXT NOT NULL,
+                 worktree_clean INTEGER NOT NULL CHECK(worktree_clean IN (0, 1)),
+                 source_trust TEXT NOT NULL
+                     CHECK(source_trust IN ('offline_import', 'trusted_provider')),
+                 provider_registration_id TEXT,
+                 executable_sha256 TEXT,
+                 artifact_sha256 TEXT,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 UNIQUE(project_key, provider_profile_id, provider_contract_id,
+                        snapshot_fingerprint, worktree_fingerprint, head_revision,
+                        worktree_clean)
+             );
+             CREATE INDEX IF NOT EXISTS idx_semantic_attestation_latest
+                 ON semantic_snapshot_attestations(
+                    project_key, provider_profile_id, provider_contract_id,
+                    snapshot_fingerprint, sequence DESC
+                 );
              CREATE TABLE IF NOT EXISTS semantic_symbol_observations (
                  project_key TEXT NOT NULL,
                  provider_profile_id TEXT NOT NULL,
@@ -448,6 +574,47 @@ impl BrainStore {
         Ok(())
     }
 
+    fn ensure_semantic_snapshot_source_columns(&self) -> Result<(), StoreError> {
+        let mut statement = self
+            .connection
+            .prepare("PRAGMA table_info(semantic_snapshots)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        if !columns.contains("worktree_fingerprint") {
+            self.connection.execute_batch(
+                "ALTER TABLE semantic_snapshots ADD COLUMN worktree_fingerprint TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
+        if !columns.contains("head_revision") {
+            self.connection.execute_batch(
+                "ALTER TABLE semantic_snapshots ADD COLUMN head_revision TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
+        if !columns.contains("worktree_clean") {
+            self.connection.execute_batch(
+                "ALTER TABLE semantic_snapshots ADD COLUMN worktree_clean INTEGER NOT NULL DEFAULT 0 CHECK(worktree_clean IN (0, 1));",
+            )?;
+        }
+        if !columns.contains("source_trust") {
+            self.connection.execute_batch(
+                "ALTER TABLE semantic_snapshots ADD COLUMN source_trust TEXT NOT NULL DEFAULT 'offline_import' CHECK(source_trust IN ('offline_import', 'trusted_provider'));",
+            )?;
+        }
+        for (column, definition) in [
+            ("provider_registration_id", "TEXT"),
+            ("executable_sha256", "TEXT"),
+            ("artifact_sha256", "TEXT"),
+        ] {
+            if !columns.contains(column) {
+                self.connection.execute_batch(&format!(
+                    "ALTER TABLE semantic_snapshots ADD COLUMN {column} {definition};"
+                ))?;
+            }
+        }
+        Ok(())
+    }
+
     /// 原子应用一个 Provider 的完整符号快照，并把快照中消失的旧节点标记为 removed。
     ///
     /// # Errors
@@ -476,9 +643,11 @@ impl BrainStore {
         provider_profile_id: &str,
         observations: &[LineageSymbolObservation],
         path_renames: &[PathRenameEvidence],
+        source: &SemanticSnapshotSource,
     ) -> Result<SemanticApplyResult, StoreError> {
         validate_snapshot(snapshot)?;
         validate_semantic_observations(snapshot, provider_profile_id, observations)?;
+        validate_semantic_snapshot_source(source)?;
         let now = unix_seconds()?;
         let transaction = self.connection.unchecked_transaction()?;
         let existing: bool = transaction.query_row(
@@ -537,13 +706,22 @@ impl BrainStore {
             transaction.execute(
                 "INSERT INTO semantic_snapshots(
                      project_key, provider_profile_id, provider_contract_id,
-                     snapshot_fingerprint, created_at_unix_seconds
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                     snapshot_fingerprint, worktree_fingerprint, head_revision,
+                     worktree_clean, source_trust, provider_registration_id,
+                     executable_sha256, artifact_sha256, created_at_unix_seconds
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     snapshot.project_key,
                     provider_profile_id,
                     snapshot.provider.id,
                     snapshot.source_revision,
+                    source.worktree_fingerprint,
+                    source.head_revision,
+                    source.worktree_clean,
+                    source.trust.as_str(),
+                    source.provider_registration_id,
+                    source.executable_sha256,
+                    source.artifact_sha256,
                     now,
                 ],
             )?;
@@ -551,6 +729,7 @@ impl BrainStore {
             (candidates_inserted, evidence_inserted) =
                 persist_lineage_proposals(&transaction, &proposals, now)?;
         }
+        persist_semantic_attestation(&transaction, snapshot, provider_profile_id, source, now)?;
         transaction.commit()?;
         Ok(SemanticApplyResult {
             graph,
@@ -601,6 +780,143 @@ impl BrainStore {
             )?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    /// 验证 semantic 锚点，并只沿相邻快照中的直接身份或 confirmed lineage 解析到最新符号。
+    /// proposed/ambiguous/local/syntax fallback 都不会获得硬证据资格。
+    ///
+    /// # Errors
+    ///
+    /// 当 scope 边界非法、数据库字段损坏或 `SQLite` 查询失败时返回错误。
+    #[allow(
+        clippy::too_many_lines,
+        reason = "解析器在一个线性流程中显式保留锚点、每一跳 lineage 与最终定义的拒绝原因"
+    )]
+    pub fn resolve_semantic_scope(
+        &self,
+        project_key: &str,
+        provider_profile_id: &str,
+        provider_contract_id: &str,
+        language_id: &str,
+        anchor_snapshot: &str,
+        anchor_symbol: &str,
+    ) -> Result<SemanticScopeResolution, StoreError> {
+        let boundary = SemanticScopeBoundary {
+            project_key,
+            provider_profile_id,
+            provider_contract_id,
+            language_id,
+        };
+        validate_scope_boundary(&boundary, anchor_snapshot, anchor_symbol)?;
+        let snapshots = semantic_snapshot_chain(&self.connection, &boundary, anchor_snapshot)?;
+        let Some(first) = snapshots.first() else {
+            return Ok(unresolved_scope(
+                anchor_snapshot,
+                anchor_symbol,
+                None,
+                "锚点 snapshot 不存在或不属于指定 provider/language 边界",
+            ));
+        };
+        let Some(anchor) = semantic_observation(
+            &self.connection,
+            &boundary,
+            &first.fingerprint,
+            anchor_symbol,
+        )?
+        else {
+            return Ok(unresolved_scope(
+                anchor_snapshot,
+                anchor_symbol,
+                snapshots.last(),
+                "锚点 symbol 不存在于指定 semantic snapshot",
+            ));
+        };
+        if anchor.is_local || anchor.provider_symbol.as_deref().is_none_or(str::is_empty) {
+            return Ok(unresolved_scope(
+                anchor_snapshot,
+                anchor_symbol,
+                snapshots.last(),
+                "local 或缺少 provider symbol 的观察不得成为硬规则锚点",
+            ));
+        }
+        if provider_symbol_is_ambiguous(&self.connection, &boundary, &first.fingerprint, &anchor)? {
+            return Ok(unresolved_scope(
+                anchor_snapshot,
+                anchor_symbol,
+                snapshots.last(),
+                "provider symbol 在锚点 snapshot 中不唯一",
+            ));
+        }
+
+        let mut current_symbol = anchor_symbol.to_owned();
+        let mut decisions = Vec::new();
+        for pair in snapshots.windows(2) {
+            let from = &pair[0];
+            let to = &pair[1];
+            if semantic_observation(
+                &self.connection,
+                &boundary,
+                &to.fingerprint,
+                &current_symbol,
+            )?
+            .is_some()
+            {
+                continue;
+            }
+            let confirmed = confirmed_lineage_hop(
+                &self.connection,
+                &boundary,
+                &from.fingerprint,
+                &current_symbol,
+                &to.fingerprint,
+            )?;
+            let Some((next_symbol, decision_id)) = confirmed else {
+                return Ok(unresolved_scope(
+                    anchor_snapshot,
+                    anchor_symbol,
+                    Some(to),
+                    "相邻 semantic snapshot 间缺少唯一 confirmed lineage",
+                ));
+            };
+            current_symbol = next_symbol;
+            decisions.push(decision_id);
+        }
+        let Some(latest) = snapshots.last() else {
+            return Ok(unresolved_scope(
+                anchor_snapshot,
+                anchor_symbol,
+                None,
+                "semantic snapshot chain 意外为空",
+            ));
+        };
+        let Some(symbol) = current_semantic_symbol(
+            &self.connection,
+            &boundary,
+            &latest.fingerprint,
+            &current_symbol,
+        )?
+        else {
+            return Ok(unresolved_scope(
+                anchor_snapshot,
+                anchor_symbol,
+                Some(latest),
+                "最新 snapshot 中解析目标缺少有效 semantic definition",
+            ));
+        };
+        Ok(SemanticScopeResolution {
+            kind: if decisions.is_empty() {
+                SemanticResolutionKind::DirectSemantic
+            } else {
+                SemanticResolutionKind::ConfirmedLineage
+            },
+            anchor_snapshot_fingerprint: anchor_snapshot.to_owned(),
+            anchor_symbol_id: anchor_symbol.to_owned(),
+            latest_snapshot_fingerprint: Some(latest.fingerprint.clone()),
+            resolved_symbol: Some(symbol),
+            source: Some(latest.source.clone()),
+            lineage_decision_ids: decisions,
+            reason: None,
+        })
     }
 
     /// 通过显式用户裁决确认候选；可在同一事务中 supersede 一条旧确认。
@@ -1112,9 +1428,405 @@ impl BrainStore {
     }
 }
 
+struct SemanticScopeBoundary<'a> {
+    project_key: &'a str,
+    provider_profile_id: &'a str,
+    provider_contract_id: &'a str,
+    language_id: &'a str,
+}
+
+#[derive(Debug)]
+struct SemanticSnapshotRecord {
+    fingerprint: String,
+    source: SemanticSnapshotSource,
+}
+
+#[derive(Debug)]
+struct StoredObservation {
+    provider_symbol: Option<String>,
+    is_local: bool,
+}
+
+fn validate_scope_boundary(
+    boundary: &SemanticScopeBoundary<'_>,
+    snapshot: &str,
+    symbol: &str,
+) -> Result<(), StoreError> {
+    if !is_valid_project_key(boundary.project_key)
+        || boundary.provider_profile_id.trim().is_empty()
+        || boundary.provider_contract_id.trim().is_empty()
+        || SourceLanguage::parse(boundary.language_id).is_none()
+        || snapshot.trim().is_empty()
+        || symbol.trim().is_empty()
+    {
+        return Err(StoreError::InvalidLineage(
+            "semantic scope 边界或锚点无效".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "单条只读 SQL 明确选择每个快照的最新 append-only provenance，拆分会重复边界条件"
+)]
+fn semantic_snapshot_chain(
+    connection: &Connection,
+    boundary: &SemanticScopeBoundary<'_>,
+    anchor_snapshot: &str,
+) -> Result<Vec<SemanticSnapshotRecord>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT s.snapshot_fingerprint,
+                COALESCE((SELECT a.worktree_fingerprint
+                          FROM semantic_snapshot_attestations a
+                          WHERE a.project_key = s.project_key
+                            AND a.provider_profile_id = s.provider_profile_id
+                            AND a.provider_contract_id = s.provider_contract_id
+                            AND a.snapshot_fingerprint = s.snapshot_fingerprint
+                          ORDER BY a.sequence DESC LIMIT 1), s.worktree_fingerprint),
+                COALESCE((SELECT a.head_revision
+                          FROM semantic_snapshot_attestations a
+                          WHERE a.project_key = s.project_key
+                            AND a.provider_profile_id = s.provider_profile_id
+                            AND a.provider_contract_id = s.provider_contract_id
+                            AND a.snapshot_fingerprint = s.snapshot_fingerprint
+                          ORDER BY a.sequence DESC LIMIT 1), s.head_revision),
+                COALESCE((SELECT a.worktree_clean
+                          FROM semantic_snapshot_attestations a
+                          WHERE a.project_key = s.project_key
+                            AND a.provider_profile_id = s.provider_profile_id
+                            AND a.provider_contract_id = s.provider_contract_id
+                            AND a.snapshot_fingerprint = s.snapshot_fingerprint
+                          ORDER BY a.sequence DESC LIMIT 1), s.worktree_clean),
+                COALESCE((SELECT a.source_trust
+                          FROM semantic_snapshot_attestations a
+                          WHERE a.project_key = s.project_key
+                            AND a.provider_profile_id = s.provider_profile_id
+                            AND a.provider_contract_id = s.provider_contract_id
+                            AND a.snapshot_fingerprint = s.snapshot_fingerprint
+                          ORDER BY a.sequence DESC LIMIT 1), s.source_trust),
+                COALESCE((SELECT a.provider_registration_id
+                          FROM semantic_snapshot_attestations a
+                          WHERE a.project_key = s.project_key
+                            AND a.provider_profile_id = s.provider_profile_id
+                            AND a.provider_contract_id = s.provider_contract_id
+                            AND a.snapshot_fingerprint = s.snapshot_fingerprint
+                          ORDER BY a.sequence DESC LIMIT 1), s.provider_registration_id),
+                COALESCE((SELECT a.executable_sha256
+                          FROM semantic_snapshot_attestations a
+                          WHERE a.project_key = s.project_key
+                            AND a.provider_profile_id = s.provider_profile_id
+                            AND a.provider_contract_id = s.provider_contract_id
+                            AND a.snapshot_fingerprint = s.snapshot_fingerprint
+                          ORDER BY a.sequence DESC LIMIT 1), s.executable_sha256),
+                COALESCE((SELECT a.artifact_sha256
+                          FROM semantic_snapshot_attestations a
+                          WHERE a.project_key = s.project_key
+                            AND a.provider_profile_id = s.provider_profile_id
+                            AND a.provider_contract_id = s.provider_contract_id
+                            AND a.snapshot_fingerprint = s.snapshot_fingerprint
+                          ORDER BY a.sequence DESC LIMIT 1), s.artifact_sha256)
+         FROM semantic_snapshots s
+         WHERE s.project_key = ?1 AND s.provider_profile_id = ?2 AND s.provider_contract_id = ?3
+           AND s.sequence >= COALESCE((
+               SELECT sequence FROM semantic_snapshots
+               WHERE project_key = ?1 AND provider_profile_id = ?2
+                 AND provider_contract_id = ?3 AND snapshot_fingerprint = ?4
+           ), 9223372036854775807)
+         ORDER BY s.sequence",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                boundary.project_key,
+                boundary.provider_profile_id,
+                boundary.provider_contract_id,
+                anchor_snapshot,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(
+            |(fingerprint, worktree, head, clean, trust, registration, executable, artifact)| {
+                let trust = SemanticSourceTrust::parse(&trust).ok_or_else(|| {
+                    StoreError::InvalidSymbolField {
+                        field: "semantic_source_trust",
+                        value: trust,
+                    }
+                })?;
+                Ok(SemanticSnapshotRecord {
+                    fingerprint,
+                    source: SemanticSnapshotSource {
+                        worktree_fingerprint: worktree,
+                        head_revision: head,
+                        worktree_clean: clean,
+                        trust,
+                        provider_registration_id: registration,
+                        executable_sha256: executable,
+                        artifact_sha256: artifact,
+                    },
+                })
+            },
+        )
+        .collect()
+}
+
+fn semantic_observation(
+    connection: &Connection,
+    boundary: &SemanticScopeBoundary<'_>,
+    snapshot: &str,
+    symbol: &str,
+) -> Result<Option<StoredObservation>, StoreError> {
+    connection
+        .query_row(
+            "SELECT provider_symbol, is_local
+             FROM semantic_symbol_observations
+             WHERE project_key = ?1 AND provider_profile_id = ?2
+               AND provider_contract_id = ?3 AND language_id = ?4
+               AND snapshot_fingerprint = ?5 AND symbol_id = ?6",
+            params![
+                boundary.project_key,
+                boundary.provider_profile_id,
+                boundary.provider_contract_id,
+                boundary.language_id,
+                snapshot,
+                symbol,
+            ],
+            |row| {
+                Ok(StoredObservation {
+                    provider_symbol: row.get(0)?,
+                    is_local: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn provider_symbol_is_ambiguous(
+    connection: &Connection,
+    boundary: &SemanticScopeBoundary<'_>,
+    snapshot: &str,
+    observation: &StoredObservation,
+) -> Result<bool, StoreError> {
+    let Some(provider_symbol) = observation.provider_symbol.as_deref() else {
+        return Ok(true);
+    };
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM semantic_symbol_observations
+         WHERE project_key = ?1 AND provider_profile_id = ?2
+           AND provider_contract_id = ?3 AND language_id = ?4
+           AND snapshot_fingerprint = ?5 AND provider_symbol = ?6",
+        params![
+            boundary.project_key,
+            boundary.provider_profile_id,
+            boundary.provider_contract_id,
+            boundary.language_id,
+            snapshot,
+            provider_symbol,
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(count != 1)
+}
+
+fn confirmed_lineage_hop(
+    connection: &Connection,
+    boundary: &SemanticScopeBoundary<'_>,
+    from_snapshot: &str,
+    from_symbol: &str,
+    to_snapshot: &str,
+) -> Result<Option<(String, String)>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT c.to_symbol_id,
+                COALESCE((
+                    SELECT d.decision_id FROM semantic_lineage_decisions d
+                    WHERE (d.candidate_id = c.candidate_id AND d.to_state = 'confirmed')
+                       OR (d.related_candidate_id = c.candidate_id AND d.action = 'supersede')
+                    ORDER BY d.created_at_unix_seconds DESC, d.decision_id DESC LIMIT 1
+                ), '')
+         FROM semantic_lineage_candidates c
+         WHERE c.project_key = ?1 AND c.provider_profile_id = ?2
+           AND c.provider_contract_id = ?3 AND c.language_id = ?4
+           AND c.from_snapshot_fingerprint = ?5 AND c.from_symbol_id = ?6
+           AND c.to_snapshot_fingerprint = ?7 AND c.state = 'confirmed'",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                boundary.project_key,
+                boundary.provider_profile_id,
+                boundary.provider_contract_id,
+                boundary.language_id,
+                from_snapshot,
+                from_symbol,
+                to_snapshot,
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.len() != 1 || rows[0].1.is_empty() {
+        return Ok(None);
+    }
+    Ok(rows.into_iter().next())
+}
+
+fn current_semantic_symbol(
+    connection: &Connection,
+    boundary: &SemanticScopeBoundary<'_>,
+    snapshot: &str,
+    symbol: &str,
+) -> Result<Option<SymbolNode>, StoreError> {
+    let observation = semantic_observation(connection, boundary, snapshot, symbol)?;
+    let Some(observation) = observation else {
+        return Ok(None);
+    };
+    if observation.is_local
+        || observation
+            .provider_symbol
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || provider_symbol_is_ambiguous(connection, boundary, snapshot, &observation)?
+    {
+        return Ok(None);
+    }
+    connection
+        .query_row(
+            "SELECT project_key, id, provider_id, identity_quality, language, kind, provider_key,
+                    display_name, path, start_line, end_line, content_fingerprint, status
+             FROM symbol_nodes
+             WHERE project_key = ?1 AND id = ?2 AND provider_id = ?3
+               AND identity_quality = 'semantic' AND language = ?4 AND status = 'active'",
+            params![
+                boundary.project_key,
+                symbol,
+                boundary.provider_contract_id,
+                boundary.language_id,
+            ],
+            decode_symbol_row,
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn unresolved_scope(
+    anchor_snapshot: &str,
+    anchor_symbol: &str,
+    latest: Option<&SemanticSnapshotRecord>,
+    reason: &str,
+) -> SemanticScopeResolution {
+    SemanticScopeResolution {
+        kind: SemanticResolutionKind::Unresolved,
+        anchor_snapshot_fingerprint: anchor_snapshot.to_owned(),
+        anchor_symbol_id: anchor_symbol.to_owned(),
+        latest_snapshot_fingerprint: latest.map(|snapshot| snapshot.fingerprint.clone()),
+        resolved_symbol: None,
+        source: latest.map(|snapshot| snapshot.source.clone()),
+        lineage_decision_ids: Vec::new(),
+        reason: Some(reason.to_owned()),
+    }
+}
+
+fn persist_semantic_attestation(
+    transaction: &Transaction<'_>,
+    snapshot: &SymbolSnapshot,
+    provider_profile_id: &str,
+    source: &SemanticSnapshotSource,
+    now: i64,
+) -> Result<(), StoreError> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO semantic_snapshot_attestations(
+             project_key, provider_profile_id, provider_contract_id,
+             snapshot_fingerprint, worktree_fingerprint, head_revision,
+             worktree_clean, source_trust, provider_registration_id,
+             executable_sha256, artifact_sha256, created_at_unix_seconds
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            snapshot.project_key,
+            provider_profile_id,
+            snapshot.provider.id,
+            snapshot.source_revision,
+            source.worktree_fingerprint,
+            source.head_revision,
+            source.worktree_clean,
+            source.trust.as_str(),
+            source.provider_registration_id,
+            source.executable_sha256,
+            source.artifact_sha256,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
 fn unix_seconds() -> Result<i64, StoreError> {
     let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     Ok(i64::try_from(seconds).unwrap_or(i64::MAX))
+}
+
+fn validate_semantic_snapshot_source(source: &SemanticSnapshotSource) -> Result<(), StoreError> {
+    if source.worktree_fingerprint.len() != 64
+        || !source
+            .worktree_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || source.head_revision.trim().is_empty()
+        || source.head_revision.len() > 256
+    {
+        return Err(StoreError::InvalidSnapshot(
+            "semantic snapshot 缺少合法 worktree_fingerprint/head_revision".to_owned(),
+        ));
+    }
+    let trusted_fields = [
+        source.provider_registration_id.as_deref(),
+        source.executable_sha256.as_deref(),
+        source.artifact_sha256.as_deref(),
+    ];
+    match source.trust {
+        SemanticSourceTrust::OfflineImport if trusted_fields.iter().any(Option::is_some) => {
+            return Err(StoreError::InvalidSnapshot(
+                "offline_import 不得携带伪造的 Provider trust 字段".to_owned(),
+            ));
+        }
+        SemanticSourceTrust::TrustedProvider => {
+            let Some(registration) = source.provider_registration_id.as_deref() else {
+                return Err(StoreError::InvalidSnapshot(
+                    "trusted_provider 缺少 registration_id".to_owned(),
+                ));
+            };
+            if registration.trim().is_empty()
+                || registration.len() > 192
+                || ![
+                    source.executable_sha256.as_deref(),
+                    source.artifact_sha256.as_deref(),
+                ]
+                .into_iter()
+                .all(|value| {
+                    value.is_some_and(|digest| {
+                        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                })
+            {
+                return Err(StoreError::InvalidSnapshot(
+                    "trusted_provider 的 registration/executable/artifact 证明无效".to_owned(),
+                ));
+            }
+        }
+        SemanticSourceTrust::OfflineImport => {}
+    }
+    Ok(())
 }
 
 fn validate_semantic_observations(
@@ -1968,7 +2680,7 @@ mod tests {
     };
     use rusqlite::Connection;
 
-    use super::{AdapterRecordResult, BrainStore, StoreError};
+    use super::{AdapterRecordResult, BrainStore, SemanticSnapshotSource, StoreError};
 
     const PROJECT_KEY: &str = "project_test";
 
@@ -2082,7 +2794,13 @@ mod tests {
 
     fn apply_semantic(store: &BrainStore, snapshot: &SymbolSnapshot) -> super::SemanticApplyResult {
         store
-            .apply_semantic_snapshot(snapshot, "test-main", &semantic_observations(snapshot), &[])
+            .apply_semantic_snapshot(
+                snapshot,
+                "test-main",
+                &semantic_observations(snapshot),
+                &[],
+                &SemanticSnapshotSource::offline("b".repeat(64), "test-head".to_owned(), true),
+            )
             .unwrap()
     }
 
@@ -2407,7 +3125,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 5);
+        assert_eq!(store.database_schema_version().unwrap(), 6);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, false, 10)
@@ -2492,7 +3210,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 5);
+        assert_eq!(store.database_schema_version().unwrap(), 6);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, true, 10)
@@ -2503,6 +3221,62 @@ mod tests {
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].event_id, "event-1");
         drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v5_migration_adds_stale_source_columns_without_inventing_attestation() {
+        let (root, database) = temporary_database("v5-semantic-source-migration");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata(key, value) VALUES('schema_version', '5');
+                 CREATE TABLE semantic_snapshots (
+                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                     project_key TEXT NOT NULL,
+                     provider_profile_id TEXT NOT NULL,
+                     provider_contract_id TEXT NOT NULL,
+                     snapshot_fingerprint TEXT NOT NULL,
+                     created_at_unix_seconds INTEGER NOT NULL,
+                     UNIQUE(project_key, provider_profile_id, provider_contract_id, snapshot_fingerprint)
+                 );
+                 INSERT INTO semantic_snapshots(
+                     project_key, provider_profile_id, provider_contract_id,
+                     snapshot_fingerprint, created_at_unix_seconds
+                 ) VALUES('project_test', 'test-main', 'contract', 'old-snapshot', 1);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = BrainStore::open(&database).unwrap();
+        assert_eq!(migrated.database_schema_version().unwrap(), 6);
+        let legacy_source = migrated
+            .connection
+            .query_row(
+                "SELECT worktree_fingerprint, head_revision, worktree_clean
+                 FROM semantic_snapshots WHERE snapshot_fingerprint = 'old-snapshot'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(legacy_source, (String::new(), String::new(), false));
+        let attestations: i64 = migrated
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_snapshot_attestations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attestations, 0);
+        drop(migrated);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2627,10 +3401,182 @@ mod tests {
             1
         );
         assert!(matches!(
-            store
-                .apply_semantic_snapshot(&first, "test-main", &semantic_observations(&first), &[],),
+            store.apply_semantic_snapshot(
+                &first,
+                "test-main",
+                &semantic_observations(&first),
+                &[],
+                &SemanticSnapshotSource::offline("b".repeat(64), "test-head".to_owned(), true,),
+            ),
             Err(StoreError::InvalidLineage(_))
         ));
+    }
+
+    #[test]
+    fn semantic_scope_resolves_direct_identity_to_latest_snapshot() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let first = semantic_snapshot(
+            "semantic-direct-1",
+            vec![semantic_symbol("stable", "src/lib.rs", "stable-key")],
+        );
+        let second = semantic_snapshot(
+            "semantic-direct-2",
+            vec![semantic_symbol("stable", "src/lib.rs", "stable-key")],
+        );
+        let anchor = first.symbols[0].id.clone();
+        apply_semantic(&store, &first);
+        apply_semantic(&store, &second);
+
+        let resolved = store
+            .resolve_semantic_scope(
+                PROJECT_KEY,
+                "test-main",
+                &semantic_provider().id,
+                "rust",
+                &first.source_revision,
+                &anchor,
+            )
+            .unwrap();
+        assert_eq!(resolved.kind, super::SemanticResolutionKind::DirectSemantic);
+        assert_eq!(
+            resolved.latest_snapshot_fingerprint.as_deref(),
+            Some(second.source_revision.as_str())
+        );
+        assert_eq!(resolved.resolved_symbol.unwrap().id, anchor);
+        assert!(resolved.lineage_decision_ids.is_empty());
+        assert_eq!(resolved.source.unwrap().head_revision, "test-head");
+    }
+
+    #[test]
+    fn repeated_identical_snapshot_appends_a_fresh_source_attestation() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let snapshot = semantic_snapshot(
+            "semantic-attestation",
+            vec![semantic_symbol("stable", "src/lib.rs", "stable-key")],
+        );
+        let anchor = snapshot.symbols[0].id.clone();
+        apply_semantic(&store, &snapshot);
+        let refreshed =
+            SemanticSnapshotSource::offline("c".repeat(64), "new-clean-head".to_owned(), true);
+        let replay = store
+            .apply_semantic_snapshot(
+                &snapshot,
+                "test-main",
+                &semantic_observations(&snapshot),
+                &[],
+                &refreshed,
+            )
+            .unwrap();
+        assert!(!replay.snapshot_inserted);
+        let resolved = store
+            .resolve_semantic_scope(
+                PROJECT_KEY,
+                "test-main",
+                &semantic_provider().id,
+                "rust",
+                &snapshot.source_revision,
+                &anchor,
+            )
+            .unwrap();
+        assert_eq!(resolved.source, Some(refreshed));
+        let count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_snapshot_attestations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn semantic_scope_requires_confirmed_lineage_for_rename() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let first = semantic_snapshot(
+            "semantic-lineage-1",
+            vec![semantic_symbol("before", "src/a.rs", "old-key")],
+        );
+        let second = semantic_snapshot(
+            "semantic-lineage-2",
+            vec![semantic_symbol("after", "src/b.rs", "new-key")],
+        );
+        let anchor = first.symbols[0].id.clone();
+        apply_semantic(&store, &first);
+        apply_semantic(&store, &second);
+
+        let unresolved = store
+            .resolve_semantic_scope(
+                PROJECT_KEY,
+                "test-main",
+                &semantic_provider().id,
+                "rust",
+                &first.source_revision,
+                &anchor,
+            )
+            .unwrap();
+        assert_eq!(unresolved.kind, super::SemanticResolutionKind::Unresolved);
+
+        let candidate = store
+            .list_lineage_candidates(PROJECT_KEY, Some(LineageState::Proposed), None, None, 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let adjudicated = store
+            .confirm_lineage(
+                PROJECT_KEY,
+                &candidate.candidate_id,
+                "human-confirm-rename",
+                Some("operator@example"),
+                Some("verified rename"),
+                None,
+            )
+            .unwrap();
+        let resolved = store
+            .resolve_semantic_scope(
+                PROJECT_KEY,
+                "test-main",
+                &semantic_provider().id,
+                "rust",
+                &first.source_revision,
+                &anchor,
+            )
+            .unwrap();
+        assert_eq!(
+            resolved.kind,
+            super::SemanticResolutionKind::ConfirmedLineage
+        );
+        assert_eq!(resolved.resolved_symbol.unwrap().id, second.symbols[0].id);
+        assert_eq!(
+            resolved.lineage_decision_ids,
+            vec![adjudicated.decision.decision_id]
+        );
+    }
+
+    #[test]
+    fn ambiguous_provider_symbol_cannot_anchor_a_hard_scope() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let snapshot = semantic_snapshot(
+            "semantic-ambiguous",
+            vec![
+                semantic_symbol("one", "src/a.rs", "one-key"),
+                semantic_symbol("two", "src/b.rs", "two-key"),
+            ],
+        );
+        let anchor = snapshot.symbols[0].id.clone();
+        apply_semantic(&store, &snapshot);
+        let resolved = store
+            .resolve_semantic_scope(
+                PROJECT_KEY,
+                "test-main",
+                &semantic_provider().id,
+                "rust",
+                &snapshot.source_revision,
+                &anchor,
+            )
+            .unwrap();
+        assert_eq!(resolved.kind, super::SemanticResolutionKind::Unresolved);
+        assert!(resolved.reason.unwrap().contains("不唯一"));
     }
 
     #[test]
@@ -2872,7 +3818,7 @@ mod tests {
         drop(store);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 5);
+        assert_eq!(migrated.database_schema_version().unwrap(), 6);
         assert_eq!(
             migrated
                 .list_symbols(PROJECT_KEY, None, false, 10)

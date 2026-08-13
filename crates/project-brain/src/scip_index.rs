@@ -6,7 +6,7 @@ use brain_core::{
 use brain_scip::{
     ScipImport, ScipImportProfile, ScipImportStats, ScipLanguageCapabilities, ScipLanguageMapping,
 };
-use brain_store::{BrainStore, SemanticApplyResult};
+use brain_store::{BrainStore, SemanticApplyResult, SemanticSnapshotSource};
 use brain_symbols::{ProviderDescriptor, SourceLanguage};
 use serde::Serialize;
 
@@ -24,6 +24,7 @@ pub struct ScipIndexReport {
     pub producer_version: String,
     pub languages: Vec<SourceLanguage>,
     pub source_revision: String,
+    pub source: SemanticSnapshotSource,
     pub stats: ScipImportStats,
     pub lineage_observations: u64,
     pub apply: SemanticApplyResult,
@@ -33,6 +34,25 @@ pub struct PreparedScipIndex {
     project_key: String,
     provider_profile: String,
     imported: ScipImport,
+    source: SemanticSnapshotSource,
+}
+
+impl PreparedScipIndex {
+    pub fn attest_trusted_provider(
+        &mut self,
+        registration_id: &str,
+        executable_sha256: &str,
+        artifact_sha256: &str,
+    ) {
+        self.source = SemanticSnapshotSource::trusted_provider(
+            self.source.worktree_fingerprint.clone(),
+            self.source.head_revision.clone(),
+            self.source.worktree_clean,
+            registration_id.to_owned(),
+            executable_sha256.to_owned(),
+            artifact_sha256.to_owned(),
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -102,13 +122,29 @@ pub fn prepare(
     };
 
     let head_revision = git::head_revision(root)?;
+    let source = SemanticSnapshotSource::offline(
+        git::worktree_fingerprint(root)?,
+        head_revision.clone(),
+        git::worktree_is_clean(root)?,
+    );
     let imported =
         brain_scip::import_file(root, project_key, &head_revision, input, &import_profile)?;
     validate_project_roots(&imported.snapshot, language_profiles)?;
+    let after = SemanticSnapshotSource::offline(
+        git::worktree_fingerprint(root)?,
+        git::head_revision(root)?,
+        git::worktree_is_clean(root)?,
+    );
+    if after != source {
+        return Err(AppError::ScipProfileMismatch(
+            "源码或 Git 基线在 SCIP 导入期间发生变化；拒绝准备 semantic snapshot".to_owned(),
+        ));
+    }
     Ok(PreparedScipIndex {
         project_key: project_key.to_owned(),
         provider_profile: configured.id.clone(),
         imported,
+        source,
     })
 }
 
@@ -121,6 +157,7 @@ pub fn commit(
         &prepared.provider_profile,
         &prepared.imported.lineage_observations,
         &[],
+        &prepared.source,
     )?;
     Ok(ScipIndexReport {
         schema_version: brain_core::CURRENT_SCHEMA_VERSION,
@@ -133,6 +170,7 @@ pub fn commit(
         producer_version: prepared.imported.producer_version,
         languages: prepared.imported.languages,
         source_revision: prepared.imported.snapshot.source_revision,
+        source: prepared.source,
         stats: prepared.imported.stats,
         lineage_observations: u64::try_from(prepared.imported.lineage_observations.len())
             .unwrap_or(u64::MAX),

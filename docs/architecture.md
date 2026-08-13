@@ -128,7 +128,8 @@ confirmed / rejected / superseded / invalidated
            └── never rewrites SymbolNode / tombstone / snapshot
 ```
 
-SQLite schema v5 保存 semantic snapshots、symbol observations、candidate、evidence 和 decision。
+SQLite schema v6 保存 semantic snapshots、append-only source attestations、symbol observations、
+candidate、evidence 和 decision。
 Candidate endpoint 唯一键负责算法重跑幂等，算法版本只产生新的 evidence observation；人工状态
 永远不会被 generator 恢复或覆盖。Partial unique indexes 约束同 snapshot pair 中 predecessor 与
 successor 一对一，竞争确认不会自动选择赢家。`request_id + request_hash` 提供 at-least-once 命令
@@ -146,6 +147,10 @@ authority ∈ { explicit_user, repository_rule, accepted_decision }
 
 配置加载阶段即拒绝其他组合，避免把概率判断意外提升为强制规则。
 
+Symbol scope 还要求 direct semantic 或逐跳 confirmed lineage、非 local 且唯一的 definition、
+trusted Provider attestation、当前机器 registration/executable hash 匹配及新鲜源码。确定性工具影响
+或 clean HEAD baseline Git hunk 才能把这些事实提升为硬证据；其他情况只注入 advisory。
+
 ## Stop 闭环
 
 Codex `Stop` 读取 `stop_reconcile` 配置，对当前 Git 文件集合执行 Change Envelope 对账。
@@ -153,6 +158,10 @@ Codex `Stop` 读取 `stop_reconcile` 配置，对当前 Git 文件集合执行 C
 `stop_hook_active=true` 时直接放行，防止 hook 自触发循环。
 Envelope 在读取前会规范化并限制在项目根目录内；所有 Git diff 调用显式禁用
 external diff，避免分析动作执行仓库配置中的外部程序。
+
+符号 Stop 对账独立使用 clean `HEAD` semantic baseline 与真实 diff hunk；纯插入保留旧文件插入
+锚点。Provider、attestation、lineage 或数据库基础设施不可用时只记录 warning 并 fail-open，不能
+伪装成规则违规。
 
 ## Adapter 能力不对称
 
@@ -163,11 +172,12 @@ Prime Agent 是独立 runtime，当前已确认的 Extension `agent_end` 不具�
 
 ## 下一阶段
 
-1. Internal Hook Protocol v1 与 Codex adapter 先进入真实使用，验证项目隔离、重放、并发交错、
-   失败审计和 Stop 防循环；当前仅依赖文件/模块 scope，不假装已有稳定语义身份。
+1. Internal Hook Protocol v1 与 Codex adapter 已加入文件和 symbol scope；继续在真实项目验证项目
+   隔离、重放、并发交错、Provider 漂移降级、Stop 防循环与长会话延迟。
 2. 已接入机器级 SCIP Runner：Rust 用真实 rust-analyzer 端到端验证；.NET/Python 先用符合 producer
    行为的合成 fixture 固定 C#/VB、空 Python language、未指定 kind 与 implementation 契约。
-3. 当前 semantic lineage 只产生项目内候选；下一步实现可审计确认记录，再加入 symbol-scoped rules。
+3. Semantic lineage 裁决与 symbol-scoped rules 已实现；下一步扩展 symbol set、split/merge 和调用图
+   影响面，但仍不允许自动确认或 LLM hard block。
 4. 内部协议经验证后实现 Claude Code 与 Prime Agent adapter；Prime 继续按独立 runtime 处理。
 5. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
    直接 hard block。
@@ -179,4 +189,5 @@ Prime Agent 是独立 runtime，当前已确认的 Extension `agent_end` 不具�
 [ADR-0005](adr/0005-project-language-and-scip-profiles.md) 与
 [ADR-0006](adr/0006-semantic-lineage-ledger.md)、
 [ADR-0007](adr/0007-machine-bootstrap-and-codex-dispatcher.md) 与
-[ADR-0008](adr/0008-machine-provider-runner.md)。
+[ADR-0008](adr/0008-machine-provider-runner.md) 与
+[ADR-0009](adr/0009-symbol-scoped-hard-gates.md)。
