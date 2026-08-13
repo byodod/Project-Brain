@@ -5,6 +5,7 @@ mod codex;
 mod error;
 mod git;
 mod index;
+mod prime;
 mod protocol;
 mod provider;
 mod reconcile;
@@ -403,6 +404,7 @@ fn main() -> ExitCode {
             let agent_home = match agent {
                 AgentKind::Codex => cli.codex_home.as_deref(),
                 AgentKind::ClaudeCode => cli.claude_home.as_deref(),
+                AgentKind::PrimeAgent => None,
             };
             App::install_hooks(cli.install_root.as_deref(), agent_home, agent)
         }
@@ -410,6 +412,7 @@ fn main() -> ExitCode {
             let agent_home = match agent {
                 AgentKind::Codex => cli.codex_home.as_deref(),
                 AgentKind::ClaudeCode => cli.claude_home.as_deref(),
+                AgentKind::PrimeAgent => None,
             };
             App::uninstall_hooks(cli.install_root.as_deref(), agent_home, agent, force)
         }
@@ -420,6 +423,7 @@ fn main() -> ExitCode {
             let agent_home = match agent {
                 AgentKind::Codex => cli.codex_home.as_deref(),
                 AgentKind::ClaudeCode => cli.claude_home.as_deref(),
+                AgentKind::PrimeAgent => None,
             };
             App::open(cli.project_root)
                 .and_then(|app| app.doctor(cli.install_root.as_deref(), agent, agent_home))

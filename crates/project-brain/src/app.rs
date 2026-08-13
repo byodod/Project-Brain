@@ -20,7 +20,9 @@ use crate::{
     claude::{self, ClaudeHookInput},
     codex::{self, CodexHookInput},
     error::AppError,
-    git, index, provider, reconcile, scip_index, setup,
+    git, index,
+    prime::{self, PrimeHookInput},
+    provider, reconcile, scip_index, setup,
 };
 
 const BRAIN_DIRECTORY: &str = ".project-brain";
@@ -32,6 +34,7 @@ const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 pub enum AgentKind {
     Codex,
     ClaudeCode,
+    PrimeAgent,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -88,6 +91,11 @@ impl App {
                     pretty_json(&setup::install_claude_hooks(install_root, agent_home)?)?
                 );
             }
+            AgentKind::PrimeAgent => {
+                return Err(AppError::Setup(
+                    "Prime Agent 是独立 runtime；Extension 原子安装器尚未启用".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -118,6 +126,11 @@ impl App {
                         force,
                     )?)?
                 );
+            }
+            AgentKind::PrimeAgent => {
+                return Err(AppError::Setup(
+                    "Prime Agent Extension 安装器尚未启用，没有可卸载的托管集成".to_owned(),
+                ));
             }
         }
         Ok(())
@@ -152,6 +165,11 @@ impl App {
         let adapter = match agent {
             AgentKind::Codex => setup::DoctorAdapter::Codex,
             AgentKind::ClaudeCode => setup::DoctorAdapter::ClaudeCode,
+            AgentKind::PrimeAgent => {
+                return Err(AppError::Setup(
+                    "Prime Agent Extension 尚未安装；doctor 不伪造未实现的就绪状态".to_owned(),
+                ));
+            }
         };
         let mut report = setup::doctor(
             install_root,
@@ -272,13 +290,57 @@ impl App {
                 println!("{}", pretty_json(&output)?);
                 Ok(())
             }
+            AgentKind::PrimeAgent => Self::dispatch_prime_hook(install_root, event),
         }
+    }
+
+    fn dispatch_prime_hook(install_root: Option<&Path>, event: HookEvent) -> Result<(), AppError> {
+        let input: PrimeHookInput = match read_stdin_json_limited(MAX_HOOK_INPUT_BYTES) {
+            Ok(input) => input,
+            Err(_) => return Ok(()),
+        };
+        let Some((root, registered_project_key)) =
+            setup::registered_project_for_cwd(install_root, Path::new(input.cwd()))?
+        else {
+            return Ok(());
+        };
+        let app = Self::open(Some(root))?;
+        if app.config.project_key != registered_project_key {
+            println!(
+                "{}",
+                pretty_json(&prime::failure_output(
+                    event,
+                    &format!(
+                        "本机注册 project_key={} 与仓库 project_key={} 不一致",
+                        registered_project_key, app.config.project_key
+                    )
+                ))?
+            );
+            return Ok(());
+        }
+        let provider_trust = provider::trust_status(
+            install_root,
+            &app.root,
+            &app.config.project_key,
+            &app.config.semantic_providers,
+        );
+        let output = prime::handle_with_provider_trust(
+            &app.root,
+            &app.config,
+            &app.store,
+            &provider_trust,
+            event,
+            &input,
+        );
+        println!("{}", pretty_json(&output)?);
+        Ok(())
     }
 
     pub fn capabilities(agent: AgentKind) -> Result<(), AppError> {
         let capabilities = match agent {
             AgentKind::Codex => codex::capabilities(),
             AgentKind::ClaudeCode => claude::capabilities(),
+            AgentKind::PrimeAgent => prime::capabilities(),
         };
         println!("{}", pretty_json(&capabilities)?);
         Ok(())
@@ -444,7 +506,51 @@ impl App {
                 println!("{}", pretty_json(&output)?);
                 Ok(())
             }
+            AgentKind::PrimeAgent => Self::run_prime_hook(explicit_root, install_root, event),
         }
+    }
+
+    fn run_prime_hook(
+        explicit_root: Option<PathBuf>,
+        install_root: Option<&Path>,
+        event: HookEvent,
+    ) -> Result<(), AppError> {
+        let input: PrimeHookInput = match read_stdin_json() {
+            Ok(input) => input,
+            Err(error) => {
+                println!(
+                    "{}",
+                    pretty_json(&prime::failure_output(event, &error.to_string()))?
+                );
+                return Ok(());
+            }
+        };
+        let app = match Self::open(explicit_root) {
+            Ok(app) => app,
+            Err(error) => {
+                println!(
+                    "{}",
+                    pretty_json(&prime::failure_output(event, &error.to_string()))?
+                );
+                return Ok(());
+            }
+        };
+        let provider_trust = provider::trust_status(
+            install_root,
+            &app.root,
+            &app.config.project_key,
+            &app.config.semantic_providers,
+        );
+        let output = prime::handle_with_provider_trust(
+            &app.root,
+            &app.config,
+            &app.store,
+            &provider_trust,
+            event,
+            &input,
+        );
+        println!("{}", pretty_json(&output)?);
+        Ok(())
     }
 
     pub fn reconcile(&self, base: &str, envelope: &Path) -> Result<(), AppError> {

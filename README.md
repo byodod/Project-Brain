@@ -220,6 +220,23 @@ project-brain install-hooks claude-code
 启动绝对路径 launcher，不经过 Git Bash、PowerShell 或 POSIX shell。卸载同样只删除 manifest
 精确记录的 handler。
 
+## Prime Agent 独立 Runtime 接入
+
+Prime Agent 不是挂载在 Codex/Claude Code 上的客户端。Project Brain 为其保留独立 adapter、
+事件幂等域与审计域。当前已开放 Rust 侧直接协议入口，供 Prime Extension 开发和 fixture 使用：
+
+```text
+project-brain capabilities prime-agent
+project-brain hook prime-agent pre-tool-use
+project-brain dispatch prime-agent pre-tool-use
+```
+
+输入由 Prime Extension 从正式 `input`、`before_agent_start`、`tool_call`、`tool_result` 与
+`agent_end` event 规范化。输出是 Project Brain 自有 JSON，不复用 Codex/Claude vendor JSON；
+`tool_call` 可以依据 `block` 拒绝执行。Prime 当前没有已确认的 settled/Stop continuation 契约，
+因此 `continue_after_stop` 必须保持 `unsupported`。本阶段尚未开放
+`install-hooks prime-agent`，不会向 `~/.prime/agent/extensions/` 写入未经原子安装测试的文件。
+
 手工验证适配器：
 
 ```text
@@ -561,7 +578,7 @@ crates/
 ## 当前限制
 
 - Codex 与 Claude Code 已提供直接适配器、用户级 Hook 安装器和按 adapter 选择的 `doctor`；
-  Prime Agent 仍未实现。
+  Prime Agent 已有独立 direct adapter，但用户级 Extension 安装器与 doctor 尚未实现。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。

@@ -179,6 +179,12 @@ handler 使用 `command` 指向稳定 launcher、`args` 保存三个独立参数
 `doctor [codex|claude-code]` 选择对应的配置、manifest 和 handler hash 域；未给参数时为兼容旧调用
 默认检查 Codex。Doctor v2 使用通用 adapter 字段，不把 Claude 状态伪装成 Codex 状态。
 
+Prime Agent direct adapter v1 通过 `project-brain hook/dispatch prime-agent <event>` 暴露 Rust
+控制面。Extension 应把正式 runtime event 映射到同一内部事件语义，但输出使用独立 schema：
+pre-tool 返回 `block/reason/context`，post-tool 返回 `feedback`，停止阶段返回带
+`supported=false` 的 continuation 描述。Project Brain 不因内部规则想继续而伪造 Prime 已支持
+settled continuation。
+
 ## AnalysisReport
 
 `project-brain analyze` 输出版本化报告。每个受支持文件包含：

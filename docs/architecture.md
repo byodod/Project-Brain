@@ -189,10 +189,11 @@ external diff，避免分析动作执行仓库配置中的外部程序。
 ## Adapter 能力不对称
 
 公共协议统一治理语义，不统一 vendor JSON。Codex/Claude Code 可以拒绝工具并要求 Stop 后继续；
-Prime Agent 是独立 runtime，当前已确认的 Extension `agent_end` 不具备同等 Stop continuation
-契约，因此能力模型必须报告 unsupported。Codex 与 Claude Code adapter 都包含用户级安装器；
-Claude Code v1 复用五个已确认 lifecycle 的字段子集，但使用独立身份、幂等域、配置 manifest 和
-handler hash。`SubagentStart`、`SessionEnd` 与 Prime Agent 仍留在后续阶段。
+Prime Agent 是独立 runtime；其 Extension `tool_call` 可同步 block，但当前正式文档中的
+`agent_end` 只表示一次 prompt 结束，且未提供稳定 `agent_settled` 契约，因此 Stop continuation
+必须报告 unsupported。Prime direct adapter 使用独立身份、幂等域、审计域与自有输出 JSON，
+不复用 Codex/Claude vendor JSON。Codex 与 Claude Code adapter 都包含用户级安装器；Prime 的
+Extension 安装器仍留在后续阶段。
 
 ## 下一阶段
 
@@ -204,9 +205,12 @@ handler hash。`SubagentStart`、`SessionEnd` 与 Prime Agent 仍留在后续阶
    producer 行为的合成 fixture 固定 C#/VB、空 Python language、未指定 kind 与 implementation 契约。
 3. Semantic lineage 裁决与 symbol-scoped rules 已实现；下一步扩展 symbol set、split/merge 和调用图
    影响面，但仍不允许自动确认或 LLM hard block。
-4. Claude Code 已覆盖安装后 exec-form handler 的真实子进程 fixture；下一步研究 Prime Agent 独立
-   runtime 接入，不把它伪装成 Hook 等价物。按 adapter 选择的 doctor 已由 ADR-0016 完成。
-5. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
+4. Claude Code 已覆盖安装后 exec-form handler 的真实子进程 fixture；Prime Agent 独立 direct
+   adapter 已完成，下一步增加原子 Extension 安装与真实 Prime runtime fixture。按 adapter 选择的
+   doctor 已由 ADR-0016 完成。
+5. 引擎型项目需要 Source、Semantic、Engine、Build、Runtime 分层 Evidence Plane；下一阶段先定义
+   provider-neutral 契约，再以 Godot Engine Evidence Provider v1 验证，不能把 `.godot/` 缓存当权威。
+6. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
    直接 hard block。
 
 相关决策见 [ADR-0001](adr/0001-provider-neutral-symbol-identity.md)、

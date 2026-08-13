@@ -111,8 +111,41 @@ pub(crate) fn handle_vendor_with_provider_trust(
     adapter_version: u16,
     identity_namespace: &'static str,
 ) -> Result<CodexHookOutput, AppError> {
+    match process_vendor_with_provider_trust(
+        root,
+        config,
+        store,
+        provider_trust,
+        event,
+        input,
+        adapter_kind,
+        adapter_version,
+        identity_namespace,
+    ) {
+        Ok(outcome) => Ok(map_outcome(&outcome)),
+        Err(error) => {
+            if let Some(output) = failure_output(event, input, &error.to_string()) {
+                return Ok(output);
+            }
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_vendor_with_provider_trust(
+    root: &Path,
+    config: &BrainConfig,
+    store: &BrainStore,
+    provider_trust: &BTreeMap<String, ProviderTrustStatus>,
+    event: HookEvent,
+    input: &CodexHookInput,
+    adapter_kind: AdapterKind,
+    adapter_version: u16,
+    identity_namespace: &'static str,
+) -> Result<InternalHookOutcome, AppError> {
     let started = Instant::now();
-    let internal_event = match to_internal_event(
+    let internal_event = to_internal_event(
         root,
         config,
         event,
@@ -120,15 +153,7 @@ pub(crate) fn handle_vendor_with_provider_trust(
         adapter_kind,
         adapter_version,
         identity_namespace,
-    ) {
-        Ok(internal_event) => internal_event,
-        Err(error) => {
-            if let Some(output) = failure_output(event, input, &error.to_string()) {
-                return Ok(output);
-            }
-            return Err(error);
-        }
-    };
+    )?;
     let outcome = match protocol::process(root, config, store, provider_trust, &internal_event) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -137,9 +162,6 @@ pub(crate) fn handle_vendor_with_provider_trust(
                 elapsed_millis(started),
                 &error.to_string(),
             );
-            if let Some(output) = failure_output(event, input, &error.to_string()) {
-                return Ok(output);
-            }
             return Err(error);
         }
     };
@@ -150,13 +172,10 @@ pub(crate) fn handle_vendor_with_provider_trust(
                 AdapterRecordResult::Duplicate(first_outcome) => first_outcome,
             },
             Err(error) => {
-                if let Some(output) = failure_output(event, input, &error.to_string()) {
-                    return Ok(output);
-                }
                 return Err(error.into());
             }
         };
-    Ok(map_outcome(&outcome))
+    Ok(outcome)
 }
 
 fn elapsed_millis(started: Instant) -> u64 {

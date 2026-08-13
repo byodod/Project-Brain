@@ -80,6 +80,72 @@ fn assert_success(output: &Output) {
 }
 
 #[test]
+fn prime_direct_adapter_blocks_without_claiming_stop_continuation() {
+    let root = temp_root("prime-direct");
+    let project = root.join("repo");
+    fs::create_dir_all(&project).unwrap();
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_project-brain"));
+    assert_success(&run(
+        &executable,
+        &[
+            "--project-root",
+            project.to_str().unwrap(),
+            "init",
+            "--profile",
+            "rust",
+        ],
+        &root,
+        None,
+    ));
+
+    let config_path = project.join(".project-brain/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["rules"] = serde_json::json!([{
+        "id": "PROTECT",
+        "status": "active",
+        "authority": "repository_rule",
+        "strength": "hard",
+        "effect": "block",
+        "include_paths": [".project-brain/config.json"],
+        "actions": ["modify"],
+        "message": "protected"
+    }]);
+    fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let input = format!(
+        "{{\"session_id\":\"prime-session\",\"cwd\":{},\"tool_name\":\"edit\",\"tool_use_id\":\"prime-tool\",\"tool_input\":{{\"path\":\".project-brain/config.json\",\"oldText\":\"old\",\"newText\":\"new\"}}}}",
+        serde_json::to_string(project.to_str().unwrap()).unwrap()
+    );
+    let hook = run(
+        &executable,
+        &[
+            "--project-root",
+            project.to_str().unwrap(),
+            "hook",
+            "prime-agent",
+            "pre-tool-use",
+        ],
+        &project,
+        Some(&input),
+    );
+    assert_success(&hook);
+    let output: Value = serde_json::from_slice(&hook.stdout).unwrap();
+    assert_eq!(output["schema_version"], 1);
+    assert_eq!(output["event"], "tool_about_to_run");
+    assert_eq!(output["block"], true);
+
+    let capabilities = run(
+        &executable,
+        &["capabilities", "prime-agent"],
+        &project,
+        None,
+    );
+    assert_success(&capabilities);
+    let capabilities: Value = serde_json::from_slice(&capabilities.stdout).unwrap();
+    assert_eq!(capabilities["continue_after_stop"], "unsupported");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "单条黑盒测试按真实用户顺序验证安装到卸载的完整事务边界"
