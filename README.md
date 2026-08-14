@@ -263,11 +263,16 @@ project-brain evidence status
 
 完整 ArtifactGraph 按 fingerprint 只保存一次；每次真实运行追加轻量 attestation。Codex、Claude Code
 或 Prime Agent 的 `PostToolUse` 一旦观察到明确的 Create/Modify/Delete，现有 Semantic、Engine、Build、
-Runtime Evidence heads 会作为一个幂等事件变为 `stale`，并在后续 Session/Intent/PreTool/Stop 注入提示。
+Test、Runtime Evidence heads 会作为一个幂等事件变为 `stale`，并在后续 Session/Intent/PreTool/Stop 注入提示。
 Provider 应用新快照时会校验其显式 upstream fingerprint，并把失效传递给真正依赖它的下游；只有逐层
 重新运行对应 Provider 才能恢复各自 `fresh`。
 `stale` 证据永远没有硬阻断资格。即便是 `fresh + complete + deterministic + error` finding，也仍须
 仓库规则显式提供 authority/strength/effect，Provider 本身不能自动 block。
+
+Test 已作为独立 Evidence Plane 进入协议与 SQLite schema v14。`EvidenceFinding` 默认是 advisory；
+只有精确命中仓库 `finding_effect_mappings`，并同时满足 fresh、complete、deterministic provider 与
+`deterministic_violation` 的 error，才可能在 Stop 产生 ContinueWork。当前尚未开放具体语言的 Test
+执行命令，因此不会把普通 Build/Runtime 结果伪装成 Test Evidence。
 
 ## Build Evidence Provider
 
@@ -670,7 +675,7 @@ project-brain rules symbol-scopes --rule ARCH-001
 crates/
 ├── brain-analyzer/   # Tree-sitter changed-symbol 提取
 ├── brain-core/       # 协议、规则验证、确定性决策
-├── brain-evidence/   # Source/Semantic/Engine/Build/Runtime 证据与 ArtifactGraph 协议
+├── brain-evidence/   # Source/Semantic/Engine/Build/Test/Runtime 证据与 ArtifactGraph 协议
 ├── brain-godot/      # Godot 4 真实加载探针到 Engine Evidence 的确定性转换
 ├── brain-scip/       # 离线 SCIP protobuf、项目 profile 与语义快照
 ├── brain-store/      # SQLite schema 与审计
@@ -688,8 +693,9 @@ crates/
 - Codex 与 Claude Code 已提供直接适配器、用户级 Hook 安装器和按 adapter 选择的 `doctor`；
   Prime Agent 已有独立 direct adapter，但用户级 Extension 安装器与 doctor 尚未实现。
 - Godot Engine Provider、Evidence ledger、Hook 失效传播、.NET/Rust/Python Build Provider v1、Godot
-  C# RuntimeArtifactBundle CAS 与隔离 Godot headless Runtime Evidence v1 已完成；通用测试结果与规则
-  finding 的显式映射仍未完成，不能声称全部治理能力已经完结。
+  C# RuntimeArtifactBundle CAS、隔离 Godot headless Runtime Evidence v1，以及 Test plane/finding 显式
+  effect 映射核心已完成；具体 .NET/Rust/Python/Godot Test Provider 仍未完成，不能声称全部治理能力
+  已经完结。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。

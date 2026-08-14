@@ -187,14 +187,36 @@ settled continuation。
 
 ## Evidence Protocol v1
 
-`brain-evidence` 将 `source/semantic/engine/build/runtime` 建模为独立 Evidence Plane。快照包含
+`brain-evidence` 将 `source/semantic/engine/build/test/runtime` 建模为独立 Evidence Plane。快照包含
 项目与 provider 身份、source fingerprint、独立 snapshot fingerprint、coverage、显式 upstream
 引用、ArtifactGraph 与 findings。下游只在当前源码和全部 upstream fingerprint 一致时为 fresh；
 缺少当前证据为 unknown，任一指纹不同为 stale。
 
 Artifact ID 绑定 `project_key + provider_id + provider_key`，边的两端必须同时存在于本快照。
-只有 deterministic provider 产生的 complete、fresh、error finding 才具有 hard-block 资格；
-资格仍不等于自动阻断，最终必须继续经过规则 authority/strength/effect 判定。
+只有 deterministic provider 产生的 complete、fresh、`deterministic_violation` error finding，在精确
+命中 `finding_effect_mappings` 后才具有 hard-block 资格；未知 finding 与缺少 authority 的旧 finding
+均为 advisory。资格仍不等于自动阻断，最终必须继续经过规则 authority/strength/effect 判定。
+
+仓库映射必须精确声明，不支持通配或“所有 error”规则：
+
+```json
+{
+  "id": "TEST-SAVE-001",
+  "status": "active",
+  "authority": "repository_rule",
+  "strength": "hard",
+  "effect": "block",
+  "plane": "test",
+  "provider_id": "dotnet-test.game-debug",
+  "provider_contract_version": 1,
+  "finding_code": "save_roundtrip_assertion_failed",
+  "message": "存档往返断言失败，必须继续修复"
+}
+```
+
+Stop 只读取当前项目相同 plane/provider 的 head，并再次核对 contract version、freshness、coverage、
+Provider authority 与 finding authority。缺少 head、合同漂移、stale、partial、heuristic、warning、
+advisory finding 或未知 code 均不会产生隐式 Block。
 
 Godot probe schema v1 返回 `before/after` 两份 `ProbeProjectState`。每份状态包含
 `project_sha256`、main scene、autoloads，以及所有 `.tscn/.tres` 的 UID、SHA-256、load result 与
@@ -249,7 +271,7 @@ Source B 的 TOCTOU 检查。之后从 CAS 物理复制 bundle 到 Godot 固定�
 Evidence，原始日志保留在 machine-private run 目录。每个目录包含 project-bound marker 与原子 journal；
 自动清理在精确 DB/marker/root 匹配的恢复合同完成前保持禁用。
 
-SQLite schema v13 为 Evidence Protocol 维护四类项目隔离记录：
+SQLite schema v14 为 Evidence Protocol 维护四类项目隔离记录：
 
 - `evidence_snapshots`：不可变完整快照；相同 project/plane/provider/fingerprint 只保存一次 JSON；
 - `evidence_attestations`：每次真实 Provider 运行的轻量 append-only 证明；
@@ -260,7 +282,7 @@ SQLite schema v13 为 Evidence Protocol 维护四类项目隔离记录：
 得到 unknown；fingerprint 不一致或上游 stale 得到 stale。上游 head 变化会沿显式引用传递到下游，
 但上游恢复不会自动恢复旧下游；每个 Provider 必须真实重跑才能恢复自己的 head。三种 Agent adapter
 共用的内部 `PostToolUse` 路径在观察到明确 Create/Modify/Delete 后，把现有 Semantic、Engine、Build、
-Runtime heads 作为一个幂等事件原子标为 stale；Session、Intent、PreTool 与 Stop 只注入状态提示，
+Test、Runtime heads 作为一个幂等事件原子标为 stale；Session、Intent、PreTool 与 Stop 只注入状态提示，
 不凭 stale 状态自动阻断。失败或未知状态的修改工具也可能已产生部分写入，因此同样保守失效。
 
 ## AnalysisReport
@@ -411,7 +433,7 @@ V8 的 ambiguity 属于 `semantic_lineage_groups`；candidate 的旧 `ambiguity_
    snapshot 或跨 provider 建 equivalence；
 10. 已导入但不是当前最新的历史 snapshot 不能重新应用为当前符号图。
 
-SQLite schema v13 保存 semantic snapshots、source attestations、source manifests、symbol observations、
+SQLite schema v14 保存 semantic snapshots、source attestations、source manifests、symbol observations、
 lineage groups/members/generation runs、candidate/evidence/decision 与 legacy compaction audit。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升
 为硬证据，也不会从现存 symbol 反推缺失 Document。真实重跑相同 snapshot 时可以首次补录 manifest；
 可信重跑只追加 attestation，不改写 symbol observations 或人工 lineage 状态。attestation 的唯一身份

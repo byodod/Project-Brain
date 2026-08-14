@@ -6,7 +6,8 @@ use std::{
 
 use brain_evidence::{
     ArtifactNode, EvidenceAuthority, EvidenceCoverage, EvidenceFinding, EvidenceFreshness,
-    EvidencePlane, EvidenceProvider, EvidenceReference, EvidenceSnapshot, FindingSeverity,
+    EvidencePlane, EvidenceProvider, EvidenceReference, EvidenceSnapshot, FindingAuthority,
+    FindingSeverity,
 };
 use brain_store::EvidenceHeadRecord;
 use serde::Serialize;
@@ -528,6 +529,7 @@ fn process_findings(stage: &str, process: &provider::ProcessResult) -> Vec<Evide
         findings.push(EvidenceFinding {
             code: format!("{stage}_output_truncated"),
             severity: FindingSeverity::Warning,
+            authority: FindingAuthority::Advisory,
             message: format!(
                 "{stage} output exceeded capture bounds; stdout_sha256={} stderr_sha256={}",
                 process.stdout.sha256, process.stderr.sha256
@@ -539,6 +541,7 @@ fn process_findings(stage: &str, process: &provider::ProcessResult) -> Vec<Evide
         findings.push(EvidenceFinding {
             code: format!("{stage}_exit_failure"),
             severity: FindingSeverity::Error,
+            authority: FindingAuthority::DeterministicViolation,
             message: format!(
                 "{stage} returned exit_code={:?}; stdout_sha256={} stderr_sha256={}",
                 process.status.code(),
@@ -581,6 +584,7 @@ fn log_findings<const N: usize>(
                 findings.push(EvidenceFinding {
                     code: "godot_runtime_diagnostic".to_owned(),
                     severity: FindingSeverity::Error,
+                    authority: FindingAuthority::DeterministicViolation,
                     message: format!(
                         "Godot runtime diagnostic observed; diagnostic_fingerprint={}",
                         brain_evidence::content_fingerprint(sanitized.as_bytes())

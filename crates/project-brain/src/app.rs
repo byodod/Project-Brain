@@ -1552,6 +1552,7 @@ fn initial_config(
         project_name,
         language_profiles,
         semantic_providers,
+        finding_effect_mappings: Vec::new(),
         stop_reconcile: StopReconcileConfig {
             enabled: true,
             base: "HEAD".to_owned(),

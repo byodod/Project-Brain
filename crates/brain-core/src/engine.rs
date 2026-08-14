@@ -189,6 +189,7 @@ mod tests {
             project_name: "test".to_owned(),
             language_profiles: Vec::new(),
             semantic_providers: Vec::new(),
+            finding_effect_mappings: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![
                 rule("context", RuleEffect::InjectContext, RuleStrength::Soft),
@@ -212,6 +213,7 @@ mod tests {
             project_name: "test".to_owned(),
             language_profiles: Vec::new(),
             semantic_providers: Vec::new(),
+            finding_effect_mappings: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![rule("block", RuleEffect::Block, RuleStrength::Hard)],
         };
@@ -233,6 +235,7 @@ mod tests {
             project_name: "test".to_owned(),
             language_profiles: Vec::new(),
             semantic_providers: Vec::new(),
+            finding_effect_mappings: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![invalid],
         };
@@ -253,6 +256,7 @@ mod tests {
             project_name: "test".to_owned(),
             language_profiles: Vec::new(),
             semantic_providers: Vec::new(),
+            finding_effect_mappings: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![inactive],
         };
@@ -274,6 +278,7 @@ mod tests {
             project_name: "test".to_owned(),
             language_profiles: Vec::new(),
             semantic_providers: Vec::new(),
+            finding_effect_mappings: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![bash_only],
         };
@@ -316,6 +321,7 @@ mod tests {
                     allow_missing_language: false,
                 }],
             }],
+            finding_effect_mappings: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![symbol_rule],
         };

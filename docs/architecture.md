@@ -67,8 +67,8 @@ Tracked + unignored files
 `brain-symbols` 只定义 Provider、节点、边、快照和身份质量；它不依赖 Tree-sitter、
 Git 或 SQLite。`brain-analyzer` 与 `brain-scip` 是 Provider，`brain-store` 只消费完整快照。
 
-引擎、构建与运行时事实走独立的 `brain-evidence` 协议。它把 Source、Semantic、Engine、Build、
-Runtime 作为不同 Evidence Plane，并用 ArtifactGraph 表达场景、资源、脚本绑定、构建产物和运行
+引擎、构建、测试与运行时事实走独立的 `brain-evidence` 协议。它把 Source、Semantic、Engine、Build、
+Test、Runtime 作为不同 Evidence Plane，并用 ArtifactGraph 表达场景、资源、脚本绑定、构建产物和运行
 场景。每个下游快照记录实际消费的 upstream fingerprint；源码或任一上游变化都会使证据 stale。
 SymbolGraph 与 ArtifactGraph 不共享身份，后续只能通过显式 evidence edge 连接。
 
@@ -131,7 +131,7 @@ SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照�
 进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
 符号 ID、快照 revision、节点/边主键、查询和墓碑更新都包含 `project_key`。数据库 schema v4
 首次建立这组项目隔离约束；对应迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与
-adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v13，并在这些约束上
+adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v14，并在这些约束上
 增加独立的语义血缘账本、append-only 来源证明、不可伪造的源码 Document manifest，以及
 Evidence Plane 当前 head 与 staleness 事件。
 数据库迁移拒绝缺失或非整数的已有 `schema_version`，不会把损坏元数据静默当作 v1。
@@ -153,7 +153,7 @@ confirmed / rejected / superseded / invalidated
            └── never rewrites SymbolNode / tombstone / snapshot
 ```
 
-SQLite schema v13 保存 semantic snapshots、append-only source attestations、source manifests、
+SQLite schema v14 保存 semantic snapshots、append-only source attestations、source manifests、
 symbol observations、group/member/generation run、candidate/evidence/decision，以及显式旧账压缩的
 run/group 审计和 append-only Provider qualification events。压缩默认只读；apply 必须携带人工确认与幂等 request ID，且逻辑删除与审计同事务。
 物理 `VACUUM` 不属于压缩事务，也不能替代候选资格证明。
@@ -236,7 +236,7 @@ Extension 安装器仍留在后续阶段。
 4. Claude Code 已覆盖安装后 exec-form handler 的真实子进程 fixture；Prime Agent 独立 direct
    adapter 已完成，下一步增加原子 Extension 安装与真实 Prime runtime fixture。按 adapter 选择的
    doctor 已由 ADR-0016 完成。
-5. Source、Semantic、Engine、Build、Runtime 分层 Evidence Plane、独立 ArtifactGraph、SQLite
+5. Source、Semantic、Engine、Build、Test、Runtime 分层 Evidence Plane、独立 ArtifactGraph、SQLite
    快照/attestation/head/staleness ledger 与 Hook 新鲜度提示已经完成；Godot Engine 以及
    .NET/Rust/Python Build Evidence Provider v1 已通过真实项目验证；Godot C# 最终产物还会提升到
    机器级内容寻址存储，以不可变 RuntimeArtifactBundle 绑定精确文件字节与主程序集。下一阶段从该
@@ -262,4 +262,5 @@ Extension 安装器仍留在后续阶段。
 [ADR-0021](adr/0021-evidence-ledger-and-hook-staleness.md)、
 [ADR-0022](adr/0022-evidence-upstream-freshness-propagation.md) 与
 [ADR-0023](adr/0023-fixed-build-evidence-providers.md) 与
-[ADR-0024](adr/0024-content-addressed-runtime-bundles.md)。
+[ADR-0024](adr/0024-content-addressed-runtime-bundles.md) 与
+[ADR-0025](adr/0025-test-evidence-and-explicit-finding-effects.md)。

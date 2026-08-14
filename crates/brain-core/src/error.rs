@@ -23,6 +23,9 @@ pub enum CoreError {
     #[error("规则 {rule_id} 无效：{reason}")]
     InvalidRule { rule_id: String, reason: String },
 
+    #[error("Finding effect 映射 {mapping_id} 无效：{reason}")]
+    InvalidFindingEffectMapping { mapping_id: String, reason: String },
+
     #[error("Stop reconcile 配置无效：{0}")]
     InvalidStopReconcile(String),
 }

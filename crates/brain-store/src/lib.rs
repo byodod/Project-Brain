@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const DATABASE_SCHEMA_VERSION: i64 = 13;
+const DATABASE_SCHEMA_VERSION: i64 = 14;
 const LEGACY_LINEAGE_ALGORITHM_ID: &str = "project-brain-lineage";
 const LEGACY_LINEAGE_ALGORITHM_VERSION: &str = "1";
 const LEGACY_COMPACTION_ALGORITHM_ID: &str = "project-brain-lineage-legacy-compaction";
@@ -561,6 +561,7 @@ impl BrainStore {
         self.ensure_semantic_snapshot_source_columns()?;
         self.initialize_evidence_v12_schema()?;
         self.ensure_evidence_v13_schema()?;
+        self.ensure_evidence_v14_test_plane()?;
         self.initialize_adapter_audit_schema()?;
         self.connection.execute(
             "INSERT INTO metadata(key, value) VALUES('schema_version', ?1)
@@ -624,7 +625,7 @@ impl BrainStore {
             "CREATE TABLE IF NOT EXISTS evidence_snapshots (
                  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                  project_key TEXT NOT NULL,
-                 plane TEXT NOT NULL CHECK(plane IN ('source', 'semantic', 'engine', 'build', 'runtime')),
+                 plane TEXT NOT NULL CHECK(plane IN ('source', 'semantic', 'engine', 'build', 'test', 'runtime')),
                  provider_id TEXT NOT NULL,
                  provider_version TEXT NOT NULL,
                  provider_contract_version INTEGER NOT NULL,
@@ -703,11 +704,79 @@ impl BrainStore {
                      WHEN 'semantic' THEN '[\"semantic\"]'
                      WHEN 'engine' THEN '[\"engine\"]'
                      WHEN 'build' THEN '[\"build\"]'
+                     WHEN 'test' THEN '[\"test\"]'
                      WHEN 'runtime' THEN '[\"runtime\"]'
                      ELSE '[]'
                  END
                  WHERE planes_json = '[]';",
             )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_evidence_v14_test_plane(&self) -> Result<(), StoreError> {
+        let table_sql = self.connection.query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type = 'table' AND name = 'evidence_snapshots'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        if table_sql.contains("'test'") {
+            return Ok(());
+        }
+
+        self.connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")?;
+        let migration = self.connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE evidence_snapshots_v14 (
+                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                 project_key TEXT NOT NULL,
+                 plane TEXT NOT NULL CHECK(plane IN ('source', 'semantic', 'engine', 'build', 'test', 'runtime')),
+                 provider_id TEXT NOT NULL,
+                 provider_version TEXT NOT NULL,
+                 provider_contract_version INTEGER NOT NULL,
+                 snapshot_fingerprint TEXT NOT NULL,
+                 source_fingerprint TEXT NOT NULL,
+                 coverage TEXT NOT NULL CHECK(coverage IN ('complete', 'partial')),
+                 authority TEXT NOT NULL CHECK(authority IN ('deterministic', 'heuristic')),
+                 snapshot_json TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 UNIQUE(project_key, plane, provider_id, snapshot_fingerprint)
+             );
+             INSERT INTO evidence_snapshots_v14(
+                 sequence, project_key, plane, provider_id, provider_version,
+                 provider_contract_version, snapshot_fingerprint, source_fingerprint,
+                 coverage, authority, snapshot_json, created_at_unix_seconds
+             )
+             SELECT sequence, project_key, plane, provider_id, provider_version,
+                    provider_contract_version, snapshot_fingerprint, source_fingerprint,
+                    coverage, authority, snapshot_json, created_at_unix_seconds
+             FROM evidence_snapshots;
+             DROP TABLE evidence_snapshots;
+             ALTER TABLE evidence_snapshots_v14 RENAME TO evidence_snapshots;
+             CREATE INDEX idx_evidence_snapshot_latest
+                 ON evidence_snapshots(project_key, plane, provider_id, sequence DESC);
+             COMMIT;",
+        );
+        if migration.is_err() {
+            let _ = self.connection.execute_batch("ROLLBACK;");
+        }
+        let foreign_keys = self.connection.execute_batch("PRAGMA foreign_keys = ON;");
+        migration?;
+        foreign_keys?;
+        let violation: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT 'violation' FROM pragma_foreign_key_check LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if violation.is_some() {
+            return Err(StoreError::Integrity(
+                "Evidence v14 迁移后 foreign_key_check 失败".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -5558,7 +5627,7 @@ mod tests {
         drop(connection);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 13);
+        assert_eq!(migrated.database_schema_version().unwrap(), 14);
         let planes_json: String = migrated
             .connection
             .query_row(
@@ -5579,6 +5648,68 @@ mod tests {
             )
             .unwrap();
         assert!(replay.replayed);
+        drop(migrated);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v13_evidence_migration_preserves_heads_and_accepts_test_plane() {
+        let (root, database) = temporary_database("evidence-v13-test-plane");
+        let store = BrainStore::open(&database).unwrap();
+        let engine = evidence_snapshot(PROJECT_KEY);
+        store.apply_evidence_snapshot(&engine).unwrap();
+        drop(store);
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 BEGIN IMMEDIATE;
+                 CREATE TABLE evidence_snapshots_v13 (
+                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                     project_key TEXT NOT NULL,
+                     plane TEXT NOT NULL CHECK(plane IN ('source', 'semantic', 'engine', 'build', 'runtime')),
+                     provider_id TEXT NOT NULL,
+                     provider_version TEXT NOT NULL,
+                     provider_contract_version INTEGER NOT NULL,
+                     snapshot_fingerprint TEXT NOT NULL,
+                     source_fingerprint TEXT NOT NULL,
+                     coverage TEXT NOT NULL CHECK(coverage IN ('complete', 'partial')),
+                     authority TEXT NOT NULL CHECK(authority IN ('deterministic', 'heuristic')),
+                     snapshot_json TEXT NOT NULL,
+                     created_at_unix_seconds INTEGER NOT NULL,
+                     UNIQUE(project_key, plane, provider_id, snapshot_fingerprint)
+                 );
+                 INSERT INTO evidence_snapshots_v13 SELECT * FROM evidence_snapshots;
+                 DROP TABLE evidence_snapshots;
+                 ALTER TABLE evidence_snapshots_v13 RENAME TO evidence_snapshots;
+                 CREATE INDEX idx_evidence_snapshot_latest
+                     ON evidence_snapshots(project_key, plane, provider_id, sequence DESC);
+                 UPDATE metadata SET value = '13' WHERE key = 'schema_version';
+                 COMMIT;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = BrainStore::open(&database).unwrap();
+        assert_eq!(migrated.database_schema_version().unwrap(), 14);
+        assert_eq!(migrated.list_evidence_heads(PROJECT_KEY).unwrap().len(), 1);
+        let test_snapshot = plane_evidence_snapshot(
+            PROJECT_KEY,
+            EvidencePlane::Test,
+            "test-runner",
+            "sha256_source-test",
+            Vec::new(),
+        );
+        assert_eq!(
+            migrated
+                .apply_evidence_snapshot(&test_snapshot)
+                .unwrap()
+                .freshness,
+            EvidenceFreshness::Fresh
+        );
+        assert_eq!(migrated.list_evidence_heads(PROJECT_KEY).unwrap().len(), 2);
         drop(migrated);
         fs::remove_dir_all(root).unwrap();
     }
@@ -6211,7 +6342,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 13);
+        assert_eq!(store.database_schema_version().unwrap(), 14);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, false, 10)
@@ -6296,7 +6427,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 13);
+        assert_eq!(store.database_schema_version().unwrap(), 14);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, true, 10)
@@ -6336,7 +6467,7 @@ mod tests {
         drop(connection);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 13);
+        assert_eq!(migrated.database_schema_version().unwrap(), 14);
         let legacy_source = migrated
             .connection
             .query_row(
@@ -6724,7 +6855,7 @@ mod tests {
         drop(legacy);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 13);
+        assert_eq!(migrated.database_schema_version().unwrap(), 14);
         let refreshed = SemanticSnapshotSource::trusted_provider(
             "d".repeat(64),
             "same-head".to_owned(),
@@ -7327,7 +7458,7 @@ mod tests {
         drop(store);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 13);
+        assert_eq!(migrated.database_schema_version().unwrap(), 14);
         assert_eq!(
             migrated
                 .list_symbols(PROJECT_KEY, None, false, 10)

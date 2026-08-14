@@ -13,6 +13,7 @@ pub enum EvidencePlane {
     Semantic,
     Engine,
     Build,
+    Test,
     Runtime,
 }
 
@@ -23,6 +24,7 @@ impl EvidencePlane {
             Self::Semantic => "semantic",
             Self::Engine => "engine",
             Self::Build => "build",
+            Self::Test => "test",
             Self::Runtime => "runtime",
         }
     }
@@ -33,6 +35,7 @@ impl EvidencePlane {
             "semantic" => Some(Self::Semantic),
             "engine" => Some(Self::Engine),
             "build" => Some(Self::Build),
+            "test" => Some(Self::Test),
             "runtime" => Some(Self::Runtime),
             _ => None,
         }
@@ -44,6 +47,10 @@ impl EvidencePlane {
             Self::Semantic => matches!(upstream, Self::Source),
             Self::Engine => matches!(upstream, Self::Source | Self::Semantic),
             Self::Build => matches!(upstream, Self::Source | Self::Semantic | Self::Engine),
+            Self::Test => matches!(
+                upstream,
+                Self::Source | Self::Semantic | Self::Engine | Self::Build
+            ),
             Self::Runtime => !matches!(upstream, Self::Runtime),
         }
     }
@@ -130,6 +137,23 @@ pub enum FindingSeverity {
     Info,
     Warning,
     Error,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingAuthority {
+    #[default]
+    Advisory,
+    DeterministicViolation,
+}
+
+impl FindingAuthority {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Advisory => "advisory",
+            Self::DeterministicViolation => "deterministic_violation",
+        }
+    }
 }
 
 impl FindingSeverity {
@@ -234,6 +258,8 @@ pub struct ArtifactEdge {
 pub struct EvidenceFinding {
     pub code: String,
     pub severity: FindingSeverity,
+    #[serde(default, skip_serializing_if = "is_advisory_finding")]
+    pub authority: FindingAuthority,
     pub message: String,
     pub artifact_id: Option<String>,
     pub path: Option<String>,
@@ -286,6 +312,7 @@ impl EvidenceSnapshot {
             (
                 &left.code,
                 left.severity,
+                left.authority,
                 &left.artifact_id,
                 &left.path,
                 &left.message,
@@ -293,6 +320,7 @@ impl EvidenceSnapshot {
                 .cmp(&(
                     &right.code,
                     right.severity,
+                    right.authority,
                     &right.artifact_id,
                     &right.path,
                     &right.message,
@@ -375,11 +403,14 @@ impl EvidenceSnapshot {
         &self,
         finding: &EvidenceFinding,
         freshness: EvidenceFreshness,
+        explicitly_mapped: bool,
     ) -> bool {
-        self.provider.authority == EvidenceAuthority::Deterministic
+        explicitly_mapped
+            && self.provider.authority == EvidenceAuthority::Deterministic
             && self.coverage == EvidenceCoverage::Complete
             && freshness == EvidenceFreshness::Fresh
             && finding.severity == FindingSeverity::Error
+            && finding.authority == FindingAuthority::DeterministicViolation
             && self.findings.contains(finding)
     }
 
@@ -507,12 +538,14 @@ impl EvidenceSnapshot {
             (
                 &pair[0].code,
                 pair[0].severity,
+                pair[0].authority,
                 &pair[0].artifact_id,
                 &pair[0].path,
                 &pair[0].message,
             ) > (
                 &pair[1].code,
                 pair[1].severity,
+                pair[1].authority,
                 &pair[1].artifact_id,
                 &pair[1].path,
                 &pair[1].message,
@@ -563,6 +596,9 @@ impl EvidenceSnapshot {
         for finding in &self.findings {
             append_part(&mut bytes, finding.code.as_bytes());
             append_part(&mut bytes, finding.severity.as_str().as_bytes());
+            if finding.authority != FindingAuthority::Advisory {
+                append_part(&mut bytes, finding.authority.as_str().as_bytes());
+            }
             append_part(&mut bytes, finding.message.as_bytes());
             append_part(
                 &mut bytes,
@@ -579,6 +615,14 @@ impl EvidenceSnapshot {
         }
         fingerprint(&[&bytes])
     }
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a shared-reference predicate"
+)]
+fn is_advisory_finding(authority: &FindingAuthority) -> bool {
+    *authority == FindingAuthority::Advisory
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -808,6 +852,7 @@ mod tests {
         let finding = EvidenceFinding {
             code: "GODOT_MISSING_RESOURCE".to_owned(),
             severity: FindingSeverity::Error,
+            authority: FindingAuthority::DeterministicViolation,
             message: "scene references a missing resource".to_owned(),
             artifact_id: None,
             path: Some("scenes/main.tscn".to_owned()),
@@ -829,20 +874,96 @@ mod tests {
 
         assert!(
             make(EvidenceAuthority::Deterministic, EvidenceCoverage::Complete)
-                .finding_can_hard_block(&finding, EvidenceFreshness::Fresh)
-        );
-        assert!(
-            !make(EvidenceAuthority::Heuristic, EvidenceCoverage::Complete)
-                .finding_can_hard_block(&finding, EvidenceFreshness::Fresh)
-        );
-        assert!(
-            !make(EvidenceAuthority::Deterministic, EvidenceCoverage::Partial)
-                .finding_can_hard_block(&finding, EvidenceFreshness::Fresh)
+                .finding_can_hard_block(&finding, EvidenceFreshness::Fresh, true)
         );
         assert!(
             !make(EvidenceAuthority::Deterministic, EvidenceCoverage::Complete)
-                .finding_can_hard_block(&finding, EvidenceFreshness::Stale)
+                .finding_can_hard_block(&finding, EvidenceFreshness::Fresh, false)
         );
+        let mut advisory = finding.clone();
+        advisory.authority = FindingAuthority::Advisory;
+        let advisory_snapshot = EvidenceSnapshot::new(
+            "project-a",
+            EvidencePlane::Engine,
+            provider(EvidenceAuthority::Deterministic),
+            "sha256_worktree",
+            EvidenceCoverage::Complete,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![advisory.clone()],
+        )
+        .unwrap();
+        assert!(!advisory_snapshot.finding_can_hard_block(
+            &advisory,
+            EvidenceFreshness::Fresh,
+            true
+        ));
+        assert!(
+            !make(EvidenceAuthority::Heuristic, EvidenceCoverage::Complete).finding_can_hard_block(
+                &finding,
+                EvidenceFreshness::Fresh,
+                true
+            )
+        );
+        assert!(
+            !make(EvidenceAuthority::Deterministic, EvidenceCoverage::Partial)
+                .finding_can_hard_block(&finding, EvidenceFreshness::Fresh, true)
+        );
+        assert!(
+            !make(EvidenceAuthority::Deterministic, EvidenceCoverage::Complete)
+                .finding_can_hard_block(&finding, EvidenceFreshness::Stale, true)
+        );
+    }
+
+    #[test]
+    fn test_is_an_independent_plane_with_explicit_upstream_contract() {
+        let upstream = [
+            EvidencePlane::Source,
+            EvidencePlane::Semantic,
+            EvidencePlane::Engine,
+            EvidencePlane::Build,
+        ]
+        .into_iter()
+        .map(|plane| EvidenceReference {
+            plane,
+            provider_id: format!("{}-provider", plane.as_str()),
+            snapshot_fingerprint: format!("sha256_{}", plane.as_str()),
+        })
+        .collect();
+        let snapshot = EvidenceSnapshot::new(
+            "project-a",
+            EvidencePlane::Test,
+            provider(EvidenceAuthority::Deterministic),
+            "sha256_worktree",
+            EvidenceCoverage::Complete,
+            upstream,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(snapshot.plane, EvidencePlane::Test);
+
+        let invalid = EvidenceSnapshot::new(
+            "project-a",
+            EvidencePlane::Build,
+            provider(EvidenceAuthority::Deterministic),
+            "sha256_worktree",
+            EvidenceCoverage::Complete,
+            vec![EvidenceReference {
+                plane: EvidencePlane::Test,
+                provider_id: "test-provider".to_owned(),
+                snapshot_fingerprint: "sha256_test".to_owned(),
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(matches!(
+            invalid,
+            Err(EvidenceError::InvalidUpstreamPlane { .. })
+        ));
     }
 
     #[test]

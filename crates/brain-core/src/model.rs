@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use brain_evidence::EvidencePlane;
+
 use crate::CoreError;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -17,6 +19,8 @@ pub struct BrainConfig {
     pub language_profiles: Vec<ProjectLanguageProfile>,
     #[serde(default)]
     pub semantic_providers: Vec<SemanticProviderProfile>,
+    #[serde(default)]
+    pub finding_effect_mappings: Vec<FindingEffectMapping>,
     #[serde(default)]
     pub rules: Vec<Rule>,
     #[serde(default)]
@@ -48,6 +52,17 @@ impl BrainConfig {
         validate_language_profiles(&self.language_profiles)?;
         validate_semantic_provider_profiles(&self.language_profiles, &self.semantic_providers)?;
 
+        let mut mapping_ids = std::collections::BTreeSet::new();
+        for mapping in &self.finding_effect_mappings {
+            mapping.validate()?;
+            if !mapping_ids.insert(mapping.id.clone()) {
+                return Err(CoreError::InvalidFindingEffectMapping {
+                    mapping_id: mapping.id.clone(),
+                    reason: "id 重复".to_owned(),
+                });
+            }
+        }
+
         for rule in &self.rules {
             rule.validate()?;
             validate_rule_symbol_scopes(rule, &self.semantic_providers)?;
@@ -61,6 +76,80 @@ impl BrainConfig {
                     "envelope 不能为空".to_owned(),
                 ));
             }
+        }
+        Ok(())
+    }
+}
+
+/// 将一个精确 Evidence Finding 映射到治理 effect。
+///
+/// 未命中的 finding 永远保持 advisory；Block 仍受与普通规则相同的权限边界约束。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FindingEffectMapping {
+    pub id: String,
+    #[serde(default = "default_active")]
+    pub status: MemoryStatus,
+    pub authority: Authority,
+    pub strength: RuleStrength,
+    pub effect: RuleEffect,
+    pub plane: EvidencePlane,
+    pub provider_id: String,
+    pub provider_contract_version: u16,
+    pub finding_code: String,
+    pub message: String,
+}
+
+impl FindingEffectMapping {
+    /// 验证精确映射及其阻断权限。
+    ///
+    /// # Errors
+    ///
+    /// 当标识、provider、finding code、contract version 或权限边界无效时返回错误。
+    pub fn validate(&self) -> Result<(), CoreError> {
+        let invalid_identifier = |value: &str, max_len: usize| {
+            value.trim().is_empty()
+                || value.len() > max_len
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        };
+        if invalid_identifier(&self.id, 128) {
+            return Err(CoreError::InvalidFindingEffectMapping {
+                mapping_id: self.id.clone(),
+                reason: "id 为空或格式非法".to_owned(),
+            });
+        }
+        if invalid_identifier(&self.provider_id, 128) {
+            return Err(CoreError::InvalidFindingEffectMapping {
+                mapping_id: self.id.clone(),
+                reason: "provider_id 为空或格式非法".to_owned(),
+            });
+        }
+        if self.provider_contract_version == 0 {
+            return Err(CoreError::InvalidFindingEffectMapping {
+                mapping_id: self.id.clone(),
+                reason: "provider_contract_version 必须大于 0".to_owned(),
+            });
+        }
+        if invalid_identifier(&self.finding_code, 128) {
+            return Err(CoreError::InvalidFindingEffectMapping {
+                mapping_id: self.id.clone(),
+                reason: "finding_code 为空或格式非法".to_owned(),
+            });
+        }
+        if self.message.trim().is_empty() || self.message.len() > 4096 {
+            return Err(CoreError::InvalidFindingEffectMapping {
+                mapping_id: self.id.clone(),
+                reason: "message 为空或过长".to_owned(),
+            });
+        }
+        if matches!(self.effect, RuleEffect::Block | RuleEffect::Escalate)
+            && (self.strength != RuleStrength::Hard || !self.authority.can_block())
+        {
+            return Err(CoreError::InvalidFindingEffectMapping {
+                mapping_id: self.id.clone(),
+                reason: "Block/Escalate 只允许 hard 且 authority 为 explicit_user、repository_rule 或 accepted_decision 的映射".to_owned(),
+            });
         }
         Ok(())
     }
@@ -536,8 +625,11 @@ pub struct Decision {
 
 #[cfg(test)]
 mod tests {
+    use brain_evidence::EvidencePlane;
+
     use super::{
-        BrainConfig, CURRENT_SCHEMA_VERSION, ProjectLanguageProfile, SemanticLanguageMapping,
+        Authority, BrainConfig, CURRENT_SCHEMA_VERSION, FindingEffectMapping, MemoryStatus,
+        ProjectLanguageProfile, RuleEffect, RuleStrength, SemanticLanguageMapping,
         SemanticProviderFormat, SemanticProviderProfile, StopReconcileConfig,
     };
     use crate::CoreError;
@@ -550,6 +642,7 @@ mod tests {
             project_name: "test".to_owned(),
             language_profiles: Vec::new(),
             semantic_providers: Vec::new(),
+            finding_effect_mappings: Vec::new(),
             rules: Vec::new(),
             stop_reconcile: StopReconcileConfig {
                 enabled: true,
@@ -584,6 +677,7 @@ mod tests {
                     allow_missing_language: false,
                 }],
             }],
+            finding_effect_mappings: Vec::new(),
             rules: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
         };
@@ -634,9 +728,46 @@ mod tests {
                     allow_missing_language: true,
                 }],
             }],
+            finding_effect_mappings: Vec::new(),
             rules: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn finding_block_mapping_requires_hard_repository_authority() {
+        let mapping = FindingEffectMapping {
+            id: "TEST-FAIL-001".to_owned(),
+            status: MemoryStatus::Active,
+            authority: Authority::AgentInference,
+            strength: RuleStrength::Hard,
+            effect: RuleEffect::Block,
+            plane: EvidencePlane::Test,
+            provider_id: "dotnet-test".to_owned(),
+            provider_contract_version: 1,
+            finding_code: "assertion_failed".to_owned(),
+            message: "声明的测试断言失败，必须继续修复".to_owned(),
+        };
+        assert!(matches!(
+            mapping.validate(),
+            Err(CoreError::InvalidFindingEffectMapping { .. })
+        ));
+
+        let mut authorized = mapping;
+        authorized.authority = Authority::RepositoryRule;
+        authorized.strength = RuleStrength::Soft;
+        assert!(matches!(
+            authorized.validate(),
+            Err(CoreError::InvalidFindingEffectMapping { .. })
+        ));
+        authorized.strength = RuleStrength::Hard;
+        assert!(authorized.validate().is_ok());
+        authorized.effect = RuleEffect::Escalate;
+        authorized.authority = Authority::ObservedPattern;
+        assert!(matches!(
+            authorized.validate(),
+            Err(CoreError::InvalidFindingEffectMapping { .. })
+        ));
     }
 }

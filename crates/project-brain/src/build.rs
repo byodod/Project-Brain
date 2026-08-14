@@ -6,7 +6,8 @@ use std::{
 
 use brain_evidence::{
     ArtifactNode, EvidenceAuthority, EvidenceCoverage, EvidenceFinding, EvidencePlane,
-    EvidenceProvider, EvidenceReference, EvidenceSnapshot, FindingSeverity, content_fingerprint,
+    EvidenceProvider, EvidenceReference, EvidenceSnapshot, FindingAuthority, FindingSeverity,
+    content_fingerprint,
 };
 use serde::{Deserialize, Serialize};
 
@@ -413,6 +414,7 @@ fn run_build(
         findings.push(EvidenceFinding {
             code: "build_unavailable".to_owned(),
             severity: FindingSeverity::Warning,
+            authority: FindingAuthority::Advisory,
             message: format!(
                 "{adapter} could not complete its fixed contract because required machine toolchain or prepared dependency state was unavailable; stdout_sha256={} stderr_sha256={}",
                 process.stdout.sha256, process.stderr.sha256
@@ -424,6 +426,7 @@ fn run_build(
         findings.push(EvidenceFinding {
             code: "build_exit_failure".to_owned(),
             severity: FindingSeverity::Error,
+            authority: FindingAuthority::DeterministicViolation,
             message: format!(
                 "{adapter} returned exit_code={:?}; stdout_sha256={} stderr_sha256={}",
                 process.status.code(),
@@ -441,6 +444,7 @@ fn run_build(
         findings.push(EvidenceFinding {
             code: "required_artifact_missing".to_owned(),
             severity: FindingSeverity::Error,
+            authority: FindingAuthority::DeterministicViolation,
             message: format!("{adapter} succeeded but produced no regular artifact files"),
             artifact_id: None,
             path: Some(target_display.clone()),
@@ -480,6 +484,7 @@ fn run_build(
         findings.push(EvidenceFinding {
             code: "runtime_bundle_unavailable".to_owned(),
             severity: FindingSeverity::Warning,
+            authority: FindingAuthority::Advisory,
             message: format!(
                 "Build completed but exact Runtime bundle could not be committed to machine CAS; failure_fingerprint={}",
                 content_fingerprint(failure.as_bytes())

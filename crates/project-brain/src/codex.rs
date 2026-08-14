@@ -714,6 +714,7 @@ mod tests {
             project_name: "test".to_owned(),
             language_profiles: Vec::new(),
             semantic_providers: Vec::new(),
+            finding_effect_mappings: Vec::new(),
             stop_reconcile: StopReconcileConfig::default(),
             rules: vec![Rule {
                 id: "PROTECT".to_owned(),

@@ -66,6 +66,7 @@ pub fn process(
                     EvidencePlane::Semantic,
                     EvidencePlane::Engine,
                     EvidencePlane::Build,
+                    EvidencePlane::Test,
                     EvidencePlane::Runtime,
                 ];
                 let has_affected_head = store
@@ -94,7 +95,7 @@ pub fn process(
                 if stale.heads_marked > 0 {
                     feedback.push(FeedbackItem {
                         severity: FeedbackSeverity::Warning,
-                        text: "Project Brain：源码修改后现有 Semantic/Engine/Build/Runtime Evidence 已标记为 stale；stale 证据没有硬阻断资格。请重新运行对应的受信任 Provider 恢复 fresh。".to_owned(),
+                        text: "Project Brain：源码修改后现有 Semantic/Engine/Build/Test/Runtime Evidence 已标记为 stale；stale 证据没有硬阻断资格。请重新运行对应的受信任 Provider 恢复 fresh。".to_owned(),
                     });
                 }
             }
@@ -481,8 +482,12 @@ fn stop_decision(
     if vendor_loop_active {
         return (StopDecision::AllowStop, Vec::new());
     }
+    let (finding_violations, finding_feedback) = evaluate_finding_stop(config, store);
     if !config.stop_reconcile.enabled {
-        let (violations, feedback) = evaluate_symbol_stop(root, config, store, provider_trust);
+        let (mut violations, mut feedback) =
+            evaluate_symbol_stop(root, config, store, provider_trust);
+        violations.extend(finding_violations);
+        feedback.extend(finding_feedback);
         return if violations.is_empty() {
             (StopDecision::AllowStop, feedback)
         } else {
@@ -514,7 +519,10 @@ fn stop_decision(
     };
     match report.decision {
         reconcile::ReconcileDecision::Allow => {
-            let (violations, feedback) = evaluate_symbol_stop(root, config, store, provider_trust);
+            let (mut violations, mut feedback) =
+                evaluate_symbol_stop(root, config, store, provider_trust);
+            violations.extend(finding_violations);
+            feedback.extend(finding_feedback);
             if violations.is_empty() {
                 (StopDecision::AllowStop, feedback)
             } else {
@@ -547,6 +555,100 @@ fn stop_decision(
             )
         }
     }
+}
+
+/// 只把精确命中、fresh、complete、deterministic 且声明为确定性违规的 finding
+/// 提升为 Stop gate。存储不可用、缺失 head、合同漂移和 stale 都按 fail-open 反馈。
+fn evaluate_finding_stop(
+    config: &BrainConfig,
+    store: &BrainStore,
+) -> (Vec<String>, Vec<FeedbackItem>) {
+    let heads = match store.list_evidence_heads(&config.project_key) {
+        Ok(heads) => heads,
+        Err(error) => {
+            return (
+                Vec::new(),
+                vec![FeedbackItem {
+                    severity: FeedbackSeverity::Warning,
+                    text: format!(
+                        "Evidence ledger 不可用（{error}）；Finding effect 映射按 fail-open 处理。"
+                    ),
+                }],
+            );
+        }
+    };
+    let mut violations = Vec::new();
+    let mut feedback = Vec::new();
+    for mapping in config
+        .finding_effect_mappings
+        .iter()
+        .filter(|mapping| mapping.status == MemoryStatus::Active)
+    {
+        let matching_identity = heads
+            .iter()
+            .find(|head| head.plane == mapping.plane && head.provider_id == mapping.provider_id);
+        let Some(head) = matching_identity else {
+            feedback.push(FeedbackItem {
+                severity: FeedbackSeverity::Warning,
+                text: format!(
+                    "Finding effect 映射 {} 缺少 {} provider={} 的 Evidence head；按 advisory 处理。",
+                    mapping.id,
+                    mapping.plane.as_str(),
+                    mapping.provider_id
+                ),
+            });
+            continue;
+        };
+        if head.snapshot.provider.contract_version != mapping.provider_contract_version {
+            feedback.push(FeedbackItem {
+                severity: FeedbackSeverity::Warning,
+                text: format!(
+                    "Finding effect 映射 {} 要求 provider contract v{}，当前为 v{}；按 advisory 处理。",
+                    mapping.id,
+                    mapping.provider_contract_version,
+                    head.snapshot.provider.contract_version
+                ),
+            });
+            continue;
+        }
+        for finding in head
+            .snapshot
+            .findings
+            .iter()
+            .filter(|finding| finding.code == mapping.finding_code)
+        {
+            match mapping.effect {
+                RuleEffect::InjectContext => feedback.push(FeedbackItem {
+                    severity: FeedbackSeverity::Info,
+                    text: format!("{}：{}", mapping.message, finding.message),
+                }),
+                RuleEffect::Block | RuleEffect::Escalate => {
+                    if head
+                        .snapshot
+                        .finding_can_hard_block(finding, head.freshness, true)
+                    {
+                        violations.push(format!(
+                            "{} 命中 {}/{}/{}：{}",
+                            mapping.id,
+                            mapping.plane.as_str(),
+                            mapping.provider_id,
+                            finding.code,
+                            mapping.message
+                        ));
+                    } else {
+                        feedback.push(FeedbackItem {
+                            severity: FeedbackSeverity::Warning,
+                            text: format!(
+                                "Finding effect 映射 {} 命中 {}，但证据不满足 fresh + complete + deterministic violation；按 advisory 处理。",
+                                mapping.id, finding.code
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    (violations, feedback)
 }
 
 #[allow(
@@ -695,9 +797,14 @@ mod tests {
 
     use brain_core::{
         ActionDescriptor, ActionKind, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, DecisionKind,
-        EvidenceGrade, MemoryStatus, ProjectLanguageProfile, Rule, RuleEffect, RuleStrength,
-        RuleSymbolScope, SemanticLanguageMapping, SemanticProviderFormat, SemanticProviderProfile,
-        StopReconcileConfig, SymbolResolutionPolicy, ToolAction, ToolImpact,
+        EvidenceGrade, FindingEffectMapping, MemoryStatus, ProjectLanguageProfile, Rule,
+        RuleEffect, RuleStrength, RuleSymbolScope, SemanticLanguageMapping, SemanticProviderFormat,
+        SemanticProviderProfile, StopReconcileConfig, SymbolResolutionPolicy, ToolAction,
+        ToolImpact,
+    };
+    use brain_evidence::{
+        EvidenceAuthority, EvidenceCoverage, EvidenceFinding, EvidencePlane, EvidenceProvider,
+        EvidenceSnapshot, FindingAuthority, FindingSeverity,
     };
     use brain_store::{BrainStore, SemanticSnapshotSource};
     use brain_symbols::{
@@ -705,7 +812,7 @@ mod tests {
         SourceLanguage, SymbolNode, SymbolNodeInput, SymbolSnapshot,
     };
 
-    use super::{evaluate_symbol_rules, evaluate_symbol_stop};
+    use super::{evaluate_finding_stop, evaluate_symbol_rules, evaluate_symbol_stop};
     use crate::git;
     use crate::provider::ProviderTrustStatus;
 
@@ -841,6 +948,7 @@ mod tests {
                     allow_missing_language: false,
                 }],
             }],
+            finding_effect_mappings: Vec::new(),
             rules: vec![Rule {
                 id: "R-SYMBOL".to_owned(),
                 status: MemoryStatus::Active,
@@ -902,6 +1010,61 @@ mod tests {
         )]
         .into_iter()
         .collect()
+    }
+
+    fn finding_mapping() -> FindingEffectMapping {
+        FindingEffectMapping {
+            id: "TEST-ASSERT-001".to_owned(),
+            status: MemoryStatus::Active,
+            authority: Authority::RepositoryRule,
+            strength: RuleStrength::Hard,
+            effect: RuleEffect::Block,
+            plane: EvidencePlane::Test,
+            provider_id: "dotnet-test".to_owned(),
+            provider_contract_version: 1,
+            finding_code: "assertion_failed".to_owned(),
+            message: "声明的测试断言失败，必须继续修复".to_owned(),
+        }
+    }
+
+    fn finding_config(mappings: Vec<FindingEffectMapping>) -> BrainConfig {
+        BrainConfig {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: "project_finding_test".to_owned(),
+            project_name: "finding test".to_owned(),
+            language_profiles: Vec::new(),
+            semantic_providers: Vec::new(),
+            finding_effect_mappings: mappings,
+            rules: Vec::new(),
+            stop_reconcile: StopReconcileConfig::default(),
+        }
+    }
+
+    fn test_failure_snapshot() -> EvidenceSnapshot {
+        EvidenceSnapshot::new(
+            "project_finding_test",
+            EvidencePlane::Test,
+            EvidenceProvider {
+                id: "dotnet-test".to_owned(),
+                version: "1.0+sha256.test".to_owned(),
+                contract_version: 1,
+                authority: EvidenceAuthority::Deterministic,
+            },
+            "sha256_source",
+            EvidenceCoverage::Complete,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![EvidenceFinding {
+                code: "assertion_failed".to_owned(),
+                severity: FindingSeverity::Error,
+                authority: FindingAuthority::DeterministicViolation,
+                message: "expected true but observed false".to_owned(),
+                artifact_id: None,
+                path: Some("tests/SaveTests.cs".to_owned()),
+            }],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1005,5 +1168,42 @@ mod tests {
         assert!(violations[0].contains("semantic_baseline_diff"));
         drop(store);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finding_requires_explicit_mapping_and_fresh_authoritative_evidence() {
+        let store = BrainStore::open_in_memory().unwrap();
+        store
+            .apply_evidence_snapshot(&test_failure_snapshot())
+            .unwrap();
+
+        let (unmapped, unmapped_feedback) =
+            evaluate_finding_stop(&finding_config(Vec::new()), &store);
+        assert!(unmapped.is_empty());
+        assert!(unmapped_feedback.is_empty());
+
+        let config = finding_config(vec![finding_mapping()]);
+        config.validate().unwrap();
+        let (mapped, feedback) = evaluate_finding_stop(&config, &store);
+        assert_eq!(mapped.len(), 1);
+        assert!(feedback.is_empty());
+        assert!(mapped[0].contains("TEST-ASSERT-001"));
+
+        store
+            .mark_evidence_planes_stale(
+                &config.project_key,
+                &[EvidencePlane::Test],
+                "source-change",
+                "test source changed",
+                &["src/Save.cs".to_owned()],
+            )
+            .unwrap();
+        let (stale, stale_feedback) = evaluate_finding_stop(&config, &store);
+        assert!(stale.is_empty());
+        assert!(
+            stale_feedback
+                .iter()
+                .any(|item| item.text.contains("advisory"))
+        );
     }
 }

@@ -6,7 +6,8 @@ use std::{
 
 use brain_evidence::{
     ArtifactEdge, ArtifactEdgeKind, ArtifactNode, EvidenceAuthority, EvidenceCoverage,
-    EvidenceFinding, EvidencePlane, EvidenceProvider, EvidenceSnapshot, FindingSeverity,
+    EvidenceFinding, EvidencePlane, EvidenceProvider, EvidenceSnapshot, FindingAuthority,
+    FindingSeverity,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -516,6 +517,7 @@ fn error_finding(
     EvidenceFinding {
         code: code.to_owned(),
         severity: FindingSeverity::Error,
+        authority: FindingAuthority::DeterministicViolation,
         message,
         artifact_id,
         path,
@@ -737,7 +739,7 @@ mod tests {
         assert!(
             report
                 .snapshot
-                .finding_can_hard_block(finding, EvidenceFreshness::Fresh)
+                .finding_can_hard_block(finding, EvidenceFreshness::Fresh, true)
         );
         fs::remove_dir_all(root).unwrap();
     }
