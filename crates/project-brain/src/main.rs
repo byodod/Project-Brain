@@ -353,6 +353,26 @@ enum TestEvidenceCommand {
         timeout_seconds: u64,
     },
 
+    /// 固定执行 cargo test --workspace --all-targets --frozen；会执行 build.rs、proc macro 与测试代码
+    Rust {
+        #[arg(long)]
+        profile: String,
+        /// 必须对应当前 `cargo-build.<profile>` Evidence head
+        #[arg(long)]
+        build_profile: String,
+        #[arg(long)]
+        executable: PathBuf,
+        /// 项目内 Cargo.toml 路径
+        #[arg(long, default_value = "Cargo.toml")]
+        manifest: PathBuf,
+        #[arg(long)]
+        trust_local_executable: bool,
+        #[arg(long)]
+        trust_repository_test_code: bool,
+        #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
+    },
+
     /// 固定运行仓库内 Godot .tscn，并读取受限结构化断言结果；不会构建、还原或导出
     Godot {
         #[arg(long)]
@@ -728,6 +748,23 @@ fn main() -> ExitCode {
                         &build_profile,
                         &target,
                         &test_assembly,
+                        trust_local_executable,
+                        trust_repository_test_code,
+                        timeout_seconds,
+                    ),
+                    TestEvidenceCommand::Rust {
+                        profile,
+                        build_profile,
+                        executable,
+                        manifest,
+                        trust_local_executable,
+                        trust_repository_test_code,
+                        timeout_seconds,
+                    } => app.evidence_test_rust(
+                        &executable,
+                        &profile,
+                        &build_profile,
+                        &manifest,
                         trust_local_executable,
                         trust_repository_test_code,
                         timeout_seconds,

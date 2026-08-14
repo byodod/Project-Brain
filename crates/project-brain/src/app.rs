@@ -692,6 +692,49 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn evidence_test_rust(
+        &self,
+        executable: &Path,
+        profile: &str,
+        build_profile: &str,
+        manifest: &Path,
+        trust_local_executable: bool,
+        trust_repository_test_code: bool,
+        timeout_seconds: u64,
+    ) -> Result<(), AppError> {
+        let heads = self.store.list_evidence_heads(&self.config.project_key)?;
+        let report = test::run_rust(&test::RustTestRequest {
+            project_root: &self.root,
+            project_key: &self.config.project_key,
+            profile_id: profile,
+            build_profile_id: build_profile,
+            executable,
+            manifest,
+            trust_local_executable,
+            trust_repository_test_code,
+            timeout_seconds,
+            evidence_heads: &heads,
+        })?;
+        let passed = report.passed();
+        let persistence = self.store.apply_evidence_snapshot(&report.evidence)?;
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": 1,
+                "run": report,
+                "persistence": persistence,
+            }))?
+        );
+        if passed {
+            Ok(())
+        } else {
+            Err(AppError::Provider(
+                "Rust Test Evidence 已保存非通过结果；测试合同未通过".to_owned(),
+            ))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn evidence_test_godot(
         &self,
         install_root: Option<&Path>,

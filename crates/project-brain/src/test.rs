@@ -17,6 +17,7 @@ use crate::{artifact_store, error::AppError, git, provider, runtime};
 
 const TEST_RUN_SCHEMA_VERSION: u32 = 1;
 const DOTNET_TEST_CONTRACT_VERSION: u16 = 1;
+const RUST_TEST_CONTRACT_VERSION: u16 = 1;
 const GODOT_SCENARIO_TEST_CONTRACT_VERSION: u16 = 1;
 const MAX_TRX_FILES: usize = 32;
 const MAX_TRX_BYTES: u64 = 16 * 1024 * 1024;
@@ -35,6 +36,19 @@ pub(crate) struct DotnetTestRequest<'a> {
     pub(crate) executable: &'a Path,
     pub(crate) target: &'a Path,
     pub(crate) test_assembly: &'a Path,
+    pub(crate) trust_local_executable: bool,
+    pub(crate) trust_repository_test_code: bool,
+    pub(crate) timeout_seconds: u64,
+    pub(crate) evidence_heads: &'a [EvidenceHeadRecord],
+}
+
+pub(crate) struct RustTestRequest<'a> {
+    pub(crate) project_root: &'a Path,
+    pub(crate) project_key: &'a str,
+    pub(crate) profile_id: &'a str,
+    pub(crate) build_profile_id: &'a str,
+    pub(crate) executable: &'a Path,
+    pub(crate) manifest: &'a Path,
     pub(crate) trust_local_executable: bool,
     pub(crate) trust_repository_test_code: bool,
     pub(crate) timeout_seconds: u64,
@@ -165,6 +179,30 @@ struct DotnetTestContract {
     execution_class: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct RustTestContract {
+    contract_version: u16,
+    adapter: &'static str,
+    profile_id: String,
+    build_provider_id: String,
+    build_snapshot_fingerprint: String,
+    manifest: String,
+    argv: Vec<String>,
+    environment_policy: &'static str,
+    network_policy: &'static str,
+    execution_class: &'static str,
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
+struct RustTestSummary {
+    result_sections: u64,
+    passed: u64,
+    failed: u64,
+    ignored: u64,
+    measured: u64,
+    filtered_out: u64,
+}
+
 #[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
 struct TrxCounters {
     total: u64,
@@ -227,18 +265,40 @@ impl DotnetTestReport {
     }
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct RustTestReport {
+    schema_version: u32,
+    project_key: String,
+    profile_id: String,
+    provider_id: String,
+    status: TestStatus,
+    coverage: TestCoverage,
+    toolchain_version: String,
+    executable_sha256: String,
+    contract: RustTestContract,
+    process: TestProcessSummary,
+    summary: Option<RustTestSummary>,
+    pub(crate) evidence: EvidenceSnapshot,
+}
+
+impl RustTestReport {
+    pub(crate) fn passed(&self) -> bool {
+        self.status == TestStatus::Passed
+    }
+}
+
 struct TestScratch {
     directory: PathBuf,
 }
 
 impl TestScratch {
-    fn create() -> Result<Self, AppError> {
+    fn create(adapter: &str) -> Result<Self, AppError> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| AppError::Provider(format!("系统时间无效：{error}")))?
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "project-brain-dotnet-test-{}-{nonce}",
+            "project-brain-{adapter}-test-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir(&directory)?;
@@ -394,7 +454,7 @@ pub(crate) fn run_dotnet(request: &DotnetTestRequest<'_>) -> Result<DotnetTestRe
             "Test dotnet executable 与 Build Evidence 工具链哈希不一致".to_owned(),
         ));
     }
-    let scratch = TestScratch::create()?;
+    let scratch = TestScratch::create("dotnet")?;
     let materialized = scratch.directory.join("build-bundle");
     artifact_store::materialize_runtime_bundle(
         request.install_root,
@@ -414,7 +474,7 @@ pub(crate) fn run_dotnet(request: &DotnetTestRequest<'_>) -> Result<DotnetTestRe
         ),
         "--nologo".to_owned(),
     ];
-    let environment_storage = test_environment(&scratch.directory)?;
+    let environment_storage = dotnet_test_environment(&scratch.directory)?;
     let environment = environment_storage
         .iter()
         .map(|(name, path)| (*name, path.as_path()))
@@ -556,6 +616,218 @@ pub(crate) fn run_dotnet(request: &DotnetTestRequest<'_>) -> Result<DotnetTestRe
         },
         trx_files,
         counters,
+        evidence,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "固定 Cargo Test 合同线性保留 Build 绑定、隔离 target、结果分类与 TOCTOU 校验"
+)]
+pub(crate) fn run_rust(request: &RustTestRequest<'_>) -> Result<RustTestReport, AppError> {
+    if !request.trust_local_executable || !request.trust_repository_test_code {
+        return Err(AppError::Provider(
+            "Rust Test 会执行 build.rs、proc macro 与仓库测试代码，必须显式提供机器 executable 与 repository test code 两个信任位"
+                .to_owned(),
+        ));
+    }
+    validate_profile_id(request.profile_id)?;
+    validate_profile_id(request.build_profile_id)?;
+    let root = request.project_root.canonicalize()?;
+    let manifest = resolve_rust_manifest(&root, request.manifest)?;
+    let manifest_display = project_relative_path(&root, &manifest)?;
+    let build_provider_id = format!("cargo-build.{}", request.build_profile_id);
+    let build_head = request
+        .evidence_heads
+        .iter()
+        .find(|head| head.plane == EvidencePlane::Build && head.provider_id == build_provider_id)
+        .ok_or_else(|| AppError::Provider("缺少指定 Rust Build Evidence head".to_owned()))?;
+    if build_head.freshness != EvidenceFreshness::Fresh
+        || build_head.snapshot.coverage != EvidenceCoverage::Complete
+        || build_head.snapshot.provider.authority != EvidenceAuthority::Deterministic
+        || !build_head.snapshot.findings.is_empty()
+    {
+        return Err(AppError::Provider(
+            "Rust Test 只接受 fresh、complete、deterministic 且无 finding 的 Build head".to_owned(),
+        ));
+    }
+    let source_fingerprint = git::worktree_fingerprint(&root)?;
+    if build_head.snapshot.source_fingerprint != source_fingerprint {
+        return Err(AppError::Provider(
+            "当前源码与 Rust Build Evidence source fingerprint 不一致".to_owned(),
+        ));
+    }
+    let expected_target = brain_evidence::content_fingerprint(manifest_display.as_bytes());
+    if !build_head.snapshot.artifacts.iter().any(|artifact| {
+        artifact.kind == "build_target" && artifact.content_fingerprint == expected_target
+    }) {
+        return Err(AppError::Provider(
+            "Rust Build Evidence 未绑定当前 Cargo.toml target；请重新生成 Build Evidence"
+                .to_owned(),
+        ));
+    }
+
+    let executable =
+        provider::pin_external_executable(&root, request.executable, "cargo executable")?;
+    if !build_head
+        .snapshot
+        .provider
+        .version
+        .ends_with(&format!("+sha256.{}", executable.sha256))
+    {
+        return Err(AppError::Provider(
+            "Test cargo executable 与 Build Evidence 工具链哈希不一致".to_owned(),
+        ));
+    }
+    let scratch = TestScratch::create("cargo")?;
+    let target = scratch.directory.join("target");
+    fs::create_dir(&target)?;
+    let argv = vec![
+        "test".to_owned(),
+        "--manifest-path".to_owned(),
+        provider::provider_cli_path(&manifest),
+        "--workspace".to_owned(),
+        "--all-targets".to_owned(),
+        "--frozen".to_owned(),
+        "--target-dir".to_owned(),
+        provider::provider_cli_path(&target),
+    ];
+    let environment_storage = rust_test_environment(&scratch.directory)?;
+    let environment = environment_storage
+        .iter()
+        .map(|(name, path)| (*name, path.as_path()))
+        .collect::<Vec<_>>();
+    let timeout = Duration::from_secs(request.timeout_seconds);
+    let version_process = provider::run_process_with_environment(
+        &executable.canonical_path,
+        None,
+        &["--version".to_owned()],
+        &scratch.directory,
+        Some(&root),
+        timeout,
+        &environment,
+    )?;
+    if !version_process.status.success()
+        || version_process.stdout.truncated
+        || version_process.stderr.truncated
+    {
+        return Err(AppError::Provider(
+            "cargo version probe 未完整成功".to_owned(),
+        ));
+    }
+    let toolchain_version = provider::version_text(&version_process)?;
+    if !toolchain_version.to_ascii_lowercase().contains("cargo") {
+        return Err(AppError::Provider(
+            "Rust Test executable version probe 不是 cargo".to_owned(),
+        ));
+    }
+    let source_before = git::worktree_fingerprint(&root)?;
+    let process = provider::run_process_with_environment_observing_timeout(
+        &executable.canonical_path,
+        None,
+        &argv,
+        &scratch.directory,
+        Some(&root),
+        timeout,
+        &environment,
+    )?;
+    let source_after = git::worktree_fingerprint(&root)?;
+    if source_before != source_after || source_after != source_fingerprint {
+        return Err(AppError::Provider(
+            "源码在 Rust Test Evidence 运行期间发生变化；结果已丢弃".to_owned(),
+        ));
+    }
+    if provider::hash_file(&executable.canonical_path)? != executable.sha256 {
+        return Err(AppError::Provider(
+            "Rust Test toolchain executable 在运行期间发生漂移".to_owned(),
+        ));
+    }
+
+    let output_truncated = process.stdout.truncated || process.stderr.truncated;
+    let parsed = parse_rust_test_summary(&process.stdout.bytes, &process.stderr.bytes);
+    let (status, coverage, summary, finding) =
+        classify_rust_result(&process, output_truncated, &parsed);
+    let provider_id = format!("cargo-test.{}", request.profile_id);
+    let contract = RustTestContract {
+        contract_version: RUST_TEST_CONTRACT_VERSION,
+        adapter: "cargo-test",
+        profile_id: request.profile_id.to_owned(),
+        build_provider_id: build_provider_id.clone(),
+        build_snapshot_fingerprint: build_head.snapshot_fingerprint.clone(),
+        manifest: manifest_display,
+        argv: vec![
+            "test".to_owned(),
+            "--manifest-path".to_owned(),
+            "<PROJECT_ROOT>/Cargo.toml".to_owned(),
+            "--workspace".to_owned(),
+            "--all-targets".to_owned(),
+            "--frozen".to_owned(),
+            "--target-dir".to_owned(),
+            "<TEST_ROOT>/target".to_owned(),
+        ],
+        environment_policy: "env_clear+adapter_allowlist+machine_scratch",
+        network_policy: "offline_frozen;repository_test_code_not_os_sandboxed",
+        execution_class: "repository_test_code",
+    };
+    let contract_bytes = serde_json::to_vec(&contract)?;
+    let result_bytes = serde_json::to_vec(&(status, coverage, summary))?;
+    let artifacts = vec![
+        ArtifactNode::from_provider_key(
+            request.project_key,
+            &provider_id,
+            "test_contract",
+            "contract",
+            "Rust Test fixed execution contract",
+            None,
+            &contract_bytes,
+        ),
+        ArtifactNode::from_provider_key(
+            request.project_key,
+            &provider_id,
+            "test_result_summary",
+            "result-summary",
+            "Rust libtest aggregate result",
+            None,
+            &result_bytes,
+        ),
+    ];
+    let evidence = EvidenceSnapshot::new(
+        request.project_key,
+        EvidencePlane::Test,
+        EvidenceProvider {
+            id: provider_id.clone(),
+            version: format!("{toolchain_version}+sha256.{}", executable.sha256),
+            contract_version: RUST_TEST_CONTRACT_VERSION,
+            authority: EvidenceAuthority::Deterministic,
+        },
+        &source_fingerprint,
+        if matches!(status, TestStatus::ProviderFailed | TestStatus::TimedOut) {
+            EvidenceCoverage::Partial
+        } else {
+            EvidenceCoverage::Complete
+        },
+        vec![EvidenceReference {
+            plane: EvidencePlane::Build,
+            provider_id: build_provider_id,
+            snapshot_fingerprint: build_head.snapshot_fingerprint.clone(),
+        }],
+        artifacts,
+        Vec::new(),
+        finding.into_iter().collect(),
+    )
+    .map_err(|error| AppError::Provider(error.to_string()))?;
+    Ok(RustTestReport {
+        schema_version: TEST_RUN_SCHEMA_VERSION,
+        project_key: request.project_key.to_owned(),
+        profile_id: request.profile_id.to_owned(),
+        provider_id,
+        status,
+        coverage,
+        toolchain_version,
+        executable_sha256: executable.sha256,
+        contract,
+        process: summarize_process(&process),
+        summary,
         evidence,
     })
 }
@@ -1276,6 +1548,175 @@ fn summarize_process(process: &provider::ProcessResult) -> TestProcessSummary {
     }
 }
 
+fn parse_rust_test_summary(stdout: &[u8], stderr: &[u8]) -> Result<RustTestSummary, String> {
+    let stdout = std::str::from_utf8(stdout).map_err(|_| "cargo test stdout is not UTF-8")?;
+    let stderr = std::str::from_utf8(stderr).map_err(|_| "cargo test stderr is not UTF-8")?;
+    let mut summary = RustTestSummary::default();
+    for line in stdout.lines().chain(stderr.lines()) {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("test result:") else {
+            continue;
+        };
+        let (_, counters) = rest
+            .split_once('.')
+            .ok_or_else(|| "cargo test result line is malformed".to_owned())?;
+        let mut values = [None; 5];
+        for field in counters.split(';').map(str::trim) {
+            for (index, label) in ["passed", "failed", "ignored", "measured", "filtered out"]
+                .iter()
+                .enumerate()
+            {
+                if let Some(raw) = field.strip_suffix(label).map(str::trim) {
+                    let value = raw
+                        .parse::<u64>()
+                        .map_err(|_| "cargo test result counter is not u64".to_owned())?;
+                    values[index] = Some(value);
+                }
+            }
+        }
+        let [passed, failed, ignored, measured, filtered_out] = values;
+        summary.result_sections = summary
+            .result_sections
+            .checked_add(1)
+            .ok_or_else(|| "cargo test result section count overflow".to_owned())?;
+        summary.passed = summary
+            .passed
+            .checked_add(passed.ok_or("cargo test result is missing passed")?)
+            .ok_or_else(|| "cargo test passed counter overflow".to_owned())?;
+        summary.failed = summary
+            .failed
+            .checked_add(failed.ok_or("cargo test result is missing failed")?)
+            .ok_or_else(|| "cargo test failed counter overflow".to_owned())?;
+        summary.ignored = summary
+            .ignored
+            .checked_add(ignored.ok_or("cargo test result is missing ignored")?)
+            .ok_or_else(|| "cargo test ignored counter overflow".to_owned())?;
+        summary.measured = summary
+            .measured
+            .checked_add(measured.ok_or("cargo test result is missing measured")?)
+            .ok_or_else(|| "cargo test measured counter overflow".to_owned())?;
+        summary.filtered_out = summary
+            .filtered_out
+            .checked_add(filtered_out.ok_or("cargo test result is missing filtered out")?)
+            .ok_or_else(|| "cargo test filtered counter overflow".to_owned())?;
+    }
+    if summary.result_sections == 0 {
+        Err("cargo test produced no bounded libtest result sections".to_owned())
+    } else {
+        Ok(summary)
+    }
+}
+
+fn classify_rust_result(
+    process: &provider::ProcessResult,
+    output_truncated: bool,
+    parsed: &Result<RustTestSummary, String>,
+) -> (
+    TestStatus,
+    TestCoverage,
+    Option<RustTestSummary>,
+    Option<EvidenceFinding>,
+) {
+    if process.timed_out {
+        return rust_classified(
+            TestStatus::TimedOut,
+            TestCoverage::Unknown,
+            None,
+            "rust_test_timed_out",
+            FindingSeverity::Warning,
+            "cargo test exceeded the fixed timeout; no project violation is inferred",
+        );
+    }
+    if output_truncated {
+        return rust_classified(
+            TestStatus::ProviderFailed,
+            TestCoverage::Unknown,
+            None,
+            "rust_test_output_truncated",
+            FindingSeverity::Warning,
+            "cargo test output exceeded capture bounds; result is not authoritative",
+        );
+    }
+    let Ok(summary) = parsed else {
+        return rust_classified(
+            TestStatus::ProviderFailed,
+            TestCoverage::Unknown,
+            None,
+            "rust_test_result_unavailable",
+            FindingSeverity::Warning,
+            "cargo test did not produce a complete bounded libtest summary",
+        );
+    };
+    if summary.failed > 0 {
+        return rust_classified(
+            TestStatus::Failed,
+            TestCoverage::Covered,
+            Some(*summary),
+            "rust_test_failed",
+            FindingSeverity::Error,
+            "one or more Rust tests failed; libtest text v1 cannot safely distinguish assertion failure from panic or harness error",
+        );
+    }
+    let executed = summary
+        .passed
+        .saturating_add(summary.failed)
+        .saturating_add(summary.measured);
+    if executed == 0 {
+        return rust_classified(
+            TestStatus::NoTests,
+            TestCoverage::Empty,
+            Some(*summary),
+            "rust_test_no_tests",
+            FindingSeverity::Warning,
+            "cargo test completed but executed no tests",
+        );
+    }
+    if !process.status.success() {
+        return rust_classified(
+            TestStatus::Crashed,
+            TestCoverage::Covered,
+            Some(*summary),
+            "rust_test_process_failed",
+            FindingSeverity::Error,
+            "cargo test returned non-zero without a failed libtest summary; no assertion violation is inferred",
+        );
+    }
+    (
+        TestStatus::Passed,
+        TestCoverage::Covered,
+        Some(*summary),
+        None,
+    )
+}
+
+fn rust_classified(
+    status: TestStatus,
+    coverage: TestCoverage,
+    summary: Option<RustTestSummary>,
+    code: &str,
+    severity: FindingSeverity,
+    message: &str,
+) -> (
+    TestStatus,
+    TestCoverage,
+    Option<RustTestSummary>,
+    Option<EvidenceFinding>,
+) {
+    (
+        status,
+        coverage,
+        summary,
+        Some(EvidenceFinding {
+            code: code.to_owned(),
+            severity,
+            authority: FindingAuthority::Advisory,
+            message: message.to_owned(),
+            artifact_id: None,
+            path: None,
+        }),
+    )
+}
+
 fn classify_result(
     process: &provider::ProcessResult,
     output_truncated: bool,
@@ -1468,7 +1909,7 @@ fn parse_trx_counters(bytes: &[u8]) -> Result<TrxCounters, String> {
     Ok(counters)
 }
 
-fn test_environment(root: &Path) -> Result<Vec<(&'static str, PathBuf)>, AppError> {
+fn dotnet_test_environment(root: &Path) -> Result<Vec<(&'static str, PathBuf)>, AppError> {
     let variables = [
         ("HOME", root.join("home")),
         ("USERPROFILE", root.join("home")),
@@ -1481,6 +1922,42 @@ fn test_environment(root: &Path) -> Result<Vec<(&'static str, PathBuf)>, AppErro
     ];
     for (_, path) in &variables {
         fs::create_dir_all(path)?;
+    }
+    Ok(variables.into_iter().collect())
+}
+
+fn rust_test_environment(root: &Path) -> Result<Vec<(&'static str, PathBuf)>, AppError> {
+    let mut variables = vec![
+        ("HOME", root.join("home")),
+        ("USERPROFILE", root.join("home")),
+        ("TEMP", root.join("temp")),
+        ("TMP", root.join("temp")),
+        ("TMPDIR", root.join("temp")),
+        ("CARGO_INCREMENTAL", PathBuf::from("0")),
+        ("CARGO_NET_OFFLINE", PathBuf::from("true")),
+    ];
+    let machine_home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| machine_home.as_ref().map(|home| home.join(".cargo")))
+    {
+        variables.push(("CARGO_HOME", cargo_home));
+    }
+    if let Some(rustup_home) = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| machine_home.map(|home| home.join(".rustup")))
+    {
+        variables.push(("RUSTUP_HOME", rustup_home));
+    }
+    for (name, path) in &variables {
+        if !matches!(
+            *name,
+            "CARGO_INCREMENTAL" | "CARGO_NET_OFFLINE" | "CARGO_HOME" | "RUSTUP_HOME"
+        ) {
+            fs::create_dir_all(path)?;
+        }
     }
     Ok(variables.into_iter().collect())
 }
@@ -1519,6 +1996,30 @@ fn resolve_project_file(root: &Path, input: &Path) -> Result<PathBuf, AppError> 
         ));
     }
     Ok(target)
+}
+
+fn resolve_rust_manifest(root: &Path, input: &Path) -> Result<PathBuf, AppError> {
+    if input.is_absolute()
+        || input
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(AppError::Provider(
+            "Rust Test manifest 必须是项目内规范相对路径".to_owned(),
+        ));
+    }
+    let manifest = root.join(input).canonicalize()?;
+    let metadata = fs::symlink_metadata(&manifest)?;
+    if !manifest.starts_with(root)
+        || metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || manifest.file_name().and_then(|name| name.to_str()) != Some("Cargo.toml")
+    {
+        return Err(AppError::Provider(
+            "Rust Test manifest 必须是项目内普通 Cargo.toml".to_owned(),
+        ));
+    }
+    Ok(manifest)
 }
 
 fn project_relative_path(root: &Path, path: &Path) -> Result<String, AppError> {
@@ -1598,6 +2099,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(failed.failed, 1);
+    }
+
+    #[test]
+    fn rust_summary_parser_aggregates_multiple_harnesses() {
+        let summary = parse_rust_test_summary(
+            b"running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+            b"running 1 test\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+        )
+        .unwrap();
+        assert_eq!(summary.result_sections, 2);
+        assert_eq!(summary.passed, 2);
+        assert_eq!(summary.failed, 1);
+    }
+
+    #[test]
+    fn rust_result_classification_keeps_text_failures_advisory() {
+        let process = successful_process();
+        let failed = classify_rust_result(
+            &process,
+            false,
+            &Ok(RustTestSummary {
+                result_sections: 1,
+                failed: 1,
+                ..RustTestSummary::default()
+            }),
+        );
+        assert_eq!(failed.0, TestStatus::Failed);
+        assert_eq!(failed.1, TestCoverage::Covered);
+        assert_eq!(failed.3.unwrap().authority, FindingAuthority::Advisory);
+
+        let empty = classify_rust_result(
+            &process,
+            false,
+            &Ok(RustTestSummary {
+                result_sections: 1,
+                ..RustTestSummary::default()
+            }),
+        );
+        assert_eq!(empty.0, TestStatus::NoTests);
+        assert_eq!(empty.1, TestCoverage::Empty);
     }
 
     #[test]

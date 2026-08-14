@@ -172,7 +172,7 @@ pub fn run_dotnet(request: &BuildRequest<'_>) -> Result<BuildRunReport, AppError
         "dotnet-build",
         &["--version".to_owned()],
         "dotnet",
-        target_display,
+        &target_display,
         &argv,
         ExecutionClass::RepositoryBuildCode,
         BuildOutputKind::ArtifactSet,
@@ -267,7 +267,7 @@ pub fn run_rust(request: &BuildRequest<'_>) -> Result<BuildRunReport, AppError> 
         "cargo-build",
         &["--version".to_owned()],
         "cargo",
-        target_display,
+        &target_display,
         &argv,
         ExecutionClass::RepositoryBuildCode,
         BuildOutputKind::ArtifactSet,
@@ -329,7 +329,7 @@ pub fn run_python(request: &BuildRequest<'_>) -> Result<BuildRunReport, AppError
         "python-compile",
         &["--version".to_owned()],
         "Python",
-        target_display,
+        &target_display,
         &argv,
         ExecutionClass::CompilerOnly,
         BuildOutputKind::ValidationOnly,
@@ -346,7 +346,7 @@ fn run_build(
     adapter: &'static str,
     version_argv: &[String],
     version_marker: &str,
-    target_display: String,
+    target_display: &str,
     argv: &[String],
     execution_class: ExecutionClass,
     output_kind: BuildOutputKind,
@@ -420,7 +420,7 @@ fn run_build(
                 process.stdout.sha256, process.stderr.sha256
             ),
             artifact_id: None,
-            path: Some(target_display.clone()),
+            path: Some(target_display.to_owned()),
         });
     } else if !process.status.success() {
         findings.push(EvidenceFinding {
@@ -434,7 +434,7 @@ fn run_build(
                 process.stderr.sha256
             ),
             artifact_id: None,
-            path: Some(target_display.clone()),
+            path: Some(target_display.to_owned()),
         });
     } else if matches!(output_kind, BuildOutputKind::ArtifactSet)
         && artifact_manifest
@@ -447,7 +447,7 @@ fn run_build(
             authority: FindingAuthority::DeterministicViolation,
             message: format!("{adapter} succeeded but produced no regular artifact files"),
             artifact_id: None,
-            path: Some(target_display.clone()),
+            path: Some(target_display.to_owned()),
         });
     }
     let mut runtime_bundle_failure = None;
@@ -466,7 +466,7 @@ fn run_build(
             request.install_root,
             request.project_key,
             &format!("{adapter}.{}", request.profile_id),
-            &target_display,
+            target_display,
             &source_after,
             request.project_root,
             root,
@@ -505,7 +505,7 @@ fn run_build(
         contract_version: BUILD_CONTRACT_VERSION,
         adapter,
         profile_id: request.profile_id.to_owned(),
-        target: target_display,
+        target: target_display.to_owned(),
         argv: redact_machine_paths(argv, root, &scratch.directory),
         environment_policy: "env_clear+adapter_allowlist+machine_scratch",
         network_policy: if adapter == "cargo-build" {
@@ -519,15 +519,26 @@ fn run_build(
     };
     let contract_bytes = serde_json::to_vec(&contract)?;
     let provider_id = format!("{adapter}.{}", request.profile_id);
-    let mut artifacts = vec![ArtifactNode::from_provider_key(
-        request.project_key,
-        &provider_id,
-        "build_contract",
-        "contract",
-        "Build execution contract",
-        None,
-        &contract_bytes,
-    )];
+    let mut artifacts = vec![
+        ArtifactNode::from_provider_key(
+            request.project_key,
+            &provider_id,
+            "build_contract",
+            "contract",
+            "Build execution contract",
+            None,
+            &contract_bytes,
+        ),
+        ArtifactNode::from_provider_key(
+            request.project_key,
+            &provider_id,
+            "build_target",
+            "target",
+            "Canonical project-relative Build target",
+            Some(target_display),
+            target_display.as_bytes(),
+        ),
+    ];
     if let Some(manifest) = &artifact_manifest {
         artifacts.push(ArtifactNode::from_provider_key(
             request.project_key,

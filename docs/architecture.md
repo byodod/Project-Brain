@@ -90,6 +90,12 @@ partial unavailable。Godot C# Build Snapshot 显式引用本次实际消费的 
 物化到 scratch，并固定调用 `dotnet vstest`。TRX 汇总形成独立 Test Snapshot。NoTests、timeout 与
 provider failure 保留各自状态；普通 TRX failure 在无法区分 assertion/exception 时保持 advisory。
 
+Rust Test Provider 要求当前 `cargo-build.<profile>` head 的 Source、cargo executable 与规范
+`build_target` artifact 精确匹配，然后在机器 scratch 固定执行 offline/frozen 的 workspace all-targets
+`cargo test`。build.rs、proc macro 与测试代码是独立显式信任面。稳定版 libtest 多 harness 摘要被有界
+聚合，但文本 failure 不能证明是断言，因此保持 advisory；无测试、超时、截断和缺摘要分别保留真实
+状态，不因命令出现 error 自动阻断。
+
 Godot Scenario Test Provider 同样只消费精确 Build CAS，并额外要求该 Build 精确引用一个与当前 Godot
 executable 哈希相同的 fresh Engine head。Provider 物理复制 Source、固定 import、再运行仓库内明确
 `.tscn`；场景只能通过受限 JSON v1 结果声明断言。合法失败断言具有 deterministic_violation 权限，
@@ -251,9 +257,9 @@ Extension 安装器仍留在后续阶段。
    快照/attestation/head/staleness ledger 与 Hook 新鲜度提示已经完成；Godot Engine 以及
    .NET/Rust/Python Build Evidence Provider v1 已通过真实项目验证；Godot C# 最终产物还会提升到
    机器级内容寻址存储，以不可变 RuntimeArtifactBundle 绑定精确文件字节与主程序集。下一阶段从该
-   bundle 建立的隔离 Godot headless Runtime Provider 已通过真实项目的连续确定性运行；.NET Test 与
-   Godot Scenario Test 已使用独立 Test Plane，finding 到规则的阻断仍必须显式映射。下一阶段补 Rust、
-   Python Test Provider 与更强的真实项目重复运行证明。
+   bundle 建立的隔离 Godot headless Runtime Provider 已通过真实项目的连续确定性运行；.NET Test、
+   Godot Scenario Test 与 Rust Test 已使用独立 Test Plane，finding 到规则的阻断仍必须显式映射。
+   下一阶段补 Python Test Provider 与更强的真实项目重复运行证明。
 6. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
    直接 hard block。
 
@@ -277,4 +283,5 @@ Extension 安装器仍留在后续阶段。
 [ADR-0024](adr/0024-content-addressed-runtime-bundles.md) 与
 [ADR-0025](adr/0025-test-evidence-and-explicit-finding-effects.md) 与
 [ADR-0026](adr/0026-exact-dotnet-test-bundle.md) 与
-[ADR-0027](adr/0027-godot-structured-scenario-test.md)。
+[ADR-0027](adr/0027-godot-structured-scenario-test.md) 与
+[ADR-0028](adr/0028-rust-test-fixed-contract.md)。

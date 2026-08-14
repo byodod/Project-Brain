@@ -229,6 +229,17 @@ covered/empty/unknown。Test Evidence 的通用 coverage 仍表示 Provider 合�
 complete + empty，但 TimedOut/ProviderFailed 为 partial。v1 无法从 TRX Counters 证明失败一定是声明的
 assertion，因此 failure finding 默认为 advisory；这刻意阻止“所有测试 error 自动 block”。
 
+Rust Test run schema v1 使用 `cargo-test.<profile>` provider。它只接受指定
+`cargo-build.<build_profile>` 当前 head，并要求该 Build 为 fresh、complete、deterministic、无 finding；
+Source fingerprint、Build Snapshot 的规范 `build_target` artifact 与 cargo executable SHA-256 必须
+分别匹配当前工作树、当前 `Cargo.toml` 和本次工具链。
+
+实际 argv 固定为 `cargo test --manifest-path <PROJECT_ROOT>/Cargo.toml --workspace --all-targets
+--frozen --target-dir <scratch>/target`，环境固定 Cargo offline、incremental off；仓库不能声明 package、
+feature、filter、runner、shell、env 或网络。多个稳定版 libtest `test result:` 摘要在有界 UTF-8 输出内
+聚合。无测试为 complete + empty；timeout/输出截断/缺少完整摘要为 partial 或 provider failure。普通
+`rust_test_failed` 只能是 advisory，因为文本 v1 不能证明失败一定来自声明断言。
+
 Godot Scenario Test schema v1 使用 `godot-scenario-test.<profile>` provider。它只接受与当前 Source、
 `build_target` 和主程序集绑定一致的 `dotnet-build.<build_profile>` CAS，并要求 Build upstream 恰好含
 一个 fresh、complete、deterministic、无 finding 且 executable SHA-256 匹配的 Engine head。Source
@@ -263,7 +274,8 @@ Build Snapshot 的 `coverage` 描述观测是否完整，而不是进程是否�
 `required_artifact_missing(error)`。CLI 在这些情况下仍原子保存 Evidence 后返回非零。下游 Runtime
 必须检查 Build findings，而不能只检查 complete/fresh。Godot C# 的 Build Snapshot 还必须通过
 显式 `EvidenceReference` 固定其 Engine upstream。`.NET` manifest 只覆盖最终 bin output；包含
-scratch 绝对路径的 obj cache 是执行中间态，不进入 artifact identity。
+scratch 绝对路径的 obj cache 是执行中间态，不进入 artifact identity。所有 Build Snapshot 另含规范
+`build_target` artifact，供下游 Test 精确绑定项目入口；旧 snapshot 缺少该 artifact 时必须重跑 Build。
 
 成功的 Godot C# Build 在 scratch 回收前创建 `RuntimeArtifactBundle v1`。bundle 的规范 JSON 包含
 `project_key`、Build provider、Source fingerprint、ArtifactManifest fingerprint、排序后的全部最终

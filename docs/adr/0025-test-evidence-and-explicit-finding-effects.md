@@ -43,5 +43,5 @@ Build、Test 与 Runtime 回答不同问题。Build 证明固定构建合同的�
 
 - Project Brain 可以表达测试覆盖和测试失败，而不冒充 Runtime 正确性。
 - Provider 负责报告事实，仓库规则负责赋予 effect；二者分离后可以审计“为什么被阻断”。
-- 当前尚不能执行通用测试；下一提交应先实现 .NET 固定 Test Provider，再实现 Godot scenario，最后补
-  Rust/Python adapter。
+- 后续 ADR 已实现 .NET 固定 Test、Godot structured scenario 与 Rust offline/frozen Test Provider；
+  Python Test adapter 仍需单独定义，不能由 Python Build validation 冒充。

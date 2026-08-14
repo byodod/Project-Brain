@@ -271,8 +271,8 @@ Provider 应用新快照时会校验其显式 upstream fingerprint，并把失�
 
 Test 已作为独立 Evidence Plane 进入协议与 SQLite schema v14。`EvidenceFinding` 默认是 advisory；
 只有精确命中仓库 `finding_effect_mappings`，并同时满足 fresh、complete、deterministic provider 与
-`deterministic_violation` 的 error，才可能在 Stop 产生 ContinueWork。当前尚未开放具体语言的 Test
-执行命令，因此不会把普通 Build/Runtime 结果伪装成 Test Evidence。
+`deterministic_violation` 的 error，才可能在 Stop 产生 ContinueWork。.NET、Rust 与 Godot Scenario
+均使用独立固定 Test 合同；普通 Build/Runtime 结果不会被伪装成 Test Evidence。
 
 ## Build Evidence Provider
 
@@ -349,6 +349,29 @@ fingerprint 和 dotnet executable SHA-256 全部一致。测试代码属于独�
 结果区分 passed/failed/crashed/timed_out/no_tests/provider_failed 与 covered/empty/unknown。NoTests 不是
 Pass。TRX 汇总无法安全区分断言失败和测试/环境异常，因此 v1 的 `dotnet_test_failed` 保持 advisory；
 它不会因 severity=error 自动获得阻断资格。
+
+## Rust Test Evidence Provider
+
+Rust Test 要求先有同一 Source、Cargo executable 和规范 `Cargo.toml` target 绑定的成功 Build head：
+
+```text
+project-brain evidence test rust \
+  --profile workspace-tests \
+  --build-profile workspace-debug \
+  --executable /absolute/path/to/cargo \
+  --manifest Cargo.toml \
+  --trust-local-executable \
+  --trust-repository-test-code
+```
+
+固定合同执行 `cargo test --manifest-path <target> --workspace --all-targets --frozen --target-dir
+<machine-scratch>`，并强制 Cargo offline、关闭 incremental；不接受仓库 command、args、feature、filter、
+runner、shell 或 environment。build.rs、proc macro 和测试二进制仍属于显式信任的仓库代码，当前不是
+OS 网络沙箱。
+
+Provider 聚合稳定版 libtest 的有界结果摘要，区分 passed/failed/crashed/timed_out/no_tests/
+provider_failed。文本结果无法可靠区分断言、panic 与 harness 异常，所以 `rust_test_failed` 保持
+advisory；它不会因测试命令非零就自动获得 hard-block 资格。
 
 ## Godot Scenario Test Evidence Provider
 
@@ -760,8 +783,8 @@ crates/
   Prime Agent 已有独立 direct adapter，但用户级 Extension 安装器与 doctor 尚未实现。
 - Godot Engine Provider、Evidence ledger、Hook 失效传播、.NET/Rust/Python Build Provider v1、Godot
   C# RuntimeArtifactBundle CAS、隔离 Godot headless Runtime Evidence v1、Test plane/finding 显式
-  effect 映射核心与精确 CAS .NET Test Provider v1 已完成；Rust/Python/Godot Test Provider 仍未完成，
-  不能声称全部治理能力已经完结。
+  effect 映射核心，以及 .NET、Rust、Godot Scenario Test Provider v1 已完成；Python Test Provider
+  仍未完成，不能声称全部治理能力已经完结。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。
