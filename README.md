@@ -67,6 +67,31 @@ project-brain doctor codex
 .NET、Python、多语言项目以及 Pi、OpenCode、dsh 的完整命令见
 [快速开始与 Agent 接入](docs/getting-started.md)。
 
+## 复制给 AI 的安装提示词
+
+不想手工判断项目语言和 Agent 接入时，可以在目标仓库中把下面整段提示词交给正在使用的 Coding
+Agent。它要求 AI 只安装当前需要的接入，并保留已有 Project Brain 配置：
+
+```text
+请在当前仓库中通过 npm 正式包安装并初始化 Project Brain，完成后给出可核对的验证结果。
+
+要求：
+1. 先检查当前仓库、操作系统、Node.js/npm 是否可用，并根据实际项目文件判断语言；只允许使用 rust、dotnet、python 中真实存在的 profile，可同时选择多个。不要把框架或游戏引擎写入 Project Brain 核心配置。
+2. 从 npm registry 安装 @byodod/project-brain 的 latest 正式版本，验证 project-brain --version；不要用仓库源码构建、本地 tarball 或其它旧二进制冒充 npm 安装。
+3. 运行 project-brain install，建立机器级稳定 launcher。若仓库尚未初始化，使用识别出的语言 profile 执行 project-brain init；若 .project-brain/config.json 已存在，必须保留并验证，禁止覆盖、删除或重新生成。
+4. 运行 project-brain bootstrap 注册当前项目。
+5. 识别我当前实际使用的 Agent，只安装对应接入：Codex、Pi、OpenCode 或 dsh，不要顺带安装其它 Agent 的 Hook。若为 dsh，必须根据 DSH 的实际启动命令确定 profile，例如 dsh web 对应 web；不要把界面里的 Agent preset 名称当成 profile。安装后重启对应的 DSH 进程。
+6. 运行对应的 project-brain doctor 和 project-brain capabilities。doctor 因 semantic Provider 未绑定而 degraded 时，应把它与 Hook 安装失败分开报告，不要擅自下载或绑定 Provider。
+7. 进行一次非破坏性的真实 Agent 生命周期验收：必须由当前 Agent 正常触发 Hook/Plugin，并用 project-brain audit 确认真实 session 产生了事件；不能只用 project-brain dispatch 或 preflight 的手工调用代替。
+8. 不修改业务源码，不创建提交，不推送，不发布，不安装无关工具。任何可能覆盖现有配置或无法确定的 Agent/profile 选择都先停止并说明。
+
+最后报告：npm 包版本、原生二进制版本、机器 launcher 路径、project_key、语言 profile、安装的 Agent/profile、doctor 各项状态、真实生命周期验收证据，以及仍需人工处理的事项。
+```
+
+该提示词适合已有仓库和首次安装；更严格的来源校验、卸载及各 Agent 差异见
+[快速开始与 Agent 接入](docs/getting-started.md)和
+[dsh 接入、远程安装与验收](docs/dsh-integration.md)。
+
 ## 决策规则
 
 仓库规则位于 `.project-brain/config.json`。以下 hard repository rule 会阻止直接删除 Domain 文件：
