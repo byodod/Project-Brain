@@ -81,7 +81,7 @@ struct RuntimeProcessSummary {
 }
 
 #[derive(Debug, Serialize)]
-struct StagedSourceManifest {
+pub(crate) struct StagedSourceManifest {
     entries: Vec<StagedSourceEntry>,
 }
 
@@ -344,7 +344,10 @@ fn qualify_evidence_heads(
     ))
 }
 
-fn stage_project(root: &Path, destination: &Path) -> Result<StagedSourceManifest, AppError> {
+pub(crate) fn stage_project(
+    root: &Path,
+    destination: &Path,
+) -> Result<StagedSourceManifest, AppError> {
     fs::create_dir_all(destination)?;
     let mut entries = Vec::new();
     for relative_path in git::repository_files(root)? {
@@ -394,6 +397,80 @@ fn stage_project(root: &Path, destination: &Path) -> Result<StagedSourceManifest
     Ok(StagedSourceManifest { entries })
 }
 
+pub(crate) fn verify_staged_source(
+    manifest: &StagedSourceManifest,
+    destination: &Path,
+    allowed_extra_paths: &[&str],
+) -> Result<(), AppError> {
+    let mut expected = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.relative_path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for path in allowed_extra_paths {
+        if Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            || !expected.insert(path)
+        {
+            return Err(AppError::Provider(
+                "staged Source 允许的额外路径无效或重复".to_owned(),
+            ));
+        }
+    }
+    for entry in &manifest.entries {
+        let path = destination.join(Path::new(&entry.relative_path));
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() != entry.size
+            || provider::hash_file(&path)? != entry.sha256
+        {
+            return Err(AppError::Provider(format!(
+                "staged Source 在执行期间发生变化：{:?}",
+                entry.relative_path
+            )));
+        }
+    }
+    let mut directories = vec![destination.to_owned()];
+    while let Some(directory) = directories.pop() {
+        for child in fs::read_dir(directory)? {
+            let child = child?;
+            let path = child.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if is_link_or_reparse(&metadata) {
+                return Err(AppError::Provider(
+                    "staged project 中出现 link/reparse".to_owned(),
+                ));
+            }
+            if metadata.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            if !metadata.is_file() {
+                return Err(AppError::Provider(
+                    "staged project 中出现非普通文件".to_owned(),
+                ));
+            }
+            let relative = path
+                .strip_prefix(destination)
+                .map_err(|_| AppError::Provider("staged 文件越出项目".to_owned()))?
+                .components()
+                .map(|component| component.as_os_str().to_str())
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| AppError::Provider("staged 文件路径不是 UTF-8".to_owned()))?
+                .join("/");
+            if !excluded_source_path(&relative) && !expected.contains(relative.as_str()) {
+                return Err(AppError::Provider(format!(
+                    "staged Source 出现未声明的新文件：{relative:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn excluded_source_path(path: &str) -> bool {
     path.split('/').any(|segment| {
         matches!(
@@ -435,7 +512,7 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
     false
 }
 
-fn qualify_engine(
+pub(crate) fn qualify_engine(
     root: &Path,
     executable: &provider::PinnedExternalExecutable,
     timeout: Duration,
@@ -494,7 +571,7 @@ fn qualify_engine(
     Ok(version_text)
 }
 
-fn validate_fixed_argv(argv: &[String]) -> Result<(), AppError> {
+pub(crate) fn validate_fixed_argv(argv: &[String]) -> Result<(), AppError> {
     const FORBIDDEN: [&str; 10] = [
         "--build-solutions",
         "--script",
@@ -858,7 +935,11 @@ impl RuntimeDirectory {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        fs,
+        path::Path,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use brain_evidence::{
         ArtifactNode, EvidenceAuthority, EvidenceCoverage, EvidenceFreshness, EvidencePlane,
@@ -867,10 +948,10 @@ mod tests {
     use brain_store::EvidenceHeadRecord;
 
     use super::{
-        RuntimeRequest, excluded_source_path, qualify_evidence_heads, redact_argv,
-        validate_fixed_argv,
+        RuntimeRequest, StagedSourceEntry, StagedSourceManifest, excluded_source_path,
+        qualify_evidence_heads, redact_argv, validate_fixed_argv, verify_staged_source,
     };
-    use crate::artifact_store::RuntimeArtifactBundle;
+    use crate::{artifact_store::RuntimeArtifactBundle, provider};
 
     #[test]
     fn stage_excludes_machine_and_old_build_state() {
@@ -885,6 +966,33 @@ mod tests {
             assert!(excluded_source_path(path));
         }
         assert!(!excluded_source_path("scripts/binocular.cs"));
+    }
+
+    #[test]
+    fn staged_source_rejects_unexpected_files_but_allows_declared_outputs() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "project-brain-stage-verify-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source.cs");
+        fs::write(&source, "sealed class Source {}\n").unwrap();
+        fs::write(root.join("override.cfg"), "[application]\n").unwrap();
+        let manifest = StagedSourceManifest {
+            entries: vec![StagedSourceEntry {
+                relative_path: "source.cs".to_owned(),
+                size: fs::metadata(&source).unwrap().len(),
+                sha256: provider::hash_file(&source).unwrap(),
+            }],
+        };
+        assert!(verify_staged_source(&manifest, &root, &["override.cfg"]).is_ok());
+        fs::write(root.join("unexpected.cs"), "sealed class Unexpected {}\n").unwrap();
+        assert!(verify_staged_source(&manifest, &root, &["override.cfg"]).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

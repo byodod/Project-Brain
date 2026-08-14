@@ -229,6 +229,19 @@ covered/empty/unknown。Test Evidence 的通用 coverage 仍表示 Provider 合�
 complete + empty，但 TimedOut/ProviderFailed 为 partial。v1 无法从 TRX Counters 证明失败一定是声明的
 assertion，因此 failure finding 默认为 advisory；这刻意阻止“所有测试 error 自动 block”。
 
+Godot Scenario Test schema v1 使用 `godot-scenario-test.<profile>` provider。它只接受与当前 Source、
+`build_target` 和主程序集绑定一致的 `dotnet-build.<build_profile>` CAS，并要求 Build upstream 恰好含
+一个 fresh、complete、deterministic、无 finding 且 executable SHA-256 匹配的 Engine head。Source
+从 Git manifest 物理复制；Build bundle 固定物化到 staged Godot Debug 输出目录。import 与场景 argv
+由 adapter 构造，不允许 repository args、shell、script、build、restore 或 export。
+
+仓库场景必须生成 `.project-brain-test-result-v1.json`。结果只接受 schema_version、scenario_id、status
+和有界 assertions；scenario_id 必须等于 Test profile，status 必须与全部 assertion 布尔值一致。合法
+失败断言产生 `godot_scenario_assertion_failed` 且 authority 为 deterministic_violation；缺失/非法结果、
+import 或 runtime diagnostics、进程崩溃、超时、输出截断都不能冒充断言违规。Source/CAS/executable
+TOCTOU 校验失败则整次结果不提交。与所有 finding 相同，deterministic_violation 仍需仓库 hard rule 对
+plane/provider/contract/code 的精确显式映射才能阻断。
+
 Godot probe schema v1 返回 `before/after` 两份 `ProbeProjectState`。每份状态包含
 `project_sha256`、main scene、autoloads，以及所有 `.tscn/.tres` 的 UID、SHA-256、load result 与
 `ResourceLoader.get_dependencies()` 解析结果。转换层会规范排序并忽略 before/after 的 `loaded`

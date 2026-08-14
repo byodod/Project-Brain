@@ -350,6 +350,47 @@ fingerprint 和 dotnet executable SHA-256 全部一致。测试代码属于独�
 Pass。TRX 汇总无法安全区分断言失败和测试/环境异常，因此 v1 的 `dotnet_test_failed` 保持 advisory；
 它不会因 severity=error 自动获得阻断资格。
 
+## Godot Scenario Test Evidence Provider
+
+Godot Scenario Test 只运行仓库内明确指定的 `.tscn`，并要求其对应的 Godot C# Build 已产生
+fresh、complete、deterministic、无 finding 的 `dotnet-build.<profile>` Evidence：
+
+```text
+project-brain evidence test godot \
+  --profile first-playable-loop \
+  --build-profile godot-debug \
+  --executable /absolute/path/to/godot \
+  --target Game.csproj \
+  --scenario tests/FirstPlayableLoop.tscn \
+  --trust-local-executable \
+  --trust-repository-test-code \
+  --quit-after 600
+```
+
+Provider 要求 Build 精确引用一个匹配 Godot executable SHA-256 的 fresh Engine head；随后物理复制
+Git Source manifest、物化精确 Build CAS、固定执行 `--import`，再固定运行该场景。它不接受自定义
+Godot 参数、`--script`、shell、restore、build 或任何 export。Source、CAS 与 executable 在运行前后
+都会重新校验；场景若修改暂存源码，结果直接丢弃。
+
+场景必须在 staged project 根写出 `.project-brain-test-result-v1.json`：
+
+```json
+{
+  "schema_version": 1,
+  "scenario_id": "first-playable-loop",
+  "status": "passed",
+  "assertions": [
+    { "id": "production/tool-crafted", "passed": true, "message": "first tool crafted" }
+  ]
+}
+```
+
+`scenario_id` 必须等于 Test profile；字段、断言 ID、数量、消息和文件大小都有固定边界，重复 ID、未知
+字段、状态与断言矛盾、空断言、缺失结果、日志异常、崩溃和超时不会被算作 Pass。合法结构化结果中的
+失败断言产生 `godot_scenario_assertion_failed + deterministic_violation`；它仍只有在仓库规则显式映射
+相同 plane/provider/contract/finding code 后才可能 hard block。测试场景属于显式信任的仓库代码，当前
+环境隔离不是 OS 网络沙箱。
+
 ## Godot 隔离 Runtime Evidence
 
 Runtime v1 只接受已绑定在当前 fresh、complete、deterministic Build head 上的

@@ -352,6 +352,33 @@ enum TestEvidenceCommand {
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
     },
+
+    /// 固定运行仓库内 Godot .tscn，并读取受限结构化断言结果；不会构建、还原或导出
+    Godot {
+        #[arg(long)]
+        profile: String,
+        /// 必须对应当前 `dotnet-build.<profile>` Evidence head
+        #[arg(long)]
+        build_profile: String,
+        /// Godot 4 editor/console binary 的机器绝对路径
+        #[arg(long)]
+        executable: PathBuf,
+        /// 与 Build bundle 绑定的项目内 .csproj
+        #[arg(long)]
+        target: PathBuf,
+        /// 项目内单个 .tscn 场景；场景必须写出固定的结构化结果文件
+        #[arg(long)]
+        scenario: PathBuf,
+        #[arg(long)]
+        trust_local_executable: bool,
+        #[arg(long)]
+        trust_repository_test_code: bool,
+        /// headless 测试场景最多处理的迭代帧数
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u32).range(1..=36000))]
+        quit_after: u32,
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -703,6 +730,28 @@ fn main() -> ExitCode {
                         &test_assembly,
                         trust_local_executable,
                         trust_repository_test_code,
+                        timeout_seconds,
+                    ),
+                    TestEvidenceCommand::Godot {
+                        profile,
+                        build_profile,
+                        executable,
+                        target,
+                        scenario,
+                        trust_local_executable,
+                        trust_repository_test_code,
+                        quit_after,
+                        timeout_seconds,
+                    } => app.evidence_test_godot(
+                        cli.install_root.as_deref(),
+                        &executable,
+                        &profile,
+                        &build_profile,
+                        &target,
+                        &scenario,
+                        trust_local_executable,
+                        trust_repository_test_code,
+                        quit_after,
                         timeout_seconds,
                     ),
                 },

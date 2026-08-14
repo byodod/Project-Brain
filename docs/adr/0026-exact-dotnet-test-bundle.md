@@ -50,6 +50,7 @@ restore metadata。Project Brain 的 Build 在机器 scratch 中完成后会删�
 ## 后果
 
 - Test 运行字节与 Build Evidence 一致，不依赖仓库 `bin/obj` 或第二次构建。
-- 当前实现只支持 .NET；Godot scenario、Rust 与 Python Test Provider 仍需分别定义固定合同。
+- .NET Test 的 TRX 边界保持不变；Godot scenario 已由 ADR-0027 定义独立结构化合同，Rust 与 Python
+  Test Provider 仍需分别定义固定合同。
 - 当前通用 CAS 类型沿用历史 `RuntimeArtifactBundle` 名称；协议上它已承担受控 execution bundle。后续
   若改名必须保持 manifest 与既有 Runtime 的向后兼容。

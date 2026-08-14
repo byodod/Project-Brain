@@ -90,6 +90,12 @@ partial unavailable。Godot C# Build Snapshot 显式引用本次实际消费的 
 物化到 scratch，并固定调用 `dotnet vstest`。TRX 汇总形成独立 Test Snapshot。NoTests、timeout 与
 provider failure 保留各自状态；普通 TRX failure 在无法区分 assertion/exception 时保持 advisory。
 
+Godot Scenario Test Provider 同样只消费精确 Build CAS，并额外要求该 Build 精确引用一个与当前 Godot
+executable 哈希相同的 fresh Engine head。Provider 物理复制 Source、固定 import、再运行仓库内明确
+`.tscn`；场景只能通过受限 JSON v1 结果声明断言。合法失败断言具有 deterministic_violation 权限，
+而 import/runtime diagnostic、缺结果、崩溃、超时和输出截断保持 advisory 或 partial。Source stage、
+CAS、权威 worktree 与 executable 都有运行前后重校验；argv 不开放 script/build/export 表面。
+
 SCIP 路径以 `project_key + semantic provider profile ID + producer + contract_version` 建立
 Provider 命名空间，并把规范化 language ID 写入 provider key。语言映射逐 Document 执行，
 因此单一 scip-dotnet index 可同时容纳 C# 与 Visual Basic。Producer 自身版本只作为 provenance
@@ -245,8 +251,9 @@ Extension 安装器仍留在后续阶段。
    快照/attestation/head/staleness ledger 与 Hook 新鲜度提示已经完成；Godot Engine 以及
    .NET/Rust/Python Build Evidence Provider v1 已通过真实项目验证；Godot C# 最终产物还会提升到
    机器级内容寻址存储，以不可变 RuntimeArtifactBundle 绑定精确文件字节与主程序集。下一阶段从该
-   bundle 建立的隔离 Godot headless Runtime Provider 已通过真实项目的连续确定性运行；下一阶段补齐
-   通用测试 Evidence 和规则到 finding 的显式映射。
+   bundle 建立的隔离 Godot headless Runtime Provider 已通过真实项目的连续确定性运行；.NET Test 与
+   Godot Scenario Test 已使用独立 Test Plane，finding 到规则的阻断仍必须显式映射。下一阶段补 Rust、
+   Python Test Provider 与更强的真实项目重复运行证明。
 6. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
    直接 hard block。
 
@@ -269,4 +276,5 @@ Extension 安装器仍留在后续阶段。
 [ADR-0023](adr/0023-fixed-build-evidence-providers.md) 与
 [ADR-0024](adr/0024-content-addressed-runtime-bundles.md) 与
 [ADR-0025](adr/0025-test-evidence-and-explicit-finding-effects.md) 与
-[ADR-0026](adr/0026-exact-dotnet-test-bundle.md)。
+[ADR-0026](adr/0026-exact-dotnet-test-bundle.md) 与
+[ADR-0027](adr/0027-godot-structured-scenario-test.md)。
