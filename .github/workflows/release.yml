@@ -68,7 +68,11 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }} -p project-brain
       - name: Self-check release CLI
         shell: bash
-        run: target/${{ matrix.target }}/release/${{ matrix.executable }} capabilities codex
+        run: |
+          binary="target/${{ matrix.target }}/release/${{ matrix.executable }}"
+          "$binary" capabilities codex
+          "$binary" capabilities claude-code
+          "$binary" capabilities prime-agent
       - name: Package Unix archive
         if: runner.os != 'Windows'
         shell: bash

@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-14
+
 ### Added
 
 - 确定性四态规则引擎、项目级 Hook 协议和 Codex 生命周期适配。
@@ -24,6 +26,10 @@
   `unknown`，事件保存 Source 观察与精确 head 身份，两者都失去硬门禁资格且不能共享同一幂等事件身份。
 - 严格只读的 `database stats`，以及默认 dry-run、独占维护锁、WAL checkpoint、完整逻辑清单、
   `VACUUM INTO`、外部恢复日志、默认备份和原子替换组成的 `database compact` 物理维护协议。
+- Claude Code 独立 direct adapter、exec-form 用户级 Hook 安装器、漂移保护、精确卸载与真实子进程
+  fixture。
+- Prime Agent 独立 direct adapter、全局 TypeScript Extension 原子安装、稳定 launcher JSON 桥接、
+  无 LLM/API key 加载 fixture、漂移保护和 adapter-specific doctor。
 
 ### Security
 
@@ -39,3 +45,8 @@
   Source 的 effective freshness；Provider promotion 也拒绝 TOCTOU 漂移并事务性降级其它不兼容 heads。
 - 离线 SCIP、过期快照、未确认/歧义 lineage、local symbol 和漂移 Provider 永不获得 hard gate；
   基础设施故障按 advisory fail-open，人工 lineage/锚点变更要求 `--human-confirmed`。
+- 所有 Evidence/Provider 外部执行均受进程树生命周期隔离：Windows 使用 Job Object，Unix 使用
+  可用的 cgroup/process-group；根进程退出或超时后必须先清空子孙进程。该边界不伪装成网络、
+  文件系统或权限沙箱。
+- Prime Extension 固化机器稳定 launcher 路径并以 `shell:false` 启动；不订阅 `agent_end`，不把
+  heartbeat、goal、schedule 或 autonomous loop 伪装成 Stop continuation。
