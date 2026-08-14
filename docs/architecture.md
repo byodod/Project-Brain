@@ -146,15 +146,24 @@ profile/root 与工作区前后指纹全部通过后，才进入 semantic snapsh
         ├── scip-python package manifest SHA-256  固定传递 bundle
         ├── registration revision + probe version
         └── provider-audit.jsonl  有界本地执行/失败 provenance
+
+<ProjectBrainData>/state/qualification.sqlite
+        │
+        ├── binary + contract + schema + OS/arch target identity
+        ├── append-only run / immutable case results
+        └── Qualified / Failed / Inconclusive machine proof
 ```
 
 SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照以事务应用；快照中消失的节点
 进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
 符号 ID、快照 revision、节点/边主键、查询和墓碑更新都包含 `project_key`。数据库 schema v4
 首次建立这组项目隔离约束；对应迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与
-adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v17，并在这些约束上
+adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v18，并在这些约束上
 增加独立的语义血缘账本、append-only 来源证明、不可伪造的源码 Document manifest，以及
-Evidence Plane 当前 head 与带 `stale/unknown` 结果的失效事件。
+Evidence Plane 当前 head 与带 `stale/unknown` 结果的失效事件。v18 还为每个 adapter event 保存
+规范事件 JSON 的 SHA-256；同一 `(project_key, adapter_kind, event_id)` 只有载荷哈希相同才可重放，
+不同载荷即使并发到达也必须报幂等冲突。当前 schema 连接走只读快速初始化路径，adapter 热写入对
+SQLite busy/locked 做有界重试，避免多 Agent 启动时重复 DDL 与写者饥饿。
 数据库迁移拒绝缺失或非整数的已有 `schema_version`，不会把损坏元数据静默当作 v1。
 Adapter 审计依赖 SQLite 唯一约束和 busy timeout，使并发连接对同一项目事件收敛到首次 outcome；
 失败记录可在重开数据库后由成功重试升级，后续重复成功不能覆盖首次成功。
@@ -174,7 +183,7 @@ confirmed / rejected / superseded / invalidated
            └── never rewrites SymbolNode / tombstone / snapshot
 ```
 
-SQLite schema v17 保存 semantic snapshots、append-only source attestations、source manifests、
+SQLite schema v18 保存 semantic snapshots、append-only source attestations、source manifests、
 symbol observations、group/member/generation run、candidate/evidence/decision，以及显式旧账压缩的
 run/group 审计、删除前备份证明、人工 pair materialization request 与 append-only Provider qualification
 events。压缩默认只读；apply 必须携带人工确认、幂等 request ID 和已批准 dry-run manifest。它先持有
@@ -192,6 +201,14 @@ operation v2+ run。
 同一 semantic snapshot 可由不同机器绑定重复产生。V11 的 attestation 唯一身份包含 trust、
 registration、executable 与 artifact 证明；图内容未变化时仍可追加新的来源证明，并由最新 sequence
 参与 hard-gate 新鲜度判断，不能让旧绑定证明遮蔽当前已资格化绑定。
+
+Production Qualification 是控制面自身的部署证明，不是第七个 Evidence Plane。它在机器私有 fixture
+中运行固定七项套件，覆盖三种 adapter 合同、project_key 隔离、精确重放/碰撞拒绝、32 会话并发
+交错、正式 Provider 固定路径的内容漂移、Stop loop 上界和 10,000 事件长会话。运行前后会核对当前
+二进制与项目 Source 上下文；目标或源码在运行中变化时只能得到 `Inconclusive`。终态报告按自身哈希
+复验，run 只能从 `running` 原子收口一次，case 不可更新/删除。该机器账本永不进入项目 `brain.db`，
+不会参与 Hook 决策；只有用户显式使用 `doctor --require-qualified` 时，缺少精确 target 的 Qualified
+证明才成为 doctor issue。
 Candidate endpoint 唯一键负责算法重跑幂等，算法版本只产生新的 evidence observation；人工状态
 永远不会被 generator 恢复或覆盖。Partial unique indexes 约束同 snapshot pair 中 predecessor 与
 successor 一对一，竞争确认不会自动选择赢家。`request_id + request_hash` 提供 at-least-once 命令
@@ -263,8 +280,8 @@ Extension 安装器把机器托管的 `index.ts` 放入全局 `~/.prime/agent/ex
 
 ## 下一阶段
 
-1. Internal Hook Protocol v1、Codex adapter 与 Claude Code direct adapter 已加入文件和 symbol scope；继续在真实项目验证项目
-   隔离、重放、并发交错、Provider 漂移降级、Stop 防循环与长会话延迟。
+1. Production Qualification v1 已把 adapter 合同、项目隔离、精确重放、并发交错、Provider 漂移、
+   Stop 防循环与 10,000 事件长会话固化为机器可判定证明；下一步扩展真实项目矩阵，而不降低固定套件。
 2. 已接入机器级 SCIP Runner、complete-only commit 与重复运行稳定性证明；真实 rust-analyzer
    workspace 结果已证明非确定，且 package root 会重新提升到 workspace root，因此不启用假的
    package-shard fallback。.NET/Python 继续用符合
@@ -312,4 +329,6 @@ Extension 安装器把机器托管的 `index.ts` 放入全局 `~/.prime/agent/ex
 [ADR-0032](adr/0032-post-tool-source-fingerprint-reconciliation.md)、
 [ADR-0033](adr/0033-approved-legacy-lineage-compaction-plan.md) 与
 [ADR-0034](adr/0034-mandatory-online-backup-before-lineage-deletion.md) 与
-[ADR-0035](adr/0035-external-process-tree-containment.md)。
+[ADR-0035](adr/0035-external-process-tree-containment.md)、
+[ADR-0036](adr/0036-prime-agent-extension-provisioning.md) 与
+[ADR-0037](adr/0037-production-qualification-control-plane.md)。

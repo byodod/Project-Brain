@@ -73,6 +73,15 @@ jobs:
           "$binary" capabilities codex
           "$binary" capabilities claude-code
           "$binary" capabilities prime-agent
+      - name: Qualify release control plane
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/${{ matrix.executable }}"
+          "$binary" \
+            --project-root "$GITHUB_WORKSPACE" \
+            --install-root "$RUNNER_TEMP/project-brain-qualification" \
+            qualification run \
+            --request-id "release-${{ matrix.target }}-${GITHUB_SHA}"
       - name: Package Unix archive
         if: runner.os != 'Windows'
         shell: bash

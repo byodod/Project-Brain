@@ -64,6 +64,12 @@ pub enum AppError {
     #[error("数据库原子替换仍被临时占用：{0}")]
     DatabaseSwapBusy(String),
 
+    #[error("Production Qualification 失败：{0}")]
+    Qualification(String),
+
+    #[error("Production Qualification 账本失败：{0}")]
+    QualificationDatabase(#[from] rusqlite::Error),
+
     #[error("Project Brain doctor 检查未通过：{0}")]
     DoctorDegraded(String),
 

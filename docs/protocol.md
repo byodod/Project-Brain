@@ -186,6 +186,13 @@ handler 使用 `command` 指向稳定 launcher、`args` 保存三个独立参数
 伪装成 Codex 状态。Prime doctor 还验证专属目录只有托管 `index.ts`、无同名全局冲突、launcher
 绑定精确、目标位于项目工作树之外，并执行稳定 launcher capability roundtrip。
 
+Production Qualification v1 是独立的机器部署协议。`qualification run` 对当前 binary/contract/schema/
+OS/architecture target 执行七项固定用例，终态为 `qualified/failed/inconclusive`；运行中断保持
+`running`，绝不按通过解释。`request_id + request_hash` 拒绝不同项目/源码上下文或不同 target 的
+碰撞重放。终态报告和逐 case 结果存放在机器级 `qualification.sqlite`，按哈希复验且不可覆盖；它们
+不写项目 `brain.db`，不进入 Evidence Protocol，也不参与 Hook。`doctor --require-qualified` 只接受
+当前 target 的精确 Qualified run。
+
 Prime Agent direct adapter v1 通过 `project-brain hook/dispatch prime-agent <event>` 暴露 Rust
 控制面。Extension 应把正式 runtime event 映射到同一内部事件语义，但输出使用独立 schema：
 pre-tool 返回 `block/reason/context`，post-tool 返回 `feedback`，停止阶段返回带
@@ -520,7 +527,7 @@ V8 的 ambiguity 属于 `semantic_lineage_groups`；candidate 的旧 `ambiguity_
     保存到项目工作树外的机器级数据目录；备份的全库逻辑清单、quick check 与外键检查必须和持有
     `BEGIN IMMEDIATE` 的删除前事务一致。备份发布并复验成功前不得写 group、run、审计或执行删除。
 
-SQLite schema v17 保存 semantic snapshots、source attestations、source manifests、symbol observations、
+SQLite schema v18 保存 semantic snapshots、source attestations、source manifests、symbol observations、
 lineage groups/members/generation runs、candidate/evidence/decision 与 legacy compaction audit。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升
 为硬证据，也不会从现存 symbol 反推缺失 Document。真实重跑相同 snapshot 时可以首次补录 manifest；
 可信重跑只追加 attestation，不改写 symbol observations 或人工 lineage 状态。attestation 的唯一身份

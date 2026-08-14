@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- Production Qualification v1：机器级不可变账本、`run/status/show`、七项固定控制面资格用例，以及
+  `doctor --require-qualified` 精确 target 门禁；资格证明不进入项目 Evidence Plane 或 hard gate。
+
+### Changed
+
+- SQLite schema v18 为 adapter audit 加入规范事件载荷哈希；同一事件 ID 的不同载荷在串行、并发和
+  failure→success 路径均拒绝碰撞，当前 schema 打开避免重复 DDL，并对 adapter 热写入采用有界 busy 重试。
+
+### Security
+
+- Qualification run 只允许 `running` 一次性收口到终态，case 结果不可更新/删除，报告哈希在 replay、
+  status 与 show 时复验；`Failed`、`Inconclusive`、中断运行和目标漂移均不能冒充 `Qualified`。
+
 ## [0.1.0] - 2026-08-14
 
 ### Added

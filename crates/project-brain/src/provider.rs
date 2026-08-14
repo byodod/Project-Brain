@@ -1257,6 +1257,30 @@ fn validate_artifact(artifact: &ProviderArtifact, label: &str) -> Result<(), App
     Ok(())
 }
 
+/// Production Qualification 专用的同路径内容固定探针。
+///
+/// 返回值与后续校验都复用正式 Provider binding 的 `pinned_artifact` / `validate_artifact`
+/// 实现，避免资格测试复制一套更宽松的哈希逻辑。
+pub(crate) fn qualification_pin_artifact(path: &Path) -> Result<String, AppError> {
+    Ok(pinned_artifact(path, "qualification provider artifact")?.sha256)
+}
+
+pub(crate) fn qualification_validate_pinned_artifact(
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<(), AppError> {
+    let canonical_path = path.canonicalize().map_err(|error| {
+        AppError::Provider(format!("qualification provider artifact 无法解析：{error}"))
+    })?;
+    validate_artifact(
+        &ProviderArtifact {
+            canonical_path,
+            sha256: expected_sha256.to_owned(),
+        },
+        "qualification provider artifact",
+    )
+}
+
 fn provider_arguments(
     producer: &str,
     project_root: &Path,

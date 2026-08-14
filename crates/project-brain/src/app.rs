@@ -33,7 +33,7 @@ use crate::{
     evidence::{CurrentSourceVerification, effective_evidence_freshness},
     git, godot, index,
     prime::{self, PrimeHookInput},
-    provider, reconcile, runtime, scip_index, setup, test,
+    provider, qualification, reconcile, runtime, scip_index, setup, test,
 };
 
 const BRAIN_DIRECTORY: &str = ".project-brain";
@@ -198,6 +198,7 @@ impl App {
         install_root: Option<&Path>,
         agent: AgentKind,
         agent_home: Option<&Path>,
+        require_qualified: bool,
     ) -> Result<(), AppError> {
         let adapter = match agent {
             AgentKind::Codex => setup::DoctorAdapter::Codex,
@@ -229,12 +230,69 @@ impl App {
             report.status = "degraded";
         }
         report.semantic_coverage = Some(semantic_coverage);
+        match qualification::status(install_root) {
+            Ok(status) => {
+                if !status.qualified {
+                    let message = format!(
+                        "当前二进制/控制面合同 {} 尚无 Qualified 证明",
+                        status.current_target.target_hash
+                    );
+                    if require_qualified {
+                        report.issues.push(message);
+                        report.status = "degraded";
+                    } else {
+                        report.warnings.push(message);
+                    }
+                }
+                report.qualification = Some(status);
+            }
+            Err(error) => {
+                let message = format!("无法读取 Production Qualification 状态：{error}");
+                if require_qualified {
+                    report.issues.push(message);
+                    report.status = "degraded";
+                } else {
+                    report.warnings.push(message);
+                }
+            }
+        }
         println!("{}", pretty_json(&report)?);
         if report.is_ready() {
             Ok(())
         } else {
             Err(AppError::DoctorDegraded(report.issues.join("；")))
         }
+    }
+
+    pub fn qualification_run(
+        &self,
+        install_root: Option<&Path>,
+        request_id: &str,
+    ) -> Result<(), AppError> {
+        let report = qualification::run(install_root, &self.root, &self.config, request_id)?;
+        println!("{}", pretty_json(&report)?);
+        if report.status == qualification::QualificationState::Qualified {
+            Ok(())
+        } else {
+            Err(AppError::Qualification(format!(
+                "运行 {} 的最终状态为 {}",
+                report.run_id,
+                report.status.as_str()
+            )))
+        }
+    }
+
+    pub fn qualification_status(install_root: Option<&Path>) -> Result<(), AppError> {
+        println!("{}", pretty_json(&qualification::status(install_root)?)?);
+        Ok(())
+    }
+
+    pub fn qualification_show(install_root: Option<&Path>, run_id: &str) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&qualification::show(install_root, run_id)?)?
+        );
+        Ok(())
     }
 
     pub fn dispatch_hook(

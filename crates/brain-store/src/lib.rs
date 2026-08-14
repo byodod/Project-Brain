@@ -3,6 +3,7 @@ use std::{
     fs::{self, File},
     io::{BufReader, Read},
     path::{Path, PathBuf},
+    thread,
     time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
@@ -34,7 +35,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const DATABASE_SCHEMA_VERSION: i64 = 17;
+pub const DATABASE_SCHEMA_VERSION: i64 = 18;
+const ADAPTER_BUSY_RETRY_DELAYS_MS: [u64; 3] = [20, 80, 320];
 const ALL_EVIDENCE_PLANES: [EvidencePlane; 6] = [
     EvidencePlane::Source,
     EvidencePlane::Semantic,
@@ -99,6 +101,9 @@ pub enum StoreError {
 
     #[error("Evidence staleness event_id 已用于不同事件：{0}")]
     EvidenceIdempotencyConflict(String),
+
+    #[error("Adapter event_id 已用于不同事件：{0}")]
+    AdapterIdempotencyConflict(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,6 +126,7 @@ pub struct AdapterAuditRecord {
     pub event_id: String,
     pub session_key: String,
     pub event_kind: String,
+    pub event_hash: String,
     pub event_json: String,
     pub outcome_json: Option<String>,
     pub latency_ms: u64,
@@ -569,6 +575,9 @@ impl BrainStore {
         reason = "schema 初始化按版本顺序集中执行，避免迁移步骤次序漂移"
     )]
     fn initialize(&self) -> Result<(), StoreError> {
+        self.connection
+            .busy_timeout(std::time::Duration::from_secs(5))?;
+        self.connection.execute_batch("PRAGMA foreign_keys = ON;")?;
         let metadata_table_existed: bool = self.connection.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'
@@ -576,6 +585,14 @@ impl BrainStore {
             [],
             |row| row.get(0),
         )?;
+        if metadata_table_existed {
+            let schema_version = self.read_schema_version(true)?;
+            if schema_version == DATABASE_SCHEMA_VERSION {
+                // 已完成迁移的连接只配置 connection-local pragma。重复执行整套
+                // CREATE/ALTER DDL 会在多 Agent 同时启动时制造没有必要的写锁竞争。
+                return Ok(());
+            }
+        }
         self.connection.execute_batch(
             "PRAGMA foreign_keys = ON;
              PRAGMA busy_timeout = 5000;
@@ -729,6 +746,7 @@ impl BrainStore {
                  event_id TEXT NOT NULL,
                  session_key TEXT NOT NULL,
                  event_kind TEXT NOT NULL,
+                 event_hash TEXT NOT NULL,
                  event_json TEXT NOT NULL,
                  outcome_json TEXT,
                  latency_ms INTEGER NOT NULL,
@@ -738,6 +756,52 @@ impl BrainStore {
              );
              CREATE INDEX IF NOT EXISTS idx_adapter_audit_project_session
                  ON adapter_audit_events(project_key, adapter_kind, session_key, id);",
+        )?;
+        let has_event_hash = self
+            .connection
+            .prepare("PRAGMA table_info(adapter_audit_events)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|column| column == "event_hash");
+        if !has_event_hash {
+            self.connection
+                .execute_batch("ALTER TABLE adapter_audit_events ADD COLUMN event_hash TEXT;")?;
+        }
+        let missing_hashes = {
+            let mut statement = self.connection.prepare(
+                "SELECT id, event_json FROM adapter_audit_events
+                 WHERE event_hash IS NULL OR event_hash = ''",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, event_json) in missing_hashes {
+            self.connection.execute(
+                "UPDATE adapter_audit_events SET event_hash = ?1 WHERE id = ?2",
+                params![adapter_event_hash(&event_json), id],
+            )?;
+        }
+        self.connection.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS trg_adapter_event_hash_insert
+                 BEFORE INSERT ON adapter_audit_events
+                 WHEN NEW.event_hash IS NULL OR length(NEW.event_hash) != 71
+                      OR substr(NEW.event_hash, 1, 7) != 'sha256_'
+                      OR substr(NEW.event_hash, 8) GLOB '*[^0-9a-f]*'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'adapter event_hash is required');
+                 END;
+             CREATE TRIGGER IF NOT EXISTS trg_adapter_event_hash_update
+                 BEFORE UPDATE OF event_hash ON adapter_audit_events
+                 WHEN NEW.event_hash IS NULL OR length(NEW.event_hash) != 71
+                      OR substr(NEW.event_hash, 1, 7) != 'sha256_'
+                      OR substr(NEW.event_hash, 8) GLOB '*[^0-9a-f]*'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'adapter event_hash is required');
+                 END;",
         )?;
         Ok(())
     }
@@ -3654,6 +3718,19 @@ impl BrainStore {
         outcome: &InternalHookOutcome,
         latency_ms: u64,
     ) -> Result<AdapterRecordResult, StoreError> {
+        retry_adapter_busy(|| self.record_adapter_event_once(event, outcome, latency_ms))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "精确载荷幂等的预检、原子 upsert 与并发碰撞复核必须保持在同一写路径"
+    )]
+    fn record_adapter_event_once(
+        &self,
+        event: &InternalHookEvent,
+        outcome: &InternalHookOutcome,
+        latency_ms: u64,
+    ) -> Result<AdapterRecordResult, StoreError> {
         event
             .validate()
             .map_err(|error| StoreError::InvalidHookEvent(error.to_string()))?;
@@ -3663,6 +3740,7 @@ impl BrainStore {
             ));
         }
         let event_json = serde_json::to_string(event)?;
+        let event_hash = adapter_event_hash(&event_json);
         let outcome_json = serde_json::to_string(outcome)?;
         let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let created_at_unix_seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
@@ -3670,34 +3748,42 @@ impl BrainStore {
         let existing = self
             .connection
             .query_row(
-                "SELECT outcome_json FROM adapter_audit_events
+                "SELECT event_hash, outcome_json FROM adapter_audit_events
                  WHERE project_key = ?1 AND adapter_kind = ?2 AND event_id = ?3",
                 params![
                     event.project_key,
                     event.adapter.kind.as_str(),
                     event.event_id
                 ],
-                |row| row.get::<_, Option<String>>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )
             .optional()?;
-        if let Some(Some(existing)) = existing {
-            return Ok(AdapterRecordResult::Duplicate(serde_json::from_str(
-                &existing,
-            )?));
+        if let Some((existing_hash, existing_outcome)) = existing {
+            if existing_hash != event_hash {
+                return Err(StoreError::AdapterIdempotencyConflict(
+                    event.event_id.clone(),
+                ));
+            }
+            if let Some(existing_outcome) = existing_outcome {
+                return Ok(AdapterRecordResult::Duplicate(serde_json::from_str(
+                    &existing_outcome,
+                )?));
+            }
         }
         let changed = self.connection.execute(
             "INSERT INTO adapter_audit_events(
                  project_key, adapter_kind, adapter_version, event_id, session_key,
-                 event_kind, event_json, outcome_json, latency_ms, failure,
+                 event_kind, event_hash, event_json, outcome_json, latency_ms, failure,
                  created_at_unix_seconds
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)
              ON CONFLICT(project_key, adapter_kind, event_id) DO UPDATE SET
                  event_json = excluded.event_json,
                  outcome_json = excluded.outcome_json,
                  latency_ms = excluded.latency_ms,
                  failure = NULL,
                  created_at_unix_seconds = excluded.created_at_unix_seconds
-             WHERE adapter_audit_events.outcome_json IS NULL",
+             WHERE adapter_audit_events.outcome_json IS NULL
+               AND adapter_audit_events.event_hash = excluded.event_hash",
             params![
                 event.project_key,
                 event.adapter.kind.as_str(),
@@ -3705,6 +3791,7 @@ impl BrainStore {
                 event.event_id,
                 event.session_key,
                 event.kind().as_str(),
+                event_hash,
                 event_json,
                 outcome_json,
                 latency_ms,
@@ -3724,18 +3811,30 @@ impl BrainStore {
             )?;
             return Ok(AdapterRecordResult::Inserted(id));
         }
-        let existing: String = self.connection.query_row(
-            "SELECT outcome_json FROM adapter_audit_events
+        let (existing_hash, existing_outcome): (String, Option<String>) =
+            self.connection.query_row(
+                "SELECT event_hash, outcome_json FROM adapter_audit_events
              WHERE project_key = ?1 AND adapter_kind = ?2 AND event_id = ?3",
-            params![
-                event.project_key,
-                event.adapter.kind.as_str(),
+                params![
+                    event.project_key,
+                    event.adapter.kind.as_str(),
+                    event.event_id
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+        if existing_hash != event_hash {
+            return Err(StoreError::AdapterIdempotencyConflict(
+                event.event_id.clone(),
+            ));
+        }
+        let existing_outcome = existing_outcome.ok_or_else(|| {
+            StoreError::InvalidHookEvent(format!(
+                "Adapter event {} 的成功结果未持久化",
                 event.event_id
-            ],
-            |row| row.get(0),
-        )?;
+            ))
+        })?;
         Ok(AdapterRecordResult::Duplicate(serde_json::from_str(
-            &existing,
+            &existing_outcome,
         )?))
     }
 
@@ -3750,23 +3849,52 @@ impl BrainStore {
         latency_ms: u64,
         failure: &str,
     ) -> Result<(), StoreError> {
+        retry_adapter_busy(|| self.record_adapter_failure_once(event, latency_ms, failure))
+    }
+
+    fn record_adapter_failure_once(
+        &self,
+        event: &InternalHookEvent,
+        latency_ms: u64,
+        failure: &str,
+    ) -> Result<(), StoreError> {
         event
             .validate()
             .map_err(|error| StoreError::InvalidHookEvent(error.to_string()))?;
         let event_json = serde_json::to_string(event)?;
+        let event_hash = adapter_event_hash(&event_json);
         let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let created_at_unix_seconds = i64::try_from(seconds).unwrap_or(i64::MAX);
-        self.connection.execute(
+        let existing_hash = self
+            .connection
+            .query_row(
+                "SELECT event_hash FROM adapter_audit_events
+                 WHERE project_key = ?1 AND adapter_kind = ?2 AND event_id = ?3",
+                params![
+                    event.project_key,
+                    event.adapter.kind.as_str(),
+                    event.event_id
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if existing_hash.is_some_and(|existing| existing != event_hash) {
+            return Err(StoreError::AdapterIdempotencyConflict(
+                event.event_id.clone(),
+            ));
+        }
+        let changed = self.connection.execute(
             "INSERT INTO adapter_audit_events(
                  project_key, adapter_kind, adapter_version, event_id, session_key,
-                 event_kind, event_json, outcome_json, latency_ms, failure,
+                 event_kind, event_hash, event_json, outcome_json, latency_ms, failure,
                  created_at_unix_seconds
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11)
              ON CONFLICT(project_key, adapter_kind, event_id) DO UPDATE SET
                  latency_ms = excluded.latency_ms,
                  failure = excluded.failure,
                  created_at_unix_seconds = excluded.created_at_unix_seconds
-             WHERE adapter_audit_events.outcome_json IS NULL",
+             WHERE adapter_audit_events.outcome_json IS NULL
+               AND adapter_audit_events.event_hash = excluded.event_hash",
             params![
                 event.project_key,
                 event.adapter.kind.as_str(),
@@ -3774,12 +3902,30 @@ impl BrainStore {
                 event.event_id,
                 event.session_key,
                 event.kind().as_str(),
+                event_hash,
                 event_json,
                 i64::try_from(latency_ms).unwrap_or(i64::MAX),
                 failure,
                 created_at_unix_seconds,
             ],
         )?;
+        if changed == 0 {
+            let persisted_hash: String = self.connection.query_row(
+                "SELECT event_hash FROM adapter_audit_events
+                 WHERE project_key = ?1 AND adapter_kind = ?2 AND event_id = ?3",
+                params![
+                    event.project_key,
+                    event.adapter.kind.as_str(),
+                    event.event_id
+                ],
+                |row| row.get(0),
+            )?;
+            if persisted_hash != event_hash {
+                return Err(StoreError::AdapterIdempotencyConflict(
+                    event.event_id.clone(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -3795,7 +3941,7 @@ impl BrainStore {
     ) -> Result<Vec<AdapterAuditRecord>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT id, project_key, adapter_kind, adapter_version, event_id, session_key,
-                    event_kind, event_json, outcome_json, latency_ms, failure,
+                    event_kind, event_hash, event_json, outcome_json, latency_ms, failure,
                     created_at_unix_seconds
              FROM adapter_audit_events
              WHERE project_key = ?1
@@ -3805,7 +3951,7 @@ impl BrainStore {
         statement
             .query_map(params![project_key, limit], |row| {
                 let adapter_version: i64 = row.get(3)?;
-                let latency_ms: i64 = row.get(9)?;
+                let latency_ms: i64 = row.get(10)?;
                 Ok(AdapterAuditRecord {
                     id: row.get(0)?,
                     project_key: row.get(1)?,
@@ -3814,16 +3960,46 @@ impl BrainStore {
                     event_id: row.get(4)?,
                     session_key: row.get(5)?,
                     event_kind: row.get(6)?,
-                    event_json: row.get(7)?,
-                    outcome_json: row.get(8)?,
+                    event_hash: row.get(7)?,
+                    event_json: row.get(8)?,
+                    outcome_json: row.get(9)?,
                     latency_ms: u64::try_from(latency_ms).unwrap_or_default(),
-                    failure: row.get(10)?,
-                    created_at_unix_seconds: row.get(11)?,
+                    failure: row.get(11)?,
+                    created_at_unix_seconds: row.get(12)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
+}
+
+fn adapter_event_hash(event_json: &str) -> String {
+    format!("sha256_{:x}", Sha256::digest(event_json.as_bytes()))
+}
+
+fn retry_adapter_busy<T>(
+    mut operation: impl FnMut() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    for delay_ms in ADAPTER_BUSY_RETRY_DELAYS_MS {
+        match operation() {
+            Err(error) if is_sqlite_busy(&error) => {
+                thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            result => return result,
+        }
+    }
+    operation()
+}
+
+fn is_sqlite_busy(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::Sqlite(rusqlite::Error::SqliteFailure(details, _))
+            if matches!(
+                details.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 type LegacyCompactionKey = (
@@ -6582,7 +6758,7 @@ mod tests {
 
     use super::{
         AdapterRecordResult, BrainStore, DATABASE_SCHEMA_VERSION, LineageCandidateRecord,
-        SemanticSnapshotSource, StoreError, create_verified_legacy_backup,
+        SemanticSnapshotSource, StoreError, adapter_event_hash, create_verified_legacy_backup,
         inspect_database_storage, is_raw_sha256, legacy_backup_path, semantic_source_manifest_hash,
     };
 
@@ -7750,6 +7926,91 @@ mod tests {
     }
 
     #[test]
+    fn adapter_event_id_rejects_a_different_payload_after_success_or_failure() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let first = hook_event("project_a", "event-1");
+        store
+            .record_adapter_event(&first, &hook_outcome("event-1"), 1)
+            .unwrap();
+        let mut changed = first.clone();
+        changed.payload = HookEventPayload::SessionOpened(SessionOpened {
+            reason: SessionOpenReason::Resume,
+            previous_session_key: None,
+        });
+        assert!(matches!(
+            store.record_adapter_event(&changed, &hook_outcome("event-1"), 2),
+            Err(StoreError::AdapterIdempotencyConflict(event_id)) if event_id == "event-1"
+        ));
+
+        let failed = hook_event("project_a", "event-2");
+        store
+            .record_adapter_failure(&failed, 1, "temporary")
+            .unwrap();
+        let mut changed_failed = failed.clone();
+        changed_failed.session_key = "different-session".to_owned();
+        assert!(matches!(
+            store.record_adapter_failure(&changed_failed, 2, "different"),
+            Err(StoreError::AdapterIdempotencyConflict(event_id)) if event_id == "event-2"
+        ));
+    }
+
+    #[test]
+    fn v17_adapter_events_gain_exact_payload_hashes() {
+        let (root, database) = temporary_database("adapter-event-hash-migration");
+        let connection = Connection::open(&database).unwrap();
+        let event = hook_event("project_a", "event-1");
+        let event_json = serde_json::to_string(&event).unwrap();
+        let outcome_json = serde_json::to_string(&hook_outcome("event-1")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO metadata(key, value) VALUES('schema_version', '17');
+                 CREATE TABLE adapter_audit_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     project_key TEXT NOT NULL,
+                     adapter_kind TEXT NOT NULL,
+                     adapter_version INTEGER NOT NULL,
+                     event_id TEXT NOT NULL,
+                     session_key TEXT NOT NULL,
+                     event_kind TEXT NOT NULL,
+                     event_json TEXT NOT NULL,
+                     outcome_json TEXT,
+                     latency_ms INTEGER NOT NULL,
+                     failure TEXT,
+                     created_at_unix_seconds INTEGER NOT NULL,
+                     UNIQUE(project_key, adapter_kind, event_id)
+                 );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO adapter_audit_events(
+                     project_key, adapter_kind, adapter_version, event_id, session_key,
+                     event_kind, event_json, outcome_json, latency_ms, failure,
+                     created_at_unix_seconds
+                 ) VALUES('project_a', 'codex', 1, 'event-1', 'session',
+                          'session_opened', ?1, ?2, 1, NULL, 1)",
+                params![event_json, outcome_json],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = BrainStore::open(&database).unwrap();
+        assert_eq!(
+            store.database_schema_version().unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
+        let records = store.recent_adapter_audit("project_a", 10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].event_hash,
+            adapter_event_hash(&records[0].event_json)
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn concurrent_connections_converge_on_one_project_event() {
         let (root, database) = temporary_database("concurrent-audit-test");
         drop(BrainStore::open(&database).unwrap());
@@ -7779,6 +8040,47 @@ mod tests {
             results
                 .iter()
                 .filter(|result| matches!(result, AdapterRecordResult::Inserted(_)))
+                .count(),
+            1
+        );
+        let store = BrainStore::open(&database).unwrap();
+        assert_eq!(
+            store.recent_adapter_audit("project_a", 10).unwrap().len(),
+            1
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_connections_reject_one_of_two_payloads_for_the_same_event_id() {
+        let (root, database) = temporary_database("concurrent-audit-conflict-test");
+        drop(BrainStore::open(&database).unwrap());
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|index| {
+                let database = database.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let store = BrainStore::open(&database).unwrap();
+                    let mut event = hook_event("project_a", "event-1");
+                    if index == 1 {
+                        event.session_key = "different-session".to_owned();
+                    }
+                    barrier.wait();
+                    store.record_adapter_event(&event, &hook_outcome("event-1"), 1)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(StoreError::AdapterIdempotencyConflict(event_id)) if event_id == "event-1"))
                 .count(),
             1
         );
@@ -9470,7 +9772,8 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE semantic_lineage_compaction_runs
                  ADD COLUMN keep_backup INTEGER NOT NULL DEFAULT 0
-                 CHECK(keep_backup IN (0, 1));",
+                 CHECK(keep_backup IN (0, 1));
+                 UPDATE metadata SET value = '17' WHERE key = 'schema_version';",
             )
             .unwrap();
         drop(store);

@@ -149,6 +149,8 @@ pub struct DoctorReport {
     pub adapter_trust_state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_coverage: Option<crate::scip_index::SemanticCoverageDoctorReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualification: Option<crate::qualification::QualificationStatusReport>,
     pub issues: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -850,6 +852,7 @@ pub fn doctor(
                 adapter_hooks: CheckState::Fail,
                 adapter_trust_state: "not_programmatically_verifiable",
                 semantic_coverage: None,
+                qualification: None,
                 issues: vec![error.to_string()],
                 warnings: Vec::new(),
             };
@@ -928,6 +931,7 @@ pub fn doctor(
         adapter_hooks: adapter_hooks_valid.into(),
         adapter_trust_state: adapter_trust_state(adapter, adapter_hooks_valid),
         semantic_coverage: None,
+        qualification: None,
         issues,
         warnings: Vec::new(),
     }

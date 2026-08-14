@@ -14,6 +14,7 @@ mod index;
 mod prime;
 mod protocol;
 mod provider;
+mod qualification;
 mod reconcile;
 mod runtime;
 mod scip_index;
@@ -92,6 +93,16 @@ enum Command {
     Doctor {
         #[arg(value_enum, default_value = "codex")]
         agent: AgentKind,
+
+        /// 同时要求当前二进制与控制面合同已有 Qualified 证明
+        #[arg(long)]
+        require_qualified: bool,
+    },
+
+    /// 运行或查询机器级 Production Qualification；绝不写项目 brain.db
+    Qualification {
+        #[command(subcommand)]
+        command: QualificationCommand,
     },
 
     /// 从标准输入读取 `ActionDescriptor` 并输出通用决策 JSON
@@ -178,6 +189,22 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum QualificationCommand {
+    /// 在受控 fixture 上运行 control-plane-v1 七项固定资格测试
+    Run {
+        /// 调用者生成的幂等请求 ID；同 ID 不同目标会被拒绝
+        #[arg(long)]
+        request_id: String,
+    },
+
+    /// 查询当前二进制与控制面合同是否已有 Qualified 证明
+    Status,
+
+    /// 查看一个不可变资格运行的完整证明
+    Show { run_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -688,15 +715,32 @@ fn main() -> ExitCode {
         Command::Dispatch { agent, event } => {
             App::dispatch_hook(cli.install_root.as_deref(), agent, event)
         }
-        Command::Doctor { agent } => {
+        Command::Doctor {
+            agent,
+            require_qualified,
+        } => {
             let agent_home = match agent {
                 AgentKind::Codex => cli.codex_home.as_deref(),
                 AgentKind::ClaudeCode => cli.claude_home.as_deref(),
                 AgentKind::PrimeAgent => cli.prime_home.as_deref(),
             };
-            App::open(cli.project_root)
-                .and_then(|app| app.doctor(cli.install_root.as_deref(), agent, agent_home))
+            App::open(cli.project_root).and_then(|app| {
+                app.doctor(
+                    cli.install_root.as_deref(),
+                    agent,
+                    agent_home,
+                    require_qualified,
+                )
+            })
         }
+        Command::Qualification { command } => match command {
+            QualificationCommand::Run { request_id } => App::open(cli.project_root)
+                .and_then(|app| app.qualification_run(cli.install_root.as_deref(), &request_id)),
+            QualificationCommand::Status => App::qualification_status(cli.install_root.as_deref()),
+            QualificationCommand::Show { run_id } => {
+                App::qualification_show(cli.install_root.as_deref(), &run_id)
+            }
+        },
         Command::Preflight => App::open(cli.project_root).and_then(|app| app.preflight()),
         Command::Hook { agent, event } => {
             App::run_hook(cli.project_root, cli.install_root.as_deref(), agent, event)

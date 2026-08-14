@@ -9,6 +9,7 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - Project-scoped Internal Hook Protocol v1；
 - Codex 与 Claude Code `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Stop` 协议适配；
 - 按项目和 adapter 隔离、可重放的 SQLite 本地审计记录；
+- 独立机器账本中的 Production Qualification v1，固定验证 adapter 合同、项目隔离、重放、并发、Provider 漂移、Stop 防循环与长会话稳定性；
 - Git Change Envelope 范围核对；
 - Codex `Stop` 自动 Change Envelope 对账与防循环保护；
 - 基于 Tree-sitter 的 Rust changed-symbol 与纯删除符号提取；
@@ -16,7 +17,7 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - 按项目显式配置的 SCIP 导入与机器级安全 Runner，首批契约覆盖 rust-analyzer、scip-dotnet 与 scip-python；
 - 开放 language ID、逐文档语言映射和四态语义能力声明；
 - Project-scoped semantic lineage ledger、不可变证据与 append-only 显式裁决；
-- SQLite schema v1→v17 迁移、按项目隔离的符号 removed 历史、Evidence ledger、幂等增量更新与显式维护协议；
+- SQLite schema v1→v18 迁移、按项目隔离的符号 removed 历史、Evidence ledger、精确载荷幂等与显式维护协议；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
 ## 核心原则
@@ -45,6 +46,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```text
 cargo build --release --locked -p project-brain
 ```
+
+在把一个具体二进制声明为生产可用前，运行固定的控制面资格套件：
+
+```text
+project-brain qualification run --request-id workstation-2026-08-14
+project-brain qualification status
+project-brain qualification show qualification_<run-id>
+```
+
+`control-plane-v1` 固定包含七项用例：adapter contract、project isolation、at-least-once
+replay/idempotency、concurrent interleaving、Provider drift、Stop-loop boundedness 与 long-session
+stability。结果只可能是 `qualified`、`failed` 或 `inconclusive`；后两者绝不等价于通过。
+证明保存在机器级 `<ProjectBrainData>/state/qualification.sqlite`，不写入项目 `brain.db`，不属于
+Evidence Plane，也不能让任何项目规则获得 hard-block 权限。二进制字节、控制面合同、数据库 schema、
+OS 或架构变化都会形成新的 target，必须重新运行资格套件；没有 skip/ignore/force-qualified 开关。
 
 正式标签会在 Linux x86-64、Windows x86-64、macOS Intel 与 Apple Silicon 上分别构建、
 自检并打包，同时发布 `SHA256SUMS`。完整流程见 [docs/RELEASING.md](docs/RELEASING.md)。
@@ -181,13 +197,16 @@ Codex 会按 Hook 精确定义哈希要求审核非托管命令 Hook。安装后
 
 ```text
 project-brain doctor
+project-brain doctor --require-qualified
 project-brain uninstall-hooks codex
 ```
 
 `doctor` 默认检查 Codex；也可执行 `project-brain doctor claude-code`，并通过全局
 `--claude-home` 指定 Claude 配置根。报告使用通用的 `adapter`、`adapter_hooks` 与
 `adapter_trust_state` 字段。`doctor` 总会先把结构化报告写到标准输出；只要状态不是 `ready`，进程同时返回非零退出码，
-因此既适合人工诊断，也可以作为 CI/bootstrap 的硬门禁。
+因此既适合人工诊断，也可以作为 CI/bootstrap 的硬门禁。`--require-qualified` 还会要求当前二进制与
+控制面合同存在精确匹配的 `Qualified` 证明；普通 `doctor` 只把缺失资格报告为 warning，避免在用户
+没有显式要求时改变既有就绪语义。
 
 卸载只删除 manifest 中精确记录的 Project Brain handler，保留用户后来增加的 Hook。检测到
 人工修改或重复 handler 时默认返回 Integration Drift，不覆盖用户配置。

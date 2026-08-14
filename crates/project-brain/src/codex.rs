@@ -1187,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn vendor_tool_identity_wins_over_changed_retry_payload() {
+    fn vendor_tool_identity_rejects_a_changed_retry_payload() {
         let store = BrainStore::open_in_memory().unwrap();
         let first = delete_input();
         let mut retry = delete_input();
@@ -1209,7 +1209,16 @@ mod tests {
             &retry,
         )
         .unwrap();
-        assert_eq!(denied.0, replayed.0);
+        assert_ne!(denied.0, replayed.0);
+        assert_eq!(
+            denied.0["hookSpecificOutput"]["permissionDecisionReason"],
+            "PROTECT: protected"
+        );
+        assert!(
+            replayed.0["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("event_id 已用于不同事件"))
+        );
         assert_eq!(
             store.recent_adapter_audit("project_a", 10).unwrap().len(),
             1
