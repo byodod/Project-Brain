@@ -303,7 +303,9 @@ project-brain evidence build python \
 ```
 
 .NET 固定执行 Debug、`--no-restore --no-incremental --disable-build-servers`，只接受单个 `.csproj`；
-已准备的 NuGet restore metadata 会复制到机器私有临时目录，bin/obj 也只写入该目录。Godot C# 可用
+版本探测和构建都以项目根为工作目录，使仓库根 `global.json` 约束实际 SDK，且 Evidence 记录的
+toolchain version 与真正构建一致。已准备的 NuGet restore metadata 会复制到机器私有临时目录，
+bin/obj 也只写入该目录。Godot C# 可用
 `--require-engine` 强制引用唯一的 fresh、complete、deterministic Engine head。Rust 固定执行
 `cargo build --workspace --all-targets --frozen` 并使用临时 target。两者都可能执行仓库控制的
 MSBuild task、build.rs 或 proc macro，因此除了信任机器 executable，还必须单独确认

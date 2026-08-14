@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::{artifact_store, error::AppError, git, provider};
 
 const BUILD_RUN_SCHEMA_VERSION: u32 = 1;
-const BUILD_CONTRACT_VERSION: u16 = 1;
+const BUILD_CONTRACT_VERSION: u16 = 2;
 const MAX_ARTIFACT_FILES: usize = 20_000;
 const MAX_ARTIFACT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -37,6 +37,13 @@ pub enum ExecutionClass {
 pub enum BuildOutputKind {
     ArtifactSet,
     ValidationOnly,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkingDirectoryPolicy {
+    ProjectRoot,
+    MachineScratch,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,6 +81,7 @@ struct BuildContract {
     profile_id: String,
     target: String,
     argv: Vec<String>,
+    working_directory_policy: WorkingDirectoryPolicy,
     environment_policy: &'static str,
     network_policy: &'static str,
     execution_class: ExecutionClass,
@@ -177,6 +185,7 @@ pub fn run_dotnet(request: &BuildRequest<'_>) -> Result<BuildRunReport, AppError
         ExecutionClass::RepositoryBuildCode,
         BuildOutputKind::ArtifactSet,
         Some(&bin_debug),
+        WorkingDirectoryPolicy::ProjectRoot,
     )
 }
 
@@ -272,6 +281,7 @@ pub fn run_rust(request: &BuildRequest<'_>) -> Result<BuildRunReport, AppError> 
         ExecutionClass::RepositoryBuildCode,
         BuildOutputKind::ArtifactSet,
         Some(&artifacts),
+        WorkingDirectoryPolicy::MachineScratch,
     )
 }
 
@@ -334,6 +344,7 @@ pub fn run_python(request: &BuildRequest<'_>) -> Result<BuildRunReport, AppError
         ExecutionClass::CompilerOnly,
         BuildOutputKind::ValidationOnly,
         None,
+        WorkingDirectoryPolicy::MachineScratch,
     )
 }
 
@@ -351,6 +362,7 @@ fn run_build(
     execution_class: ExecutionClass,
     output_kind: BuildOutputKind,
     artifact_root: Option<&Path>,
+    working_directory_policy: WorkingDirectoryPolicy,
 ) -> Result<BuildRunReport, AppError> {
     validate_profile_id(request.profile_id)?;
     let timeout = Duration::from_secs(request.timeout_seconds);
@@ -359,11 +371,12 @@ fn run_build(
         .iter()
         .map(|(name, path)| (*name, path.as_path()))
         .collect::<Vec<_>>();
+    let working_directory = working_directory(working_directory_policy, root, &scratch.directory);
     let version_process = provider::run_process_with_environment(
         &executable.canonical_path,
         None,
         version_argv,
-        &scratch.directory,
+        working_directory,
         Some(root),
         timeout,
         &environment,
@@ -384,7 +397,7 @@ fn run_build(
         &executable.canonical_path,
         None,
         argv,
-        &scratch.directory,
+        working_directory,
         Some(root),
         timeout,
         &environment,
@@ -507,6 +520,7 @@ fn run_build(
         profile_id: request.profile_id.to_owned(),
         target: target_display.to_owned(),
         argv: redact_machine_paths(argv, root, &scratch.directory),
+        working_directory_policy,
         environment_policy: "env_clear+adapter_allowlist+machine_scratch",
         network_policy: if adapter == "cargo-build" {
             "offline_frozen"
@@ -612,6 +626,17 @@ fn run_build(
         status,
         evidence,
     })
+}
+
+fn working_directory<'a>(
+    policy: WorkingDirectoryPolicy,
+    root: &'a Path,
+    scratch: &'a Path,
+) -> &'a Path {
+    match policy {
+        WorkingDirectoryPolicy::ProjectRoot => root,
+        WorkingDirectoryPolicy::MachineScratch => scratch,
+    }
 }
 
 fn infrastructure_failure(adapter: &str, stdout: &[u8], stderr: &[u8]) -> bool {
@@ -908,8 +933,8 @@ impl Drop for BuildScratch {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildRequest, ExecutionClass, infrastructure_failure, prepare_dotnet_restore_state,
-        require_trust, validate_profile_id,
+        BuildRequest, ExecutionClass, WorkingDirectoryPolicy, infrastructure_failure,
+        prepare_dotnet_restore_state, require_trust, validate_profile_id, working_directory,
     };
     use std::{fs, path::Path};
 
@@ -940,6 +965,20 @@ mod tests {
         assert!(validate_profile_id("godot-debug").is_ok());
         assert!(validate_profile_id("bad/profile").is_err());
         assert!(validate_profile_id("x;echo").is_err());
+    }
+
+    #[test]
+    fn dotnet_contract_resolves_sdk_from_project_root() {
+        let root = Path::new("project-root");
+        let scratch = Path::new("machine-scratch");
+        assert_eq!(
+            working_directory(WorkingDirectoryPolicy::ProjectRoot, root, scratch),
+            root
+        );
+        assert_eq!(
+            working_directory(WorkingDirectoryPolicy::MachineScratch, root, scratch),
+            scratch
+        );
     }
 
     #[test]

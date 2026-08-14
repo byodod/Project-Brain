@@ -275,11 +275,15 @@ Godot Engine Snapshot 使用固定 provider ID `godot-engine-resolver`；provide
 Godot version 与 executable SHA-256。Engine 导出的 diagnostics、load failure、missing dependency、
 unresolved UID 和 cache reference 都成为明确 finding，而不是依赖自由文本猜测。
 
-Build run schema v1 只允许内置 adapter 构造固定 argv：`dotnet-build`、`cargo-build` 与
+Build run schema v1 的 provider contract v2 只允许内置 adapter 构造固定 argv：`dotnet-build`、`cargo-build` 与
 `python-compile`。provider ID 为 `adapter + profile_id`，provider version 绑定真实工具版本和
 executable SHA-256。`.NET` 与 Rust 的 execution class 是 `repository_build_code`；Python 是
 `compiler_only`，输出类型为 `validation_only`。RepositoryBuildCode 必须取得独立的显式信任位，
 不能从 executable 信任推导。
+
+contract v2 显式记录 working-directory policy：`.NET` 的版本探测和 build 都以项目根为工作目录，
+保证 `global.json` 约束被探测与实际构建共同消费；Cargo/Python 继续以 machine scratch 为工作目录。
+所有 `.NET` bin/obj 输出仍被固定重定向到 scratch，进程前后 worktree 指纹漂移仍使证据失效。
 
 Build Snapshot 的 `coverage` 描述观测是否完整，而不是进程是否成功。固定合同完整执行但返回非零时，
 保存 `complete + build_exit_failure(error)`；输出被截断、链接器/SDK/离线依赖或预还原状态不可用时，

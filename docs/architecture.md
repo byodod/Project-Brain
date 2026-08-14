@@ -81,9 +81,10 @@ main scene、autoload、resource dependency 与文件哈希；Rust 侧要求两�
 Build Provider 不复用 Semantic Runner，也不把“编译”并入 Engine。`.NET` 与 `cargo` 属于
 `RepositoryBuildCode`：即使 argv 由 Project Brain 固定，MSBuild task、build.rs 和 proc macro 仍可
 执行仓库代码，因此必须同时取得机器 executable 信任与仓库构建代码信任。Python v1 属于
-`CompilerOnly`，固定 isolated interpreter bootstrap，只调用 `compile()`。所有构建在机器私有 scratch
-中运行并生成产物哈希清单；完整观测到非零退出仍是 complete error evidence，基础设施缺失则降级为
-partial unavailable。Godot C# Build Snapshot 显式引用本次实际消费的 Engine fingerprint。
+`CompilerOnly`，固定 isolated interpreter bootstrap，只调用 `compile()`。所有输出都进入机器私有
+scratch；`.NET` 的版本探测和构建进程以项目根为工作目录，以便 `global.json` 参与 SDK 解析，Rust 与
+Python 仍以 scratch 为工作目录。完整观测到非零退出仍是 complete error evidence，基础设施缺失则
+降级为 partial unavailable。Godot C# Build Snapshot 显式引用本次实际消费的 Engine fingerprint。
 
 .NET Test Provider 不使用仓库当前输出，也不调用 `dotnet test` 重新进入 MSBuild。Build CAS manifest
 绑定 `build_target`；Test 核对 fresh Build head、Source、target、toolchain 与 bundle 后，将精确字节
@@ -285,4 +286,5 @@ Extension 安装器仍留在后续阶段。
 [ADR-0026](adr/0026-exact-dotnet-test-bundle.md) 与
 [ADR-0027](adr/0027-godot-structured-scenario-test.md) 与
 [ADR-0028](adr/0028-rust-test-fixed-contract.md) 与
-[ADR-0029](adr/0029-python-manifest-test-contract.md)。
+[ADR-0029](adr/0029-python-manifest-test-contract.md) 与
+[ADR-0030](adr/0030-dotnet-project-root-sdk-resolution.md)。
