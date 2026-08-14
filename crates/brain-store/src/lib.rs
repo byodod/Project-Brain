@@ -25,7 +25,7 @@ use brain_symbols::{
     SourceFileState, SourceLanguage, SymbolNode, SymbolSnapshot, SymbolStatus, propose_lineage,
     symbol_id,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -43,6 +43,7 @@ const LEGACY_LINEAGE_ALGORITHM_ID: &str = "project-brain-lineage";
 const LEGACY_LINEAGE_ALGORITHM_VERSION: &str = "1";
 const LEGACY_COMPACTION_ALGORITHM_ID: &str = "project-brain-lineage-legacy-compaction";
 const LEGACY_COMPACTION_ALGORITHM_VERSION: &str = "1";
+const LEGACY_COMPACTION_OPERATION_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -78,6 +79,9 @@ pub enum StoreError {
 
     #[error("lineage request_id 已用于不同请求：{0}")]
     LineageIdempotencyConflict(String),
+
+    #[error("lineage 压缩计划已变化：批准 {approved}，当前 {current}")]
+    LineageCompactionPlanStale { approved: String, current: String },
 
     #[error("Provider 资格状态无效：{0}")]
     InvalidProviderQualification(String),
@@ -398,11 +402,15 @@ pub struct LegacyLineageCompactionReport {
     pub applied: bool,
     pub replayed: bool,
     pub request_id: Option<String>,
+    #[serde(default)]
+    pub approved_manifest_hash: Option<String>,
     pub legacy_ambiguous_candidate_count: u64,
     pub compactable_group_count: u64,
     pub compactable_candidate_count: u64,
     pub compactable_evidence_count: u64,
     pub protected_candidate_count: u64,
+    #[serde(default)]
+    pub protected_candidate_manifest_hash: String,
     pub group_member_count: u64,
     pub oversized_group_count: u64,
     pub compaction_manifest_hash: String,
@@ -2478,6 +2486,7 @@ impl BrainStore {
         &self,
         project_key: &str,
         request_id: &str,
+        approved_manifest_hash: &str,
     ) -> Result<LegacyLineageCompactionReport, StoreError> {
         let request_id = request_id.trim();
         if request_id.is_empty() || request_id.len() > 192 {
@@ -2485,8 +2494,15 @@ impl BrainStore {
                 "legacy compaction request_id 为空或过长".to_owned(),
             ));
         }
-        let request_hash = legacy_compaction_request_hash(project_key);
-        let transaction = self.connection.unchecked_transaction()?;
+        let approved_manifest_hash = approved_manifest_hash.trim();
+        if !is_sha256_fingerprint(approved_manifest_hash) {
+            return Err(StoreError::InvalidLineage(
+                "legacy compaction approved_manifest_hash 必须是 sha256_ 指纹".to_owned(),
+            ));
+        }
+        let request_hash = legacy_compaction_request_hash(project_key, approved_manifest_hash);
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let replay = transaction
             .query_row(
                 "SELECT request_hash, report_json FROM semantic_lineage_compaction_runs
@@ -2512,7 +2528,14 @@ impl BrainStore {
             "apply",
             Some(request_id),
         )?;
+        if plan.report.compaction_manifest_hash != approved_manifest_hash {
+            return Err(StoreError::LineageCompactionPlanStale {
+                approved: approved_manifest_hash.to_owned(),
+                current: plan.report.compaction_manifest_hash,
+            });
+        }
         plan.report.applied = true;
+        plan.report.approved_manifest_hash = Some(approved_manifest_hash.to_owned());
         let now = unix_seconds()?;
         let proposals = plan
             .groups
@@ -3666,6 +3689,21 @@ struct LegacyCompactionPlan {
     groups: Vec<LegacyCompactionPlanGroup>,
 }
 
+#[derive(Serialize)]
+struct LegacyCompactionManifest<'a> {
+    operation_version: u32,
+    project_key: &'a str,
+    legacy_ambiguous_candidate_count: u64,
+    compactable_group_count: u64,
+    compactable_candidate_count: u64,
+    compactable_evidence_count: u64,
+    protected_candidate_count: u64,
+    protected_candidate_manifest_hash: &'a str,
+    group_member_count: u64,
+    oversized_group_count: u64,
+    groups: &'a [LegacyLineageCompactionGroup],
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "压缩预演必须在同一只读快照中完成候选资格、完整笛卡尔积和摘要校验"
@@ -3676,6 +3714,7 @@ fn build_legacy_lineage_compaction_plan(
     mode: &str,
     request_id: Option<&str>,
 ) -> Result<LegacyCompactionPlan, StoreError> {
+    ensure_lineage_project_reference_integrity(connection, project_key)?;
     let total_raw: i64 = connection.query_row(
         "SELECT COUNT(*) FROM semantic_lineage_candidates
          WHERE project_key = ?1 AND proposal_origin = 'legacy_v7'
@@ -3751,7 +3790,7 @@ fn build_legacy_lineage_compaction_plan(
     })?;
     let mut groups =
         std::collections::BTreeMap::<LegacyCompactionKey, LegacyCompactionAccumulator>::new();
-    let mut unkeyed_protected = 0_u64;
+    let mut protected_candidate_ids = Vec::new();
     for row in rows {
         let (
             candidate_id,
@@ -3784,7 +3823,7 @@ fn build_legacy_lineage_compaction_plan(
             && old_fingerprint.is_some()
             && old_fingerprint == new_fingerprint;
         if !compatible {
-            unkeyed_protected = unkeyed_protected.saturating_add(1);
+            protected_candidate_ids.push(candidate_id);
             continue;
         }
         let kind = old_kind.unwrap_or_default();
@@ -3832,7 +3871,6 @@ fn build_legacy_lineage_compaction_plan(
         }
     }
 
-    let mut protected = unkeyed_protected;
     let mut compactable = Vec::new();
     for (key, mut group) in groups {
         group.candidate_ids.sort();
@@ -3851,7 +3889,7 @@ fn build_legacy_lineage_compaction_plan(
             && candidate_count == potential_pair_count
             && group.evidence_tokens.len() == group.candidate_ids.len();
         if !complete_cartesian {
-            protected = protected.saturating_add(candidate_count);
+            protected_candidate_ids.extend(group.candidate_ids);
             continue;
         }
         let oversized = from_members.len() > MAX_LINEAGE_GROUP_MEMBERS_PER_SIDE
@@ -3901,7 +3939,10 @@ fn build_legacy_lineage_compaction_plan(
             total.checked_add(group.report.evidence_count)
         })
         .ok_or_else(|| StoreError::InvalidLineage("compactable evidence count 溢出".to_owned()))?;
-    if protected.saturating_add(compactable_candidate_count) != total {
+    protected_candidate_ids.sort();
+    let protected_candidate_count =
+        u64::try_from(protected_candidate_ids.len()).unwrap_or(u64::MAX);
+    if protected_candidate_count.saturating_add(compactable_candidate_count) != total {
         return Err(StoreError::Integrity(
             "legacy compaction 候选分类计数不守恒".to_owned(),
         ));
@@ -3920,28 +3961,45 @@ fn build_legacy_lineage_compaction_plan(
         .iter()
         .map(|group| group.report.clone())
         .collect::<Vec<_>>();
-    let manifest = serde_json::to_vec(&reports)?;
+    let compactable_group_count = u64::try_from(reports.len()).unwrap_or(u64::MAX);
+    let protected_candidate_manifest_hash = stable_string_set_hash(&protected_candidate_ids);
+    let oversized_group_count = u64::try_from(
+        reports
+            .iter()
+            .filter(|group| group.storage_mode == "summary_only")
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    let manifest = serde_json::to_vec(&LegacyCompactionManifest {
+        operation_version: LEGACY_COMPACTION_OPERATION_VERSION,
+        project_key,
+        legacy_ambiguous_candidate_count: total,
+        compactable_group_count,
+        compactable_candidate_count,
+        compactable_evidence_count,
+        protected_candidate_count,
+        protected_candidate_manifest_hash: &protected_candidate_manifest_hash,
+        group_member_count,
+        oversized_group_count,
+        groups: &reports,
+    })?;
     Ok(LegacyCompactionPlan {
         report: LegacyLineageCompactionReport {
             project_key: project_key.to_owned(),
-            operation_version: 1,
+            operation_version: LEGACY_COMPACTION_OPERATION_VERSION,
             mode: mode.to_owned(),
             applied: false,
             replayed: false,
             request_id: request_id.map(str::to_owned),
+            approved_manifest_hash: None,
             legacy_ambiguous_candidate_count: total,
-            compactable_group_count: u64::try_from(reports.len()).unwrap_or(u64::MAX),
+            compactable_group_count,
             compactable_candidate_count,
             compactable_evidence_count,
-            protected_candidate_count: protected,
+            protected_candidate_count,
+            protected_candidate_manifest_hash,
             group_member_count,
-            oversized_group_count: u64::try_from(
-                reports
-                    .iter()
-                    .filter(|group| group.storage_mode == "summary_only")
-                    .count(),
-            )
-            .unwrap_or(u64::MAX),
+            oversized_group_count,
             compaction_manifest_hash: format!("sha256_{:x}", Sha256::digest(manifest)),
             groups: reports,
         },
@@ -3979,13 +4037,45 @@ fn stable_parts_hash(values: &[&str]) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn legacy_compaction_request_hash(project_key: &str) -> String {
+fn ensure_lineage_project_reference_integrity(
+    connection: &Connection,
+    project_key: &str,
+) -> Result<(), StoreError> {
+    let cross_project_reference_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM (
+             SELECT d.decision_id
+             FROM semantic_lineage_decisions d
+             JOIN semantic_lineage_candidates c ON c.candidate_id = d.candidate_id
+             WHERE (d.project_key = ?1 OR c.project_key = ?1)
+               AND d.project_key <> c.project_key
+             UNION ALL
+             SELECT d.decision_id
+             FROM semantic_lineage_decisions d
+             JOIN semantic_lineage_candidates c
+               ON c.candidate_id = d.related_candidate_id
+             WHERE (d.project_key = ?1 OR c.project_key = ?1)
+               AND d.project_key <> c.project_key
+         )",
+        [project_key],
+        |row| row.get(0),
+    )?;
+    if cross_project_reference_count != 0 {
+        return Err(StoreError::Integrity(format!(
+            "项目 {project_key:?} 的 lineage decision 存在 {cross_project_reference_count} 条跨项目 candidate 引用"
+        )));
+    }
+    Ok(())
+}
+
+fn legacy_compaction_request_hash(project_key: &str, approved_manifest_hash: &str) -> String {
+    let operation_version = LEGACY_COMPACTION_OPERATION_VERSION.to_string();
     format!(
         "sha256_{}",
         stable_parts_hash(&[
             project_key,
             "compact-legacy-proposals",
-            LEGACY_COMPACTION_ALGORITHM_VERSION,
+            operation_version.as_str(),
+            approved_manifest_hash,
         ])
     )
 }
@@ -8381,10 +8471,18 @@ mod tests {
         assert_eq!(preview.protected_candidate_count, 0);
         assert_eq!(preview.group_member_count, 4);
         let applied = store
-            .apply_legacy_lineage_compaction(PROJECT_KEY, "compact-request-1")
+            .apply_legacy_lineage_compaction(
+                PROJECT_KEY,
+                "compact-request-1",
+                &preview.compaction_manifest_hash,
+            )
             .unwrap();
         assert!(applied.applied);
         assert!(!applied.replayed);
+        assert_eq!(
+            applied.approved_manifest_hash.as_deref(),
+            Some(preview.compaction_manifest_hash.as_str())
+        );
         assert_eq!(
             applied.compaction_manifest_hash,
             preview.compaction_manifest_hash
@@ -8418,7 +8516,11 @@ mod tests {
             .unwrap();
         assert_eq!(audit_groups, 1);
         let replay = store
-            .apply_legacy_lineage_compaction(PROJECT_KEY, "compact-request-1")
+            .apply_legacy_lineage_compaction(
+                PROJECT_KEY,
+                "compact-request-1",
+                &preview.compaction_manifest_hash,
+            )
             .unwrap();
         assert!(replay.replayed);
         assert_eq!(
@@ -8438,6 +8540,150 @@ mod tests {
                 "legacy-materialize-rejected",
             ),
             Err(StoreError::InvalidLineage(_))
+        ));
+
+        let different_manifest = format!("sha256_{}", "f".repeat(64));
+        assert!(matches!(
+            store.apply_legacy_lineage_compaction(
+                PROJECT_KEY,
+                "compact-request-1",
+                &different_manifest,
+            ),
+            Err(StoreError::LineageIdempotencyConflict(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_compaction_rejects_a_stale_approved_manifest_without_deleting() {
+        let store = BrainStore::open_in_memory().unwrap();
+        insert_legacy_cartesian_fixture(&store, true);
+        let preview = store
+            .preview_legacy_lineage_compaction(PROJECT_KEY)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE semantic_lineage_candidates SET state = 'rejected', revision = 1
+                 WHERE candidate_id = 'legacy-candidate-1'",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.apply_legacy_lineage_compaction(
+                PROJECT_KEY,
+                "stale-compaction",
+                &preview.compaction_manifest_hash,
+            ),
+            Err(StoreError::LineageCompactionPlanStale { .. })
+        ));
+        let remaining: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_lineage_candidates
+                 WHERE proposal_origin = 'legacy_v7'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 4);
+        let audit_runs: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_lineage_compaction_runs",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_runs, 0);
+    }
+
+    #[test]
+    fn legacy_compaction_manifest_covers_protected_candidates() {
+        let store = BrainStore::open_in_memory().unwrap();
+        insert_legacy_cartesian_fixture(&store, true);
+        let before = store
+            .preview_legacy_lineage_compaction(PROJECT_KEY)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO semantic_lineage_candidates(
+                     candidate_id, project_key, provider_profile_id,
+                     provider_contract_id, language_id,
+                     from_snapshot_fingerprint, from_symbol_id,
+                     to_snapshot_fingerprint, to_symbol_id, state,
+                     ambiguity_group_id, revision, created_at_unix_seconds,
+                     updated_at_unix_seconds, origin_group_id, proposal_origin
+                 ) VALUES(
+                     'legacy-unkeyed', ?1, 'test-main', ?2, 'rust',
+                     'unkeyed-from', ?3, 'unkeyed-to', ?4,
+                     'proposed', 'legacy-unkeyed-group', 0, 1, 1, NULL, 'legacy_v7'
+                 )",
+                params![
+                    PROJECT_KEY,
+                    semantic_provider().id,
+                    semantic_symbol("old_a", "src/old_a.rs", "legacy-old-a").id,
+                    semantic_symbol("new_a", "src/new_a.rs", "legacy-new-a").id,
+                ],
+            )
+            .unwrap();
+
+        let after = store
+            .preview_legacy_lineage_compaction(PROJECT_KEY)
+            .unwrap();
+        assert_eq!(after.compactable_candidate_count, 4);
+        assert_eq!(after.protected_candidate_count, 1);
+        assert_ne!(
+            before.compaction_manifest_hash,
+            after.compaction_manifest_hash
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE semantic_lineage_candidates
+                 SET candidate_id = 'legacy-unkeyed-replacement'
+                 WHERE candidate_id = 'legacy-unkeyed'",
+                [],
+            )
+            .unwrap();
+        let replacement = store
+            .preview_legacy_lineage_compaction(PROJECT_KEY)
+            .unwrap();
+        assert_eq!(replacement.protected_candidate_count, 1);
+        assert_ne!(
+            after.protected_candidate_manifest_hash,
+            replacement.protected_candidate_manifest_hash
+        );
+        assert_ne!(
+            after.compaction_manifest_hash,
+            replacement.compaction_manifest_hash
+        );
+    }
+
+    #[test]
+    fn legacy_compaction_fails_closed_on_cross_project_decision_reference() {
+        let store = BrainStore::open_in_memory().unwrap();
+        insert_legacy_cartesian_fixture(&store, true);
+        store
+            .connection
+            .execute(
+                "INSERT INTO semantic_lineage_decisions(
+                     decision_id, project_key, request_id, request_hash,
+                     candidate_id, action, from_state, to_state,
+                     related_candidate_id, actor_kind, created_at_unix_seconds
+                 ) VALUES(
+                     'cross-project-decision', 'pb_other', 'cross-project-request',
+                     'sha256_invalid-but-irrelevant', 'legacy-candidate-1',
+                     'reject', 'proposed', 'rejected', NULL, 'explicit_user', 1
+                 )",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.preview_legacy_lineage_compaction(PROJECT_KEY),
+            Err(StoreError::Integrity(message)) if message.contains("跨项目")
         ));
     }
 

@@ -140,7 +140,7 @@ impl DatabaseAccessLock {
         Ok(Self { _file: file })
     }
 
-    fn acquire_exclusive(database: &Path, timeout: Duration) -> Result<Self, AppError> {
+    pub(crate) fn acquire_exclusive(database: &Path, timeout: Duration) -> Result<Self, AppError> {
         let path = lock_path(database)?;
         let file = open_lock_file(&path)?;
         let started = Instant::now();

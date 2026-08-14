@@ -724,12 +724,16 @@ project-brain lineage compact-legacy-proposals
 project-brain lineage compact-legacy-proposals \
   --apply \
   --request-id <request-id> \
+  --approved-manifest-hash <dry-run中的compaction_manifest_hash> \
   --human-confirmed
 ```
 
-执行会在同一事务中保存 group/member、候选与证据 manifest hash 及追加式审计，再删除已证明冗余的
-旧 pair/evidence。重放同一 request ID 返回原报告；命令不会执行 `VACUUM`。由旧 token 指纹压缩成的
-group 只保留历史事实，禁止重新 materialize。
+apply 会取得独占协作维护锁，并在 `BEGIN IMMEDIATE` 事务中重新计算完整计划。当前 manifest 与人工
+审核的 hash 不同会以 plan-stale 拒绝，且不会写审计、group 或删除记录；request ID 的参数摘要也绑定
+该 hash，同一 ID 换计划会触发幂等碰撞。计划还会 fail-closed 检查项目与 decision/candidate 的引用归属。
+验证通过后才在同一事务中保存 group/member、候选与证据 manifest hash 及追加式审计，再删除已证明
+冗余的旧 pair/evidence。重放同一 request ID 返回原报告；命令不会执行 `VACUUM`。由旧 token 指纹
+压缩成的 group 只保留历史事实，禁止重新 materialize。可用 `--lock-timeout-seconds` 调整独占锁等待。
 
 ## 数据库维护
 

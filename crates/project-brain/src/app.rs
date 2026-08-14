@@ -3,6 +3,7 @@ use std::{
     env, fs,
     io::{self, Read},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use brain_core::{
@@ -408,6 +409,23 @@ impl App {
     }
 
     pub fn open(explicit_root: Option<PathBuf>) -> Result<Self, AppError> {
+        Self::open_with_database_access(explicit_root, None)
+    }
+
+    pub fn open_exclusive_maintenance(
+        explicit_root: Option<PathBuf>,
+        lock_timeout_seconds: u64,
+    ) -> Result<Self, AppError> {
+        Self::open_with_database_access(
+            explicit_root,
+            Some(Duration::from_secs(lock_timeout_seconds)),
+        )
+    }
+
+    fn open_with_database_access(
+        explicit_root: Option<PathBuf>,
+        exclusive_timeout: Option<Duration>,
+    ) -> Result<Self, AppError> {
         let start = explicit_root.unwrap_or(env::current_dir()?);
         let root = discover_root(&start).ok_or(AppError::ProjectNotInitialized)?;
         let brain_dir = root.join(BRAIN_DIRECTORY);
@@ -423,7 +441,11 @@ impl App {
             fs::write(&config_path, pretty_json(&config)?)?;
         }
         let database = brain_dir.join(DATABASE_FILE);
-        let database_lock = DatabaseAccessLock::acquire_shared(&database)?;
+        let database_lock = if let Some(timeout) = exclusive_timeout {
+            DatabaseAccessLock::acquire_exclusive(&database, timeout)?
+        } else {
+            DatabaseAccessLock::acquire_shared(&database)?
+        };
         database::ensure_no_pending_operation(&database)?;
         let store = BrainStore::open(&database)?;
         Ok(Self {
@@ -1526,6 +1548,7 @@ impl App {
         &self,
         apply: bool,
         request_id: Option<&str>,
+        approved_manifest_hash: Option<&str>,
         human_confirmed: bool,
     ) -> Result<(), AppError> {
         let report = if apply {
@@ -1535,13 +1558,21 @@ impl App {
                     "--apply 必须同时提供非空 --request-id 以保证幂等审计".to_owned(),
                 )
             })?;
-            self.store
-                .apply_legacy_lineage_compaction(&self.config.project_key, request_id)?
-        } else {
-            if request_id.is_some() || human_confirmed {
-                return Err(AppError::Governance(
-                    "dry-run 不接受 --request-id 或 --human-confirmed；只有 --apply 会写数据库"
+            let approved_manifest_hash = approved_manifest_hash.ok_or_else(|| {
+                AppError::Governance(
+                    "--apply 必须提供 dry-run 输出的 --approved-manifest-hash；计划变化时拒绝删除"
                         .to_owned(),
+                )
+            })?;
+            self.store.apply_legacy_lineage_compaction(
+                &self.config.project_key,
+                request_id,
+                approved_manifest_hash,
+            )?
+        } else {
+            if request_id.is_some() || approved_manifest_hash.is_some() || human_confirmed {
+                return Err(AppError::Governance(
+                    "dry-run 不接受 --request-id、--approved-manifest-hash 或 --human-confirmed；只有 --apply 会写数据库".to_owned(),
                 ));
             }
             self.store

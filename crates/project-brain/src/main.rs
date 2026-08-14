@@ -444,6 +444,14 @@ enum LineageCommand {
         #[arg(long)]
         request_id: Option<String>,
 
+        /// apply 模式必填，必须等于本次人工审核的 dry-run manifest
+        #[arg(long)]
+        approved_manifest_hash: Option<String>,
+
+        /// apply 等待独占维护锁的最长秒数（0..=300）
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(0..=300))]
+        lock_timeout_seconds: u64,
+
         /// 确认本次逻辑删除来自显式人工决定
         #[arg(long)]
         human_confirmed: bool,
@@ -894,65 +902,89 @@ fn main() -> ExitCode {
                 ),
             })
         }
-        Command::Lineage { command } => App::open(cli.project_root).and_then(|app| match command {
-            LineageCommand::CompactLegacyProposals {
-                apply,
-                request_id,
-                human_confirmed,
-            } => {
-                app.compact_legacy_lineage_proposals(apply, request_id.as_deref(), human_confirmed)
-            }
-            LineageCommand::Groups { limit } => app.lineage_groups(limit),
-            LineageCommand::Group { group } => app.lineage_group(&group),
-            LineageCommand::Materialize {
-                group,
-                from,
-                to,
-                request_id,
-                human_confirmed,
-            } => {
-                app.materialize_lineage_group_pair(&group, &from, &to, &request_id, human_confirmed)
-            }
-            LineageCommand::Candidates {
-                state,
-                snapshot,
-                ambiguity_group,
-                limit,
-            } => app.lineage_candidates(
-                state.map(Into::into),
-                snapshot.as_deref(),
-                ambiguity_group.as_deref(),
-                limit,
-            ),
-            LineageCommand::Confirm {
-                candidate,
-                request_id,
-                actor_ref,
-                reason,
-                supersede,
-                human_confirmed,
-            } => app.confirm_lineage(
-                &candidate,
-                &request_id,
-                actor_ref.as_deref(),
-                reason.as_deref(),
-                supersede.as_deref(),
-                human_confirmed,
-            ),
-            LineageCommand::Reject {
-                candidate,
-                request_id,
-                actor_ref,
-                reason,
-                human_confirmed,
-            } => app.reject_lineage(
-                &candidate,
-                &request_id,
-                actor_ref.as_deref(),
-                reason.as_deref(),
-                human_confirmed,
-            ),
-        }),
+        Command::Lineage { command } => {
+            let exclusive_timeout = match &command {
+                LineageCommand::CompactLegacyProposals {
+                    apply: true,
+                    lock_timeout_seconds,
+                    ..
+                } => Some(*lock_timeout_seconds),
+                _ => None,
+            };
+            let app = if let Some(timeout) = exclusive_timeout {
+                App::open_exclusive_maintenance(cli.project_root, timeout)
+            } else {
+                App::open(cli.project_root)
+            };
+            app.and_then(|app| match command {
+                LineageCommand::CompactLegacyProposals {
+                    apply,
+                    request_id,
+                    approved_manifest_hash,
+                    lock_timeout_seconds: _,
+                    human_confirmed,
+                } => app.compact_legacy_lineage_proposals(
+                    apply,
+                    request_id.as_deref(),
+                    approved_manifest_hash.as_deref(),
+                    human_confirmed,
+                ),
+                LineageCommand::Groups { limit } => app.lineage_groups(limit),
+                LineageCommand::Group { group } => app.lineage_group(&group),
+                LineageCommand::Materialize {
+                    group,
+                    from,
+                    to,
+                    request_id,
+                    human_confirmed,
+                } => app.materialize_lineage_group_pair(
+                    &group,
+                    &from,
+                    &to,
+                    &request_id,
+                    human_confirmed,
+                ),
+                LineageCommand::Candidates {
+                    state,
+                    snapshot,
+                    ambiguity_group,
+                    limit,
+                } => app.lineage_candidates(
+                    state.map(Into::into),
+                    snapshot.as_deref(),
+                    ambiguity_group.as_deref(),
+                    limit,
+                ),
+                LineageCommand::Confirm {
+                    candidate,
+                    request_id,
+                    actor_ref,
+                    reason,
+                    supersede,
+                    human_confirmed,
+                } => app.confirm_lineage(
+                    &candidate,
+                    &request_id,
+                    actor_ref.as_deref(),
+                    reason.as_deref(),
+                    supersede.as_deref(),
+                    human_confirmed,
+                ),
+                LineageCommand::Reject {
+                    candidate,
+                    request_id,
+                    actor_ref,
+                    reason,
+                    human_confirmed,
+                } => app.reject_lineage(
+                    &candidate,
+                    &request_id,
+                    actor_ref.as_deref(),
+                    reason.as_deref(),
+                    human_confirmed,
+                ),
+            })
+        }
         Command::Database { command } => match command {
             DatabaseCommand::Stats => App::database_stats(cli.project_root),
             DatabaseCommand::Compact {

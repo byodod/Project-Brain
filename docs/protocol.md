@@ -505,6 +505,9 @@ V8 的 ambiguity 属于 `semantic_lineage_groups`；candidate 的旧 `ambiguity_
 9. 不自动确认、拒绝竞争项、supersede、延伸传递 lineage、修改 symbol ID、恢复 tombstone、改写
    snapshot 或跨 provider 建 equivalence；
 10. 已导入但不是当前最新的历史 snapshot 不能重新应用为当前符号图。
+11. V7 逻辑压缩的 dry-run manifest 覆盖完整候选分类、受保护身份、精确 deletion set 摘要和目标 group；apply 必须
+    在独占协作维护锁与 immediate 事务内重新计划，并与显式批准的 manifest hash 相等。任何计划漂移或
+    decision/candidate 跨项目引用都 fail-closed，request ID 同时绑定 operation version 与批准 hash。
 
 SQLite schema v16 保存 semantic snapshots、source attestations、source manifests、symbol observations、
 lineage groups/members/generation runs、candidate/evidence/decision 与 legacy compaction audit。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升
@@ -516,8 +519,10 @@ lineage groups/members/generation runs、candidate/evidence/decision 与 legacy 
 V7 legacy compaction 默认是 dry-run。只有一个 group 的所有行仍为 `proposed`、每条恰有一份
 `project-brain-lineage` version 1 evidence、没有 decision/related decision 引用，且按 kind 与 definition
 fingerprint 重建后的实际 pair 集精确等于 from×to，才可进入 apply。任何缺行、附加证据、裁决或损坏
-observation 都保护整个 group。apply 先保存 group/member 与 append-only compaction audit，再在同一事务
-删除对应 evidence/candidate；不执行 `VACUUM`，压缩后的 legacy group 不得重新物化。
+observation 都保护整个 group。apply 必须携带人工审核的 dry-run manifest hash，在独占协作维护锁和
+immediate 事务内重新计划；计划漂移或跨项目引用直接拒绝。验证一致后先保存 group/member 与
+append-only compaction audit，再在同一事务删除对应 evidence/candidate；不执行 `VACUUM`，压缩后的
+legacy group 不得重新物化。
 
 物理文件维护使用独立的 Database Maintenance Protocol v1：`database stats` 以只读连接和一致性事务
 读取当前 schema，不初始化或迁移数据库；`database compact` 的 dry-run 计算全库逻辑清单、文件摘要
