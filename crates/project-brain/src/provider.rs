@@ -1,11 +1,10 @@
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use brain_core::SemanticProviderProfile;
@@ -21,8 +20,14 @@ use crate::{
     },
 };
 
+pub(crate) use crate::execution::ProcessResult;
+
+#[cfg(test)]
+pub(crate) use crate::execution::CapturedOutput;
+#[cfg(test)]
+use crate::execution::MAX_CAPTURE_BYTES;
+
 const PROVIDER_SCHEMA_VERSION: u32 = 1;
-const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 const MAX_SCIP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
 const AUDIT_RETAIN_BYTES: usize = 2 * 1024 * 1024;
@@ -293,21 +298,6 @@ impl Drop for ProviderRun {
             let _ = fs::remove_dir_all(&self.temp_dir);
         }
     }
-}
-
-pub(crate) struct ProcessResult {
-    pub status: ExitStatus,
-    pub timed_out: bool,
-    pub duration: Duration,
-    pub stdout: CapturedOutput,
-    pub stderr: CapturedOutput,
-}
-
-pub(crate) struct CapturedOutput {
-    pub bytes: Vec<u8>,
-    pub total_bytes: usize,
-    pub sha256: String,
-    pub truncated: bool,
 }
 
 #[allow(
@@ -1314,10 +1304,9 @@ pub(crate) fn provider_cli_path(path: &Path) -> String {
     }
 }
 
-fn configure_provider_environment(
-    command: &mut Command,
+fn provider_environment(
     repository_root: Option<&Path>,
-) -> Result<(), AppError> {
+) -> Result<Vec<(OsString, OsString)>, AppError> {
     const ALLOWED: [&str; 22] = [
         "SystemRoot",
         "WINDIR",
@@ -1342,19 +1331,19 @@ fn configure_provider_environment(
         "ProgramData",
         "CommonProgramFiles",
     ];
-    command
-        .env_clear()
-        .env("NO_COLOR", "1")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+    let mut environment = vec![
+        (OsString::from("NO_COLOR"), OsString::from("1")),
+        (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
+    ];
     for name in ALLOWED {
         if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
+            environment.push((OsString::from(name), value));
         }
     }
     if let Some(path) = sanitized_path(repository_root)? {
-        command.env("PATH", path);
+        environment.push((OsString::from("PATH"), path));
     }
-    Ok(())
+    Ok(environment)
 }
 
 fn sanitized_path(repository_root: Option<&Path>) -> Result<Option<std::ffi::OsString>, AppError> {
@@ -1452,79 +1441,23 @@ fn run_process_with_environment_inner(
     environment: &[(&str, &Path)],
     observe_timeout: bool,
 ) -> Result<ProcessResult, AppError> {
-    let mut command = Command::new(executable);
-    if let Some(script) = launcher_script {
-        command.arg(provider_cli_path(script));
-    }
-    command
-        .args(arguments)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_provider_environment(&mut command, repository_root)?;
+    let mut owned_environment = provider_environment(repository_root)?;
     for (name, value) in environment {
-        command.env(name, value);
+        owned_environment.push((OsString::from(name), value.as_os_str().to_os_string()));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let started = Instant::now();
-    let mut child = command.spawn().map_err(|error| {
-        AppError::Provider(format!(
-            "无法启动 Provider {}：{error}",
-            executable.display()
-        ))
-    })?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::Provider("无法捕获 Provider stdout".to_owned()))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| AppError::Provider("无法捕获 Provider stderr".to_owned()))?;
-    let stdout_reader = thread::spawn(move || drain_bounded(stdout));
-    let stderr_reader = thread::spawn(move || drain_bounded(stderr));
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if started.elapsed() >= timeout {
-            terminate_process_tree(&mut child);
-            let status = child.wait()?;
-            if !observe_timeout {
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(AppError::Provider(format!(
-                    "Provider 超时（{} 秒）并已终止",
-                    timeout.as_secs()
-                )));
-            }
-            timed_out = true;
-            break status;
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| AppError::Provider("Provider stdout reader 异常退出".to_owned()))??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| AppError::Provider("Provider stderr reader 异常退出".to_owned()))??;
-    Ok(ProcessResult {
-        status,
-        timed_out,
-        duration: started.elapsed(),
-        stdout,
-        stderr,
-    })
+    crate::execution::run_contained(
+        executable,
+        launcher_script,
+        arguments,
+        cwd,
+        timeout,
+        &owned_environment,
+        observe_timeout,
+    )
 }
 
-fn drain_bounded(mut stream: impl Read) -> Result<CapturedOutput, std::io::Error> {
+#[cfg(test)]
+fn drain_bounded(mut stream: impl std::io::Read) -> Result<CapturedOutput, std::io::Error> {
     let mut captured = Vec::new();
     let mut digest = Sha256::new();
     let mut total_bytes = 0_usize;
@@ -1544,40 +1477,6 @@ fn drain_bounded(mut stream: impl Read) -> Result<CapturedOutput, std::io::Error
         let remaining = MAX_CAPTURE_BYTES.saturating_sub(captured.len());
         captured.extend_from_slice(&chunk[..read.min(remaining)]);
     }
-}
-
-#[cfg(unix)]
-fn terminate_process_tree(child: &mut Child) {
-    let pid = child.id();
-    let kill = ["/bin/kill", "/usr/bin/kill"]
-        .iter()
-        .map(Path::new)
-        .find(|candidate| candidate.is_file());
-    if let Some(kill) = kill {
-        let _ = Command::new(kill)
-            .args(["-KILL", &format!("-{pid}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.kill();
-}
-
-#[cfg(target_os = "windows")]
-fn terminate_process_tree(child: &mut Child) {
-    let system_root =
-        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
-    let taskkill = system_root.join("System32/taskkill.exe");
-    if taskkill.is_file() {
-        let _ = Command::new(taskkill)
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.kill();
 }
 
 pub(crate) fn version_text(process: &ProcessResult) -> Result<String, AppError> {

@@ -42,7 +42,8 @@ Provider 的 fail-closed 表示“不产生 semantic truth”，不是“阻止 
 Runner 保证 Project Brain 自身不执行仓库声明的命令；它不是通用 OS sandbox。受信任 indexer
 可能调用 Cargo、proc macro、build script、.NET 工具或 Python 环境。scip-dotnet adapter 默认加入
 `--skip-dotnet-restore`，但用户仍需把语言工具链视为独立信任面。Windows 当前使用 `taskkill /T`
-终止进程树，Unix 使用独立 process group；更强的 Job Object/sandbox 是后续隔离层。
+终止进程树，Unix 使用独立 process group；更强的 Job Object/sandbox 是后续隔离层。该终止策略
+已由 [ADR-0035](0035-external-process-tree-containment.md) 的启动时进程树容器取代。
 
 ## 验收不变量
 

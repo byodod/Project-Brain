@@ -7,6 +7,7 @@ mod codex;
 mod database;
 mod error;
 mod evidence;
+mod execution;
 mod git;
 mod godot;
 mod index;

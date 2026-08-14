@@ -631,7 +631,9 @@ project-brain provider index --profile rust-main --timeout-seconds 300
 
 Runner 从固定 adapter 构造 argv，不接收仓库命令或任意参数，不使用 shell；它固定 executable/
 Node entrypoint 哈希，并对 scip-python 固定完整 npm 包清单哈希。Runner 关闭 stdin，使用环境白名单和净化后的 `PATH`，把输出写入机器私有临时目录，
-限制并完整哈希 stdout/stderr，并按项目、profile、worktree 使用 OS 文件锁。索引前后及 SCIP 解析后
+限制并完整哈希 stdout/stderr，并按项目、profile、worktree 使用 OS 文件锁。所有 Evidence Runner 外部进程在启动时
+即进入受控进程树：Windows 使用 race-free Job Object，Unix 使用可用的 cgroup/process-group；根进程
+自然退出或超时后都会先清空完整进程树，再接受任何产物。索引前后及 SCIP 解析后
 都会核对完整工作区内容指纹；源码变化、超时、非零退出、二进制漂移、链接输出、过大/非法 SCIP
 均不会提交 semantic snapshot。过程 provenance 与失败只写入机器级有界 JSONL audit。
 
@@ -882,8 +884,8 @@ crates/
   Prime Agent 已有独立 direct adapter，但用户级 Extension 安装器与 doctor 尚未实现。
 - Godot Engine Provider、Evidence ledger、Hook 失效传播、.NET/Rust/Python Build Provider v1、Godot
   C# RuntimeArtifactBundle CAS、隔离 Godot headless Runtime Evidence v1、Test plane/finding 显式
-  effect 映射核心，以及 .NET、Rust、Python、Godot Scenario Test Provider v1 已完成；其他语言与更强
-  OS 沙箱仍未完成，不能声称全部治理能力已经完结。
+  effect 映射核心，以及 .NET、Rust、Python、Godot Scenario Test Provider v1 已完成；其他语言与
+  网络/文件系统级 OS 沙箱仍未完成，不能声称全部治理能力已经完结。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。
@@ -894,9 +896,10 @@ crates/
   `stable_complete`。scip-python 0.6.6 的官方 npm 包在原生 Windows 存在启动缺陷；本仓库用固定整包
   清单的审计补丁验证了后续链路，但这不是对官方原包 Windows 可用性的声明。Linux/macOS 仍需在
   对应平台 CI 中补充真实 producer 资格证据。
-- Runner 保证自身不执行仓库声明的命令，但语言 indexer、Cargo/build script/proc macro、.NET 和
-  Python 环境仍是独立信任面；当前版本不是通用 OS 沙箱。Windows 超时使用 `taskkill /T`，Unix
-  使用独立 process group；尚未提供 Windows Job Object 级的强隔离证明。
+- Runner 保证自身不执行仓库声明的命令，并已为全部 Evidence/Provider 外部执行加入进程树生命周期隔离：Windows 使用
+  Job Object，Unix 使用可用的 cgroup/process-group；根进程自然退出或超时后必须先清空子孙进程。
+  这仍不是网络、文件系统或权限沙箱；语言 indexer、Cargo/build script/proc macro、.NET、Python
+  环境与仓库测试代码仍是独立信任面，Unix process-group fallback 也不能阻止主动 `setsid` 逃逸。
 - syntax fallback 不自动关联 rename/move lineage；这必须由语义证据或显式确认完成。
 - semantic lineage 当前只支持同项目、同 provider profile/contract、同语言、相邻快照的一对一
   predecessor/successor；split/merge、跨 provider equivalence 和传递闭包不在本阶段。

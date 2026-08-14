@@ -115,6 +115,9 @@ entrypoint SHA-256。scip-python 额外校验 package.json 的官方包身份、
 有界文件清单哈希，避免只固定薄入口而遗漏 `dist/` 传递 bundle。Runner 仅对三种已知 adapter 构造
 固定 argv，拒绝仓库内 executable、相对路径、Windows shell shim 和任意 repo args。Windows 内部
 可继续使用 verbatim canonical path，但传给不接受 `\\?\` 的 producer argv/JS 入口会转换为等价本机路径。
+所有 Semantic、Engine、Build、Test、Runtime 外部执行在受控 spawn 时即进入统一进程树容器；
+Windows 使用 Job Object，Unix 使用可用的 cgroup/process-group。根进程退出或超时后，Runner 先
+清空并确认完整进程树，再收尾输出、验证产物。该合同只约束进程生命周期，不是网络/文件系统沙箱。
 外部进程运行期间不持有 SQLite 写事务；只有输出、provenance、
 profile/root 与工作区前后指纹全部通过后，才进入 semantic snapshot 事务。
 
@@ -275,7 +278,7 @@ Extension 安装器仍留在后续阶段。
    机器级内容寻址存储，以不可变 RuntimeArtifactBundle 绑定精确文件字节与主程序集。下一阶段从该
    bundle 建立的隔离 Godot headless Runtime Provider 已通过真实项目的连续确定性运行；.NET、Rust、
    Python 与 Godot Scenario Test 已使用独立 Test Plane，finding 到规则的阻断仍必须显式映射。下一阶段
-   增加其他语言合同、更强 OS 隔离与更多真实项目重复运行证明。
+   增加其他语言合同、网络/文件系统级 OS 隔离与更多真实项目重复运行证明。
 6. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
    直接 hard block。
 
@@ -306,4 +309,5 @@ Extension 安装器仍留在后续阶段。
 [ADR-0031](adr/0031-crash-safe-database-compaction.md) 与
 [ADR-0032](adr/0032-post-tool-source-fingerprint-reconciliation.md)、
 [ADR-0033](adr/0033-approved-legacy-lineage-compaction-plan.md) 与
-[ADR-0034](adr/0034-mandatory-online-backup-before-lineage-deletion.md)。
+[ADR-0034](adr/0034-mandatory-online-backup-before-lineage-deletion.md) 与
+[ADR-0035](adr/0035-external-process-tree-containment.md)。
