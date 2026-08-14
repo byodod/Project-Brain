@@ -63,7 +63,7 @@ project-brain bootstrap
 project-brain install-hooks codex
 project-brain install-hooks pi
 project-brain install-hooks opencode
-project-brain --dsh-profile default install-hooks dsh
+project-brain --dsh-profile <实际-profile> install-hooks dsh
 ```
 
 接入位置：
@@ -75,7 +75,9 @@ project-brain --dsh-profile default install-hooks dsh
   一次的模拟续轮。
 - OpenCode：`$OPENCODE_CONFIG_DIR/plugins/project-brain.js`，默认位于
   `~/.config/opencode/plugins/project-brain.js`。
-- dsh：通过 `dsh plugin --profile <name> add/remove` 管理指定 profile，不修改其它 profile。
+- dsh：通过 `dsh plugin --profile <name> add/remove` 管理指定 profile，不修改其它 profile。这里的 profile
+  必须与实际启动命令一致；例如 `dsh web` 对应 `web`，不是会话界面中的 Agent preset 名称。安装或卸载后
+  需要重启正在运行的 DSH 进程。
 
 dsh 还依赖其自身的 CLI 和 profile 包管理器。远程 npm 来源验收、Windows CLI 发现、生命周期证据及
 常见问题见 [dsh 接入、远程安装与验收](dsh-integration.md)。
@@ -93,7 +95,7 @@ dsh 还依赖其自身的 CLI 和 profile 包管理器。远程 npm 来源验收
 project-brain doctor codex
 project-brain doctor pi
 project-brain doctor opencode
-project-brain --dsh-profile default doctor dsh
+project-brain --dsh-profile <实际-profile> doctor dsh
 ```
 
 查看 Agent 的机器可读能力：
@@ -117,7 +119,7 @@ Pi 的 `continue_after_stop` 为 `emulated`，OpenCode 为 `unsupported`；这�
 project-brain uninstall-hooks codex
 project-brain uninstall-hooks pi
 project-brain uninstall-hooks opencode
-project-brain --dsh-profile default uninstall-hooks dsh
+project-brain --dsh-profile <实际-profile> uninstall-hooks dsh
 ```
 
 卸载 Agent 接入不会删除项目的 `.project-brain/brain.db`、审计历史或仓库规则。

@@ -36,13 +36,19 @@ SHA-256，以及 `node_modules/@byodod/project-brain/vendor/<target>/` 中原生
 
 ## 安装 dsh profile Plugin
 
-profile 必须显式选择。例如当前 dsh preset 为 `cordis`：
+profile 必须按 **DSH 实际启动命令** 显式选择，不能根据会话界面显示的 Agent preset 名称猜测。
+例如 `dsh web` 是 `dsh --profile web` 的别名，因此监听网页端口的进程必须安装到 `web` profile：
 
 ```text
-project-brain --dsh-profile cordis install-hooks dsh
-project-brain --dsh-profile cordis doctor dsh
+project-brain --dsh-profile web install-hooks dsh
+project-brain --dsh-profile web doctor dsh
 project-brain capabilities dsh
 ```
+
+如果实际通过 `dsh --profile cordis ...` 启动，才应选择 `cordis`。DSH 设置中的
+`agent-presets.default: cordis` 只决定新会话默认使用哪个 Agent preset，不会把 `dsh web` 的运行时
+profile 改成 `cordis`。安装或卸载 profile Plugin 后，应重启对应 DSH 进程；仅新建会话不足以让已经运行的
+进程重新组合 profile。
 
 不要为验证 dsh 而安装 Codex Hook。只有同一仓库确实还使用 Codex 时，才独立执行
 `project-brain install-hooks codex`。
@@ -58,6 +64,11 @@ dsh 接入至少需要同时证明：
    `agent/turn-stopping` 四个治理边界；
 5. 工具前 deny、工具后 context 和 Stop continuation 的实际返回值符合协议。
 
+其中至少应有一次真实会话验收：不要直接运行 `project-brain dispatch`，而是让 Agent 正常调用其工具，
+确认界面出现 Project Brain 上下文或拒绝反馈，并在 `project-brain audit` 中出现该真实 session 的
+`session_opened`、`intent_declared` 和工具事件。手工调用 `dispatch dsh` 只能证明适配协议，不能证明正在
+运行的 DSH profile 已加载 Plugin。
+
 `codex-probe`、Codex app-server 会话或 Codex Hook 审计都不能充当上述 dsh 证据。若项目另有 Codex
 验收，应单独标记并设置确定性超时，避免它阻塞 dsh 安装判断。
 
@@ -70,5 +81,6 @@ dsh 接入至少需要同时证明：
 | dsh profile 初始化时找不到 pnpm | 前置条件 | 先由用户安装或启用 pnpm，再重试；Project Brain 不擅自安装工具链 |
 | Windows PATH 中只有 npm 的 `dsh.cmd`，裸 `dsh` 启动失败 | Project Brain 缺陷 | 自动发现 `.exe/.cmd/.bat`；仍可用精确环境变量覆盖 |
 | `doctor` 因语义 Provider 未绑定而显示 degraded | 配置状态 | 单独检查 `adapter_hooks`；Provider 绑定属于语言证据配置，不等同于 dsh Hook 失败 |
+| 把 Agent preset 名称当作 DSH profile | 操作问题 | 以启动命令为准；`dsh web` 安装到 `web`，`agent-presets.default` 与运行时 profile 无关 |
+| `doctor` 通过但真实网页会话没有 Project Brain 事件 | 运行时未加载 | 检查 Plugin 是否安装到正在运行的 profile，并在安装后重启该 DSH 进程 |
 | Codex probe 长时间无进展 | 外部验收问题 | 不计入 dsh 结果；Codex 验收必须设置超时并独立记录 |
-
