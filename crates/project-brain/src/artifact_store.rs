@@ -12,7 +12,7 @@ use crate::{
     build::{ArtifactEntry, ArtifactManifest},
     error::AppError,
     provider,
-    setup::{MutationLock, resolve_install_root},
+    setup::{MutationLock, canonical_directory_boundary, resolve_install_root},
 };
 
 const STORE_SCHEMA_VERSION: u32 = 1;
@@ -96,15 +96,9 @@ pub(crate) fn promote_runtime_bundle(
     artifact_root: &Path,
     artifact_manifest: &ArtifactManifest,
 ) -> Result<RuntimeArtifactBundleReceipt, AppError> {
-    let install_root = resolve_install_root(explicit_install_root)?;
+    let install_root = canonical_directory_boundary(&resolve_install_root(explicit_install_root)?)?;
     let canonical_project_root = project_root.canonicalize()?;
-    let project_boundary = PathBuf::from(provider::provider_cli_path(&canonical_project_root));
-    let install_boundary = PathBuf::from(provider::provider_cli_path(&install_root));
-    if install_boundary.starts_with(&project_boundary)
-        || install_root.canonicalize().is_ok_and(|path| {
-            PathBuf::from(provider::provider_cli_path(&path)).starts_with(&project_boundary)
-        })
-    {
+    if install_root.starts_with(&canonical_project_root) {
         return Err(AppError::Provider(
             "机器级 artifact store 不得位于项目工作树内".to_owned(),
         ));

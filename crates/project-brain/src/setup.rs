@@ -1,8 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, ExitCode, Stdio},
 };
 
@@ -816,6 +818,77 @@ pub(crate) fn resolve_install_root(explicit: Option<&Path>) -> Result<PathBuf, A
     ))
 }
 
+/// 解析一个预期为目录的边界路径，即使末尾目录尚未创建，也先解析最近的现有祖先。
+///
+/// 这避免把 macOS `/var` 与 `/private/var`、Windows 大小写/短名称，以及现有目录
+/// 中的符号链接当成不同边界。返回值可直接作为后续写入根，确保检查与实际写入使用
+/// 同一条规范路径。
+pub(crate) fn canonical_directory_boundary(path: &Path) -> Result<PathBuf, AppError> {
+    let normalized = normalize_absolute_path(path)?;
+    let mut cursor = normalized.as_path();
+    let mut missing = Vec::<OsString>::new();
+
+    loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(_) => {
+                let mut resolved = cursor.canonicalize()?;
+                if !resolved.is_dir() {
+                    return Err(AppError::Setup(format!(
+                        "机器级目录边界的现有祖先不是目录：{}",
+                        cursor.display()
+                    )));
+                }
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = cursor.file_name().ok_or_else(|| {
+                    AppError::Setup(format!(
+                        "找不到机器级目录边界的现有祖先：{}",
+                        normalized.display()
+                    ))
+                })?;
+                missing.push(component.to_os_string());
+                cursor = cursor.parent().ok_or_else(|| {
+                    AppError::Setup(format!(
+                        "找不到机器级目录边界的现有祖先：{}",
+                        normalized.display()
+                    ))
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, AppError> {
+    let absolute = absolute_path(path)?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    return Err(AppError::Setup(format!(
+                        "机器级目录边界试图越过文件系统根：{}",
+                        path.display()
+                    )));
+                }
+                normalized.pop();
+            }
+        }
+    }
+    Ok(normalized)
+}
+
 fn resolve_codex_home(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
     if let Some(path) = explicit {
         return absolute_path(path);
@@ -1411,9 +1484,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        MutationLock, ProjectRegistry, append_managed_groups, handler_hashes, install_codex_hooks,
-        managed_handlers, observed_managed_hashes, read_json, remove_managed_handlers,
-        stable_launcher_path,
+        MutationLock, ProjectRegistry, append_managed_groups, canonical_directory_boundary,
+        handler_hashes, install_codex_hooks, managed_handlers, observed_managed_hashes, read_json,
+        remove_managed_handlers, stable_launcher_path,
     };
 
     fn temp_root(label: &str) -> std::path::PathBuf {
@@ -1427,6 +1500,23 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn canonical_directory_boundary_resolves_missing_suffixes_against_existing_ancestor() {
+        let root = temp_root("canonical-boundary");
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+
+        let project_boundary = canonical_directory_boundary(&project).unwrap();
+        let nested =
+            canonical_directory_boundary(&project.join("missing").join("..").join("machine-state"))
+                .unwrap();
+        let sibling = canonical_directory_boundary(&root.join("machine-state")).unwrap();
+
+        assert!(nested.starts_with(&project_boundary));
+        assert!(!sibling.starts_with(&project_boundary));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

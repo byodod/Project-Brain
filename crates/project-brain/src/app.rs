@@ -1552,14 +1552,10 @@ impl App {
         approved_manifest_hash: Option<&str>,
         human_confirmed: bool,
     ) -> Result<(), AppError> {
-        let install_root = setup::resolve_install_root(install_root)?;
-        let project_boundary = PathBuf::from(provider::provider_cli_path(&self.root));
-        let install_boundary = PathBuf::from(provider::provider_cli_path(&install_root));
-        if install_boundary.starts_with(&project_boundary)
-            || install_root.canonicalize().is_ok_and(|path| {
-                PathBuf::from(provider::provider_cli_path(&path)).starts_with(&project_boundary)
-            })
-        {
+        let install_root =
+            setup::canonical_directory_boundary(&setup::resolve_install_root(install_root)?)?;
+        let project_boundary = setup::canonical_directory_boundary(&self.root)?;
+        if install_root.starts_with(&project_boundary) {
             return Err(AppError::Governance(
                 "lineage 删除前备份必须位于项目工作树之外的机器级数据目录".to_owned(),
             ));

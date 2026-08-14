@@ -339,7 +339,7 @@ pub fn bind(
     let project_root = project_root.canonicalize()?;
     let executable = pinned_artifact(executable, "Provider executable")?;
     reject_repository_artifact(&project_root, &executable, "Provider executable")?;
-    reject_windows_command_script(&executable.canonical_path)?;
+    reject_command_script(&executable.canonical_path)?;
     let launcher_script = launcher_script
         .map(|path| pinned_artifact(path, "Provider launcher script"))
         .transpose()?;
@@ -932,7 +932,7 @@ pub(crate) fn pin_external_executable(
 ) -> Result<PinnedExternalExecutable, AppError> {
     let artifact = pinned_artifact(path, label)?;
     reject_repository_artifact(project_root, &artifact, label)?;
-    reject_windows_command_script(&artifact.canonical_path)?;
+    reject_command_script(&artifact.canonical_path)?;
     Ok(PinnedExternalExecutable {
         canonical_path: artifact.canonical_path,
         sha256: artifact.sha256,
@@ -1103,23 +1103,17 @@ fn binding_equivalent(left: &ProviderBinding, right: &ProviderBinding) -> bool {
         && left.resolved_version == right.resolved_version
 }
 
-#[cfg(target_os = "windows")]
-fn reject_windows_command_script(path: &Path) -> Result<(), AppError> {
+fn reject_command_script(path: &Path) -> Result<(), AppError> {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
     if extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat") {
         return Err(AppError::Provider(
-            "拒绝直接执行 .cmd/.bat；请绑定原生 executable，并用 --script 提供已固定哈希的脚本入口"
+            "拒绝直接执行 .cmd/.bat shell shim；请绑定原生 executable，并用 --script 提供已固定哈希的脚本入口"
                 .to_owned(),
         ));
     }
-    Ok(())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn reject_windows_command_script(_path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
@@ -1754,8 +1748,8 @@ mod tests {
     use super::{
         MAX_CAPTURE_BYTES, PROVIDER_SCHEMA_VERSION, ProviderArtifact, ProviderBinding,
         ProviderRegistry, drain_bounded, pinned_artifact, provider_arguments, provider_cli_path,
-        registration_id, reject_repository_artifact, scip_python_package_manifest, trust_status,
-        validate_binding, verify_probe_identity,
+        registration_id, reject_command_script, reject_repository_artifact,
+        scip_python_package_manifest, trust_status, validate_binding, verify_probe_identity,
     };
 
     fn profile(producer: &str) -> SemanticProviderProfile {
@@ -1820,6 +1814,14 @@ mod tests {
             provider_cli_path(Path::new("repo with spaces/index.scip")),
             "repo with spaces/index.scip"
         );
+    }
+
+    #[test]
+    fn command_script_shims_are_rejected_on_every_host_platform() {
+        assert!(reject_command_script(Path::new("provider.cmd")).is_err());
+        assert!(reject_command_script(Path::new("provider.BAT")).is_err());
+        assert!(reject_command_script(Path::new("provider.exe")).is_ok());
+        assert!(reject_command_script(Path::new("provider")).is_ok());
     }
 
     #[test]

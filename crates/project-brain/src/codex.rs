@@ -1297,13 +1297,14 @@ mod tests {
 
     #[test]
     fn structured_write_and_delete_have_whole_file_impacts_but_patch_update_does_not() {
-        let root = Path::new("C:/repo");
+        let root = std::env::temp_dir().join("project-brain-structured-impact-root");
+        let write_path = root.join("src/lib.rs");
         let write = CodexHookInput {
             tool_name: "Write".to_owned(),
-            tool_input: json!({"file_path": "C:/repo/src/lib.rs", "content": "new"}),
+            tool_input: json!({"file_path": write_path, "content": "new"}),
             ..CodexHookInput::default()
         };
-        let write_impacts = deterministic_impacts(root, &write);
+        let write_impacts = deterministic_impacts(&root, &write);
         assert_eq!(write_impacts.len(), 1);
         assert_eq!(write_impacts[0].path, "src/lib.rs");
         assert!(write_impacts[0].whole_file);
@@ -1313,14 +1314,14 @@ mod tests {
             tool_input: json!({"command": "*** Begin Patch\n*** Delete File: src/lib.rs\n*** End Patch"}),
             ..CodexHookInput::default()
         };
-        assert!(deterministic_impacts(root, &delete)[0].whole_file);
+        assert!(deterministic_impacts(&root, &delete)[0].whole_file);
 
         let update = CodexHookInput {
             tool_name: "apply_patch".to_owned(),
             tool_input: json!({"command": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"}),
             ..CodexHookInput::default()
         };
-        assert!(deterministic_impacts(root, &update).is_empty());
+        assert!(deterministic_impacts(&root, &update).is_empty());
     }
 
     #[test]
