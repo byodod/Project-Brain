@@ -461,6 +461,9 @@ enum LineageCommand {
         from: String,
         #[arg(long)]
         to: String,
+        /// 调用者生成的幂等请求 ID；同 ID 不同 pair 会被拒绝
+        #[arg(long)]
+        request_id: String,
         #[arg(long)]
         human_confirmed: bool,
     },
@@ -864,8 +867,11 @@ fn main() -> ExitCode {
                 group,
                 from,
                 to,
+                request_id,
                 human_confirmed,
-            } => app.materialize_lineage_group_pair(&group, &from, &to, human_confirmed),
+            } => {
+                app.materialize_lineage_group_pair(&group, &from, &to, &request_id, human_confirmed)
+            }
             LineageCommand::Candidates {
                 state,
                 snapshot,

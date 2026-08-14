@@ -19,6 +19,7 @@
 - SQLite v8 group-first lineage、SCIP producer signature 证据与线性有界歧义存储。
 - SQLite v9 V7 pair-first 旧账 dry-run/显式幂等压缩、manifest 审计与 legacy group 禁止重新物化。
 - SQLite v10 append-only Provider 稳定性资格；已失败或已过期的资格阻止普通 index 偶然提交。
+- SQLite v15 人工 lineage pair materialization request 审计、幂等重放与 request ID 碰撞拒绝。
 
 ### Security
 

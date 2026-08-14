@@ -1457,7 +1457,7 @@ mod tests {
                 .zip(&current)
                 .all(|(before, after)| before.symbol_id != after.symbol_id)
         );
-        let candidates = propose_lineage_candidates(&old, &current, &[]);
+        let candidates = propose_lineage_candidates(&old, &current, &[]).unwrap();
 
         assert!(!candidates.is_empty());
         assert!(

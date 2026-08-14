@@ -24,7 +24,8 @@ Accepted，2026-08-13。
 4. 普通歧义 group 完整保存 from/to member set 与摘要。单侧超过 4096 members 时保存
    `summary_only`，禁止直接物化。
 5. 用户可以显式从非超大 group 选择一个 from/to member pair；该操作仍只创建 `proposed`，确认
-   继续使用原有 `--human-confirmed`、request ID、revision CAS 与一对一唯一约束。
+继续使用原有 `--human-confirmed`、request ID、revision CAS 与一对一唯一约束；pair materialization
+自身也必须由 request ID 提供幂等重放与碰撞检测，不能只依赖 endpoint 唯一键。
 6. SQLite schema v8 新增 group、member、generation-run 与 candidate origin；V7 candidate 保持原样，
    不在 schema migration 中删除或重新解释。
 7. 旧笛卡尔积行只允许由后续显式 compact 命令处理：先 dry-run，证明 group 可完整重建、实际 pair

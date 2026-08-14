@@ -687,11 +687,13 @@ project-brain lineage materialize \
   --group <group-id> \
   --from <old-symbol-id> \
   --to <new-symbol-id> \
+  --request-id <request-id> \
   --human-confirmed
 ```
 
-`materialize` 仍只产生 `proposed` candidate；随后必须单独 confirm。超过单侧 4096 members 的恶意或
-病态 group 仅保存计数和成员集摘要，不能直接物化。
+`materialize` 仍只产生 `proposed` candidate；随后必须单独 confirm。该命令以 request ID 幂等重放，
+同一 ID 指向不同 group/member pair 时 fail-closed。超过单侧 4096 members 的恶意或病态 group 仅保存
+计数和成员集摘要，不能直接物化。
 
 V7 曾把歧义 group 物化为 pair-first 笛卡尔积。升级不会静默删除这些历史行；先运行只读预演：
 

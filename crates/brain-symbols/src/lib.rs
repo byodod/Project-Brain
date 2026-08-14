@@ -1,8 +1,33 @@
+use std::{error::Error, fmt};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const SYMBOL_PROTOCOL_VERSION: u32 = 2;
 const HIGH_CONFIDENCE_RENAME_BASIS_POINTS: u16 = 5_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineageGenerationError {
+    PairCountOverflow { from_count: u64, to_count: u64 },
+    MemberCountOverflow,
+}
+
+impl fmt::Display for LineageGenerationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PairCountOverflow {
+                from_count,
+                to_count,
+            } => write!(
+                formatter,
+                "lineage group potential pair 计数溢出：{from_count} × {to_count}"
+            ),
+            Self::MemberCountOverflow => formatter.write_str("lineage group member 计数溢出"),
+        }
+    }
+}
+
+impl Error for LineageGenerationError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(transparent)]
@@ -551,17 +576,25 @@ type LineageGroupKey = (
 /// 对相邻快照的 removed/inserted 观察生成可审计 lineage 候选。
 ///
 /// 该函数永远不会自动确认候选、复用 symbol ID 或改写 tombstone。
+///
+/// # Errors
+///
+/// 当成员数或潜在 pair 计数超出可审计整数范围时返回错误，不生成部分结果。
 pub fn propose_lineage_candidates(
     previous: &[LineageSymbolObservation],
     current: &[LineageSymbolObservation],
     path_renames: &[PathRenameEvidence],
-) -> Vec<LineageCandidateProposal> {
-    propose_lineage(previous, current, path_renames).candidates
+) -> Result<Vec<LineageCandidateProposal>, LineageGenerationError> {
+    Ok(propose_lineage(previous, current, path_renames)?.candidates)
 }
 
 /// 先按确定性兼容条件形成 lineage group；只有 1x1 group 会产生 proposed candidate。
 ///
 /// 歧义 group 不物化笛卡尔积 pair，因此存储规模受成员数线性约束。
+///
+/// # Errors
+///
+/// 当成员数或潜在 pair 计数溢出时 fail-closed，避免以饱和值伪造审计统计。
 #[allow(
     clippy::too_many_lines,
     reason = "group-first 生成器在一个确定性流程中计算成员、摘要、容量等级和唯一候选"
@@ -570,7 +603,7 @@ pub fn propose_lineage(
     previous: &[LineageSymbolObservation],
     current: &[LineageSymbolObservation],
     path_renames: &[PathRenameEvidence],
-) -> LineageProposalSet {
+) -> Result<LineageProposalSet, LineageGenerationError> {
     let previous_ids = previous
         .iter()
         .map(|observation| observation.symbol_id.as_str())
@@ -613,9 +646,11 @@ pub fn propose_lineage(
         };
         old_members.sort_by_key(|item| item.symbol_id.as_str());
         new_members.sort_by_key(|item| item.symbol_id.as_str());
-        let from_count = u64::try_from(old_members.len()).unwrap_or(u64::MAX);
-        let to_count = u64::try_from(new_members.len()).unwrap_or(u64::MAX);
-        let potential_pair_count = from_count.saturating_mul(to_count);
+        let from_count = u64::try_from(old_members.len())
+            .map_err(|_| LineageGenerationError::MemberCountOverflow)?;
+        let to_count = u64::try_from(new_members.len())
+            .map_err(|_| LineageGenerationError::MemberCountOverflow)?;
+        let potential_pair_count = checked_lineage_pair_count(from_count, to_count)?;
         let oversized = old_members.len() > MAX_LINEAGE_GROUP_MEMBERS_PER_SIDE
             || new_members.len() > MAX_LINEAGE_GROUP_MEMBERS_PER_SIDE;
         let unique = old_members.len() == 1 && new_members.len() == 1;
@@ -689,7 +724,19 @@ pub fn propose_lineage(
         (&left.from_symbol, &left.to_symbol).cmp(&(&right.from_symbol, &right.to_symbol))
     });
     groups.sort_by(|left, right| left.group_id.cmp(&right.group_id));
-    LineageProposalSet { groups, candidates }
+    Ok(LineageProposalSet { groups, candidates })
+}
+
+fn checked_lineage_pair_count(
+    from_count: u64,
+    to_count: u64,
+) -> Result<u64, LineageGenerationError> {
+    from_count
+        .checked_mul(to_count)
+        .ok_or(LineageGenerationError::PairCountOverflow {
+            from_count,
+            to_count,
+        })
 }
 
 fn lineage_group_key(
@@ -833,10 +880,10 @@ fn update_digest(hasher: &mut Sha256, part: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        IdentityQuality, LineageConfidence, LineageEvidence, LineageSymbolObservation,
-        PathRenameEvidence, ProviderDescriptor, SourceFileState, SourceLanguage, SymbolNode,
-        SymbolNodeInput, SymbolStatus, encode_provider_key, propose_lineage,
-        propose_lineage_candidates,
+        IdentityQuality, LineageConfidence, LineageEvidence, LineageGenerationError,
+        LineageSymbolObservation, PathRenameEvidence, ProviderDescriptor, SourceFileState,
+        SourceLanguage, SymbolNode, SymbolNodeInput, SymbolStatus, checked_lineage_pair_count,
+        encode_provider_key, propose_lineage, propose_lineage_candidates,
     };
 
     const PROJECT_KEY: &str = "project_alpha";
@@ -1096,7 +1143,8 @@ mod tests {
             &[lineage_observation("old", "old-id", "before", "src/lib.rs")],
             &[lineage_observation("new", "new-id", "after", "src/lib.rs")],
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(renamed.len(), 1);
         assert_eq!(renamed[0].ambiguity_group_id, None);
         assert_eq!(renamed[0].confidence, LineageConfidence::High);
@@ -1110,7 +1158,8 @@ mod tests {
                 new_path: "src/b.rs".to_owned(),
                 similarity_basis_points: 10_000,
             }],
-        );
+        )
+        .unwrap();
         assert_eq!(moved[0].ambiguity_group_id, None);
         assert_eq!(moved[0].confidence, LineageConfidence::High);
     }
@@ -1120,7 +1169,7 @@ mod tests {
         let old = lineage_observation("old", "old-id", "run", "src/lib.rs");
         let first = lineage_observation("new", "new-a", "run_a", "src/a.rs");
         let second = lineage_observation("new", "new-b", "run_b", "src/b.rs");
-        let proposals = propose_lineage(&[old], &[first, second], &[]);
+        let proposals = propose_lineage(&[old], &[first, second], &[]).unwrap();
 
         assert!(proposals.candidates.is_empty());
         assert_eq!(proposals.groups.len(), 1);
@@ -1140,7 +1189,7 @@ mod tests {
             .map(|index| lineage_observation("new", &format!("new-{index}"), "run", "src/new.rs"))
             .collect::<Vec<_>>();
 
-        let proposals = propose_lineage(&previous, &current, &[]);
+        let proposals = propose_lineage(&previous, &current, &[]).unwrap();
 
         assert!(proposals.candidates.is_empty());
         assert_eq!(proposals.groups.len(), 1);
@@ -1153,7 +1202,11 @@ mod tests {
     fn unchanged_symbol_ids_do_not_create_lineage_candidates() {
         let old = lineage_observation("old", "stable-id", "run", "src/lib.rs");
         let current = lineage_observation("new", "stable-id", "run", "src/lib.rs");
-        assert!(propose_lineage_candidates(&[old], &[current], &[]).is_empty());
+        assert!(
+            propose_lineage_candidates(&[old], &[current], &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1162,7 +1215,11 @@ mod tests {
         let mut other = lineage_observation("new", "new-id", "run", "src/lib.rs");
         other.project_key = "project_beta".to_owned();
 
-        assert!(propose_lineage_candidates(&[old], &[other], &[]).is_empty());
+        assert!(
+            propose_lineage_candidates(&[old], &[other], &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1172,12 +1229,17 @@ mod tests {
         other_provider.provider_contract_id = "scip-secondary".to_owned();
         assert!(
             propose_lineage_candidates(std::slice::from_ref(&old), &[other_provider], &[])
+                .unwrap()
                 .is_empty()
         );
 
         let mut other_language = lineage_observation("new", "new-id", "run", "src/lib.rs");
         other_language.language = SourceLanguage::python();
-        assert!(propose_lineage_candidates(&[old], &[other_language], &[]).is_empty());
+        assert!(
+            propose_lineage_candidates(&[old], &[other_language], &[])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1193,7 +1255,8 @@ mod tests {
                 new_path: "src/b.rs".to_owned(),
                 similarity_basis_points: 0,
             }],
-        );
+        )
+        .unwrap();
         assert_eq!(low[0].confidence, LineageConfidence::Medium);
 
         let invalid = propose_lineage_candidates(
@@ -1204,7 +1267,8 @@ mod tests {
                 new_path: "src/b.rs".to_owned(),
                 similarity_basis_points: 10_001,
             }],
-        );
+        )
+        .unwrap();
         assert_eq!(invalid[0].confidence, LineageConfidence::Medium);
         assert!(
             invalid[0]
@@ -1221,6 +1285,21 @@ mod tests {
         let mut current = lineage_observation("new", "new-id", "local", "src/lib.rs");
         current.is_local = true;
 
-        assert!(propose_lineage_candidates(&[old], &[current], &[]).is_empty());
+        assert!(
+            propose_lineage_candidates(&[old], &[current], &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn potential_pair_count_overflow_fails_closed() {
+        assert_eq!(
+            checked_lineage_pair_count(u64::MAX, 2),
+            Err(LineageGenerationError::PairCountOverflow {
+                from_count: u64::MAX,
+                to_count: 2,
+            })
+        );
     }
 }

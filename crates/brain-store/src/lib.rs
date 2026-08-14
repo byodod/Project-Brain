@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const DATABASE_SCHEMA_VERSION: i64 = 14;
+const DATABASE_SCHEMA_VERSION: i64 = 15;
 const LEGACY_LINEAGE_ALGORITHM_ID: &str = "project-brain-lineage";
 const LEGACY_LINEAGE_ALGORITHM_VERSION: &str = "1";
 const LEGACY_COMPACTION_ALGORITHM_ID: &str = "project-brain-lineage-legacy-compaction";
@@ -436,6 +436,13 @@ pub struct LineageAdjudicationResult {
     pub replayed: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LineageMaterializationResult {
+    pub request_id: String,
+    pub candidate: LineageCandidateRecord,
+    pub replayed: bool,
+}
+
 pub struct BrainStore {
     connection: Connection,
 }
@@ -562,6 +569,7 @@ impl BrainStore {
         self.initialize_evidence_v12_schema()?;
         self.ensure_evidence_v13_schema()?;
         self.ensure_evidence_v14_test_plane()?;
+        self.ensure_lineage_v15_materialization_requests()?;
         self.initialize_adapter_audit_schema()?;
         self.connection.execute(
             "INSERT INTO metadata(key, value) VALUES('schema_version', ?1)
@@ -1069,6 +1077,29 @@ impl BrainStore {
              );
              CREATE INDEX IF NOT EXISTS idx_lineage_compaction_project
                  ON semantic_lineage_compaction_runs(project_key, created_at_unix_seconds DESC);",
+        )?;
+        Ok(())
+    }
+
+    fn ensure_lineage_v15_materialization_requests(&self) -> Result<(), StoreError> {
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS semantic_lineage_materialization_requests (
+                 project_key TEXT NOT NULL,
+                 request_id TEXT NOT NULL,
+                 request_hash TEXT NOT NULL,
+                 group_id TEXT NOT NULL,
+                 from_symbol_id TEXT NOT NULL,
+                 to_symbol_id TEXT NOT NULL,
+                 candidate_id TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 PRIMARY KEY(project_key, request_id),
+                 FOREIGN KEY(group_id)
+                     REFERENCES semantic_lineage_groups(group_id) ON DELETE RESTRICT,
+                 FOREIGN KEY(candidate_id)
+                     REFERENCES semantic_lineage_candidates(candidate_id) ON DELETE RESTRICT
+             );
+             CREATE INDEX IF NOT EXISTS idx_lineage_materialization_candidate
+                 ON semantic_lineage_materialization_requests(project_key, candidate_id);",
         )?;
         Ok(())
     }
@@ -1753,6 +1784,7 @@ impl BrainStore {
             LineageProposalSet::default()
         } else {
             propose_lineage(&previous, observations, path_renames)
+                .map_err(|error| StoreError::InvalidLineage(error.to_string()))?
         };
         let graph = apply_snapshot_transaction(&transaction, snapshot)?;
         let mut candidates_inserted = 0_u64;
@@ -2241,9 +2273,53 @@ impl BrainStore {
         group_id: &str,
         from_symbol_id: &str,
         to_symbol_id: &str,
-    ) -> Result<LineageCandidateRecord, StoreError> {
-        let group = self
-            .connection
+        request_id: &str,
+    ) -> Result<LineageMaterializationResult, StoreError> {
+        if !is_valid_project_key(project_key)
+            || group_id.trim().is_empty()
+            || group_id.len() > 192
+            || from_symbol_id.trim().is_empty()
+            || from_symbol_id.len() > 1_024
+            || to_symbol_id.trim().is_empty()
+            || to_symbol_id.len() > 1_024
+            || request_id.trim().is_empty()
+            || request_id.len() > 192
+        {
+            return Err(StoreError::InvalidLineage(
+                "materialize project/group/member/request 参数无效".to_owned(),
+            ));
+        }
+        let request_hash = lineage_materialization_request_hash(
+            project_key,
+            group_id,
+            from_symbol_id,
+            to_symbol_id,
+            request_id,
+        );
+        let transaction = self.connection.unchecked_transaction()?;
+        let replay = transaction
+            .query_row(
+                "SELECT request_hash, candidate_id
+                 FROM semantic_lineage_materialization_requests
+                 WHERE project_key = ?1 AND request_id = ?2",
+                params![project_key, request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((stored_hash, candidate_id)) = replay {
+            if stored_hash != request_hash {
+                return Err(StoreError::LineageIdempotencyConflict(
+                    request_id.to_owned(),
+                ));
+            }
+            let candidate = lineage_candidate_by_id(&transaction, project_key, &candidate_id)?;
+            return Ok(LineageMaterializationResult {
+                request_id: request_id.to_owned(),
+                candidate,
+                replayed: true,
+            });
+        }
+        let group = transaction
             .query_row(
                 "SELECT project_key, provider_profile_id, provider_contract_id, language_id,
                     from_snapshot_fingerprint, to_snapshot_fingerprint, symbol_kind,
@@ -2286,7 +2362,7 @@ impl BrainStore {
             ));
         }
         for (side, symbol_id) in [("from", from_symbol_id), ("to", to_symbol_id)] {
-            let exists: bool = self.connection.query_row(
+            let exists: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM semantic_lineage_group_members
                  WHERE group_id = ?1 AND side = ?2 AND symbol_id = ?3)",
                 params![group_id, side, symbol_id],
@@ -2314,9 +2390,9 @@ impl BrainStore {
             ))
         );
         let proposal = LineageCandidateProposal {
-            project_key: group.0,
-            provider_profile_id: group.1,
-            provider_contract_id: group.2,
+            project_key: group.0.clone(),
+            provider_profile_id: group.1.clone(),
+            provider_contract_id: group.2.clone(),
             language,
             from_snapshot: group.4.clone(),
             from_symbol: from_symbol_id.to_owned(),
@@ -2325,25 +2401,56 @@ impl BrainStore {
             ambiguity_group_id: None,
             origin_group_id: Some(group_id.to_owned()),
             proposal_origin: "human_group_pair".to_owned(),
-            algorithm_id: group.8,
-            algorithm_version: group.9,
+            algorithm_id: group.8.clone(),
+            algorithm_version: group.9.clone(),
             confidence: LineageConfidence::Low,
             input_fingerprint,
             evidence_fingerprint: format!("sha256_{:x}", Sha256::digest(&evidence_json)),
             evidence,
         };
-        let transaction = self.connection.unchecked_transaction()?;
-        persist_lineage_proposals(&transaction, &[proposal], unix_seconds()?)?;
+        let now = unix_seconds()?;
+        persist_lineage_proposals(&transaction, &[proposal], now)?;
+        let candidate_id: String = transaction.query_row(
+            "SELECT candidate_id FROM semantic_lineage_candidates
+             WHERE project_key = ?1 AND provider_profile_id = ?2
+               AND provider_contract_id = ?3 AND language_id = ?4
+               AND from_snapshot_fingerprint = ?5 AND from_symbol_id = ?6
+               AND to_snapshot_fingerprint = ?7 AND to_symbol_id = ?8",
+            params![
+                project_key,
+                group.1,
+                group.2,
+                group.3,
+                group.4,
+                from_symbol_id,
+                group.5,
+                to_symbol_id,
+            ],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO semantic_lineage_materialization_requests(
+                 project_key, request_id, request_hash, group_id,
+                 from_symbol_id, to_symbol_id, candidate_id, created_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                project_key,
+                request_id,
+                request_hash,
+                group_id,
+                from_symbol_id,
+                to_symbol_id,
+                candidate_id,
+                now,
+            ],
+        )?;
+        let candidate = lineage_candidate_by_id(&transaction, project_key, &candidate_id)?;
         transaction.commit()?;
-        self.list_lineage_candidates(project_key, None, None, None, u32::MAX)?
-            .into_iter()
-            .find(|candidate| {
-                candidate.from_snapshot_fingerprint == group.4
-                    && candidate.from_symbol_id == from_symbol_id
-                    && candidate.to_snapshot_fingerprint == group.5
-                    && candidate.to_symbol_id == to_symbol_id
-            })
-            .ok_or_else(|| StoreError::Integrity("已物化 lineage candidate 无法回读".to_owned()))
+        Ok(LineageMaterializationResult {
+            request_id: request_id.to_owned(),
+            candidate,
+            replayed: false,
+        })
     }
 
     /// 验证 semantic 锚点，并只沿相邻快照中的直接身份或 confirmed lineage 解析到最新符号。
@@ -4560,6 +4667,28 @@ fn lineage_request_hash(
     format!("sha256_{:x}", digest.finalize())
 }
 
+fn lineage_materialization_request_hash(
+    project_key: &str,
+    group_id: &str,
+    from_symbol_id: &str,
+    to_symbol_id: &str,
+    request_id: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    for part in [
+        "materialize_group_pair_v1",
+        project_key,
+        group_id,
+        from_symbol_id,
+        to_symbol_id,
+        request_id,
+    ] {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("sha256_{:x}", digest.finalize())
+}
+
 fn lineage_candidate_by_id(
     connection: &Connection,
     project_key: &str,
@@ -5627,7 +5756,7 @@ mod tests {
         drop(connection);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 14);
+        assert_eq!(migrated.database_schema_version().unwrap(), 15);
         let planes_json: String = migrated
             .connection
             .query_row(
@@ -5693,7 +5822,7 @@ mod tests {
         drop(connection);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 14);
+        assert_eq!(migrated.database_schema_version().unwrap(), 15);
         assert_eq!(migrated.list_evidence_heads(PROJECT_KEY).unwrap().len(), 1);
         let test_snapshot = plane_evidence_snapshot(
             PROJECT_KEY,
@@ -5871,12 +6000,19 @@ mod tests {
         let from_members = members("from");
         let to_members = members("to");
         let mut candidates = Vec::new();
-        for from in &from_members {
-            for to in &to_members {
+        for (from_index, from) in from_members.iter().enumerate() {
+            for (to_index, to) in to_members.iter().enumerate() {
                 candidates.push(
                     store
-                        .materialize_lineage_group_pair(PROJECT_KEY, &group_id, from, to)
-                        .unwrap(),
+                        .materialize_lineage_group_pair(
+                            PROJECT_KEY,
+                            &group_id,
+                            from,
+                            to,
+                            &format!("materialize-{from_index}-{to_index}"),
+                        )
+                        .unwrap()
+                        .candidate,
                 );
             }
         }
@@ -6342,7 +6478,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 14);
+        assert_eq!(store.database_schema_version().unwrap(), 15);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, false, 10)
@@ -6427,7 +6563,7 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 14);
+        assert_eq!(store.database_schema_version().unwrap(), 15);
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, true, 10)
@@ -6467,7 +6603,7 @@ mod tests {
         drop(connection);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 14);
+        assert_eq!(migrated.database_schema_version().unwrap(), 15);
         let legacy_source = migrated
             .connection
             .query_row(
@@ -6855,7 +6991,7 @@ mod tests {
         drop(legacy);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 14);
+        assert_eq!(migrated.database_schema_version().unwrap(), 15);
         let refreshed = SemanticSnapshotSource::trusted_provider(
             "d".repeat(64),
             "same-head".to_owned(),
@@ -7059,7 +7195,8 @@ mod tests {
             &before_observations,
             &after_observations,
             &[],
-        );
+        )
+        .unwrap();
         assert_eq!(proposals.len(), 1);
         proposals[0].algorithm_version = "3".to_owned();
         let transaction = store.connection.unchecked_transaction().unwrap();
@@ -7279,6 +7416,7 @@ mod tests {
                 &group.group_id,
                 "not-a-member",
                 &detail.to_members[0],
+                "invalid-member",
             ),
             Err(StoreError::InvalidLineage(_))
         ));
@@ -7288,6 +7426,7 @@ mod tests {
                 &group.group_id,
                 &detail.from_members[0],
                 &detail.to_members[0],
+                "materialize-pair",
             )
             .unwrap();
         let replay = store
@@ -7296,10 +7435,26 @@ mod tests {
                 &group.group_id,
                 &detail.from_members[0],
                 &detail.to_members[0],
+                "materialize-pair",
             )
             .unwrap();
-        assert_eq!(first_candidate.candidate_id, replay.candidate_id);
-        assert_eq!(replay.state, LineageState::Proposed);
+        assert_eq!(
+            first_candidate.candidate.candidate_id,
+            replay.candidate.candidate_id
+        );
+        assert!(!first_candidate.replayed);
+        assert!(replay.replayed);
+        assert_eq!(replay.candidate.state, LineageState::Proposed);
+        assert!(matches!(
+            store.materialize_lineage_group_pair(
+                PROJECT_KEY,
+                &group.group_id,
+                &detail.from_members[0],
+                &detail.to_members[1],
+                "materialize-pair",
+            ),
+            Err(StoreError::LineageIdempotencyConflict(_))
+        ));
     }
 
     #[test]
@@ -7432,6 +7587,7 @@ mod tests {
                 group_id,
                 &detail.from_members[0],
                 &detail.to_members[0],
+                "legacy-materialize-rejected",
             ),
             Err(StoreError::InvalidLineage(_))
         ));
@@ -7458,7 +7614,7 @@ mod tests {
         drop(store);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 14);
+        assert_eq!(migrated.database_schema_version().unwrap(), 15);
         assert_eq!(
             migrated
                 .list_symbols(PROJECT_KEY, None, false, 10)

@@ -1479,6 +1479,7 @@ impl App {
         group_id: &str,
         from_symbol_id: &str,
         to_symbol_id: &str,
+        request_id: &str,
         human_confirmed: bool,
     ) -> Result<(), AppError> {
         require_human_confirmation(human_confirmed, "materialize lineage group pair")?;
@@ -1489,6 +1490,7 @@ impl App {
                 group_id,
                 from_symbol_id,
                 to_symbol_id,
+                request_id,
             )?)?
         );
         Ok(())
