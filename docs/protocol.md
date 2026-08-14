@@ -500,6 +500,20 @@ fingerprint 重建后的实际 pair 集精确等于 from×to，才可进入 appl
 observation 都保护整个 group。apply 先保存 group/member 与 append-only compaction audit，再在同一事务
 删除对应 evidence/candidate；不执行 `VACUUM`，压缩后的 legacy group 不得重新物化。
 
+物理文件维护使用独立的 Database Maintenance Protocol v1：`database stats` 以只读连接和一致性事务
+读取当前 schema，不初始化或迁移数据库；`database compact` 的 dry-run 计算全库逻辑清单、文件摘要
+和保守磁盘预算。apply 必须提供人工确认和 request ID，并依次通过独占协作锁、无 busy 的 WAL
+`TRUNCATE` checkpoint、`VACUUM INTO` 候选、quick/integrity/foreign-key 检查、schema 与全部表内容清单
+等价、源/目标文件 SHA-256 复核及同文件系统原子替换。默认备份源库。外部 JSON 操作日志使用
+`running / verified / swapped / completed / failed` 状态；`verified` 表示候选及源未漂移验证均已通过，
+`swapped` 仅表示原子替换已提交，`completed` 还要求 post-swap 重开和完整验证通过。除 `completed` 外都要求恢复并阻止普通
+运行。同 request/同参数恢复或重放，同 request/不同参数拒绝。completed 重放重新验证当前数据库，
+但把“仍是当时目标”和“之后合法演进”分开报告。Windows 临时占用有限重试，失败保持 `verified`；
+操作日志保存替换前的原子临时文件基线，崩溃恢复仅清理本次新增的精确命名临时文件。磁盘预算显式
+包含当前 WAL。该协议输出 `cooperative_only`，不把协作锁描述为通用 OS 沙箱；同时输出
+`replacement_durability=temp_file_synced_atomic_replace;power_loss_directory_durability_platform_dependent`，
+不把进程崩溃原子性描述为跨平台断电 write-through 保证。
+
 覆盖率是独立的确定性证据：对 Provider profile 显式映射的 Rust/Python/C#/VB/F# language，比较
 Git 已跟踪及未忽略、位于声明 roots 且扩展名属于该 language 契约的文件，与 SCIP Document 清单。
 未知 language 必须报告 `unverifiable`，不得猜扩展名。已有快照的 `partial` 或与当前 worktree/HEAD

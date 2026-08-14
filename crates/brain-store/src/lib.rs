@@ -4,6 +4,13 @@ use std::{
     time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
+mod maintenance;
+
+pub use maintenance::{
+    DatabaseLogicalVerification, WalCheckpointReport, checkpoint_database_wal,
+    inspect_database_logical_content, inspect_database_storage, vacuum_database_into,
+};
+
 use brain_core::{
     ActionDescriptor, Decision, HOOK_PROTOCOL_VERSION, InternalHookEvent, InternalHookOutcome,
 };
@@ -23,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const DATABASE_SCHEMA_VERSION: i64 = 15;
+pub const DATABASE_SCHEMA_VERSION: i64 = 15;
 const LEGACY_LINEAGE_ALGORITHM_ID: &str = "project-brain-lineage";
 const LEGACY_LINEAGE_ALGORITHM_VERSION: &str = "1";
 const LEGACY_COMPACTION_ALGORITHM_ID: &str = "project-brain-lineage-legacy-compaction";
@@ -156,6 +163,25 @@ pub struct EvidenceHeadSummary {
     pub stale_reason: Option<String>,
     pub updated_at_unix_seconds: i64,
     pub last_attestation_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatabaseStorageStats {
+    pub schema_version: i64,
+    pub page_size_bytes: u64,
+    pub page_count: u64,
+    pub freelist_page_count: u64,
+    pub database_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub reclaimable_basis_points: u16,
+    pub journal_mode: String,
+    pub quick_check: String,
+    pub foreign_key_violation_count: u64,
+    pub lineage_candidate_count: u64,
+    pub lineage_evidence_count: u64,
+    pub lineage_group_count: u64,
+    pub lineage_group_member_count: u64,
+    pub lineage_materialization_request_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2840,6 +2866,15 @@ impl BrainStore {
         value
             .parse()
             .map_err(|_| StoreError::Integrity("schema_version 不是整数".to_owned()))
+    }
+
+    /// 返回当前 `SQLite` 文件的逻辑行数、页面占用与可回收空间，不执行 checkpoint 或写入。
+    ///
+    /// # Errors
+    ///
+    /// 当 PRAGMA、完整性检查或计数读取失败，或数据库返回负数/溢出统计时返回错误。
+    pub fn database_storage_stats(&self) -> Result<DatabaseStorageStats, StoreError> {
+        maintenance::storage_stats(&self.connection)
     }
 
     /// 追加一次显式 Provider 稳定性资格结论；不会改写旧结论。
@@ -6355,6 +6390,24 @@ mod tests {
             Err(StoreError::Integrity(_))
         ));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn database_stats_are_read_only_bounded_and_cover_lineage_ledgers() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let before_changes = store.connection.total_changes();
+        let stats = store.database_storage_stats().unwrap();
+
+        assert_eq!(stats.schema_version, 15);
+        assert!(stats.page_size_bytes > 0);
+        assert!(stats.page_count > 0);
+        assert!(stats.database_bytes >= stats.reclaimable_bytes);
+        assert!(stats.reclaimable_basis_points <= 10_000);
+        assert_eq!(stats.quick_check, "ok");
+        assert_eq!(stats.foreign_key_violation_count, 0);
+        assert_eq!(stats.lineage_candidate_count, 0);
+        assert_eq!(stats.lineage_materialization_request_count, 0);
+        assert_eq!(store.connection.total_changes(), before_changes);
     }
 
     #[test]

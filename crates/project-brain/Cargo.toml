@@ -16,6 +16,7 @@ brain-scip = { path = "../brain-scip" }
 brain-store = { path = "../brain-store" }
 brain-symbols = { path = "../brain-symbols" }
 clap.workspace = true
+fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -23,3 +24,6 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

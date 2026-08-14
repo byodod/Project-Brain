@@ -4,6 +4,7 @@ mod artifact_store;
 mod build;
 mod claude;
 mod codex;
+mod database;
 mod error;
 mod git;
 mod godot;
@@ -140,6 +141,12 @@ enum Command {
     Lineage {
         #[command(subcommand)]
         command: LineageCommand,
+    },
+
+    /// 查看并显式维护项目级 `SQLite` 存储
+    Database {
+        #[command(subcommand)]
+        command: DatabaseCommand,
     },
 
     /// 管理仓库规则的 semantic symbol scope
@@ -520,6 +527,39 @@ enum LineageCommand {
         reason: Option<String>,
 
         /// 确认本次不可自动推导的裁决来自显式人工决定
+        #[arg(long)]
+        human_confirmed: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DatabaseCommand {
+    /// 只读输出数据库页面占用、可回收空间、完整性与关键 ledger 行数
+    Stats,
+
+    /// 默认仅预演；显式确认后以可恢复日志和原子替换压缩 `SQLite` 文件
+    Compact {
+        /// 实际执行压缩；缺省为 dry-run
+        #[arg(long)]
+        apply: bool,
+
+        /// 幂等请求标识；apply 时必填
+        #[arg(long)]
+        request_id: Option<String>,
+
+        /// 对源库与候选库额外执行 PRAGMA `integrity_check`
+        #[arg(long)]
+        full_check: bool,
+
+        /// 不保留原始数据库备份；默认保留首个已验证备份
+        #[arg(long)]
+        no_backup: bool,
+
+        /// 等待独占维护锁的最长秒数（0..=300）
+        #[arg(long, default_value_t = 5)]
+        lock_timeout_seconds: u64,
+
+        /// 确认本次文件替换来自显式人工决定
         #[arg(long)]
         human_confirmed: bool,
     },
@@ -912,6 +952,27 @@ fn main() -> ExitCode {
                 human_confirmed,
             ),
         }),
+        Command::Database { command } => match command {
+            DatabaseCommand::Stats => App::database_stats(cli.project_root),
+            DatabaseCommand::Compact {
+                apply,
+                request_id,
+                full_check,
+                no_backup,
+                lock_timeout_seconds,
+                human_confirmed,
+            } => App::database_compact(
+                cli.project_root,
+                &database::DatabaseCompactOptions {
+                    apply,
+                    request_id,
+                    human_confirmed,
+                    full_check,
+                    keep_backup: !no_backup,
+                    lock_timeout_seconds,
+                },
+            ),
+        },
         Command::Rules { command } => App::open(cli.project_root).and_then(|app| match command {
             RulesCommand::BindSymbol {
                 rule,

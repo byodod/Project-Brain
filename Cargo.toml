@@ -21,6 +21,7 @@ authors = ["Project Brain contributors"]
 [workspace.dependencies]
 atomic-write-file = "=0.3.0"
 clap = { version = "4.6.6", features = ["derive"] }
+fs2 = "=0.4.3"
 protobuf = "=3.7.2"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 scip = "=0.9.0"

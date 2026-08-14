@@ -1,3 +1,2 @@
-brain.db
-brain.db-shm
-brain.db-wal
+brain.db*
+.brain.db*

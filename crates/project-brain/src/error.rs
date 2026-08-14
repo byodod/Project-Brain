@@ -58,6 +58,12 @@ pub enum AppError {
     #[error("规则治理操作失败：{0}")]
     Governance(String),
 
+    #[error("数据库维护操作失败：{0}")]
+    DatabaseMaintenance(String),
+
+    #[error("数据库原子替换仍被临时占用：{0}")]
+    DatabaseSwapBusy(String),
+
     #[error("Project Brain doctor 检查未通过：{0}")]
     DoctorDegraded(String),
 

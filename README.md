@@ -16,7 +16,7 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - 按项目显式配置的 SCIP 导入与机器级安全 Runner，首批契约覆盖 rust-analyzer、scip-dotnet 与 scip-python；
 - 开放 language ID、逐文档语言映射和四态语义能力声明；
 - Project-scoped semantic lineage ledger、不可变证据与 append-only 显式裁决；
-- SQLite schema v1→v13 迁移、按项目隔离的符号 removed 历史、Evidence ledger 与幂等增量更新；
+- SQLite schema v1→v15 迁移、按项目隔离的符号 removed 历史、Evidence ledger、幂等增量更新与显式维护协议；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
 ## 核心原则
@@ -714,6 +714,47 @@ project-brain lineage compact-legacy-proposals \
 执行会在同一事务中保存 group/member、候选与证据 manifest hash 及追加式审计，再删除已证明冗余的
 旧 pair/evidence。重放同一 request ID 返回原报告；命令不会执行 `VACUUM`。由旧 token 指纹压缩成的
 group 只保留历史事实，禁止重新 materialize。
+
+## 数据库维护
+
+逻辑记录清理与物理文件压缩是两个独立步骤。`lineage compact-legacy-proposals` 只在事务内证明并删除
+冗余旧账；它不会用物理 `VACUUM` 绕过候选资格、decision 引用或 evidence 完整性检查。先查看严格
+只读的页面、freelist、完整性与关键 ledger 行数：
+
+```text
+project-brain database stats
+```
+
+物理压缩同样默认只预演。预演会在一致性只读事务中遍历 schema 和全部表内容，生成完整逻辑清单、
+文件 SHA-256、磁盘空间预算，并且不 checkpoint、不创建候选库：
+
+```text
+project-brain database compact
+project-brain database compact --full-check
+```
+
+确认逻辑压缩报告和物理预演后，才可显式执行：
+
+```text
+project-brain database compact \
+  --apply \
+  --request-id <request-id> \
+  --full-check \
+  --human-confirmed
+```
+
+执行会取得项目数据库独占维护锁，要求 WAL `TRUNCATE` checkpoint 无 busy reader/writer，以
+`VACUUM INTO` 生成同目录候选，比较源库与候选库的完整逻辑清单，再通过同文件系统原子替换切换。
+默认保留按 request ID 确定命名的原库备份；只有明确接受无备份风险时才使用 `--no-backup`。外部操作
+日志不存于被替换的数据库；相同 request/参数可幂等重放，相同 request/不同参数拒绝。进程崩溃或
+验证失败后，普通 Hook/CLI 会 fail-closed，并要求使用同一 request ID 恢复；若当前目标同时不匹配
+已验证源/候选，而默认备份仍精确匹配源哈希，恢复会先原子还原源库再重建候选。Windows 临时文件
+占用按有限 backoff 重试，仍失败则保留 `verified` 状态供同 request 恢复。completed 重放会重新验证
+当前库，并明确报告它仍是当时目标还是已发生合法后续写入。输出固定声明
+`external_writer_protection=cooperative_only`：维护锁是 Project Brain 进程间的协作边界，不冒充阻止
+任意外部 SQLite 写入的操作系统沙箱。`replacement_durability` 也明确声明临时文件已同步且采用原子替换，
+但突然断电时目录项持久性取决于平台；它不会把进程崩溃安全夸大成跨平台断电事务。操作日志还保存
+替换前已存在的原子临时文件基线，恢复时只清理由本次未完成替换新增的精确命名临时文件。
 
 查看候选：
 

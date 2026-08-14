@@ -174,7 +174,12 @@ confirmed / rejected / superseded / invalidated
 SQLite schema v15 保存 semantic snapshots、append-only source attestations、source manifests、
 symbol observations、group/member/generation run、candidate/evidence/decision，以及显式旧账压缩的
 run/group 审计、人工 pair materialization request 与 append-only Provider qualification events。压缩默认只读；apply 必须携带人工确认与幂等 request ID，且逻辑删除与审计同事务。
-物理 `VACUUM` 不属于压缩事务，也不能替代候选资格证明。
+物理压缩是后续独立维护协议，不能替代候选资格证明。`database stats` 只读打开当前 schema；
+`database compact` 默认预演，apply 则在协作式独占锁下完成 WAL checkpoint、`VACUUM INTO`、源/候选
+全库逻辑清单等价验证、默认备份与同文件系统原子替换。操作日志位于被替换数据库之外；任何未完成或
+失败状态都会阻止普通 Hook/CLI，使用相同 request ID 才能恢复。锁只覆盖 Project Brain 进程，不声称
+隔离绕过协议的外部 SQLite 写入器。报告同时区分进程崩溃下的“同步临时文件 + 原子替换”与平台相关的
+突然断电目录项持久性，不宣称无法由标准库证明的 write-through 保证。
 同一 semantic snapshot 可由不同机器绑定重复产生。V11 的 attestation 唯一身份包含 trust、
 registration、executable 与 artifact 证明；图内容未变化时仍可追加新的来源证明，并由最新 sequence
 参与 hard-gate 新鲜度判断，不能让旧绑定证明遮蔽当前已资格化绑定。
@@ -287,4 +292,5 @@ Extension 安装器仍留在后续阶段。
 [ADR-0027](adr/0027-godot-structured-scenario-test.md) 与
 [ADR-0028](adr/0028-rust-test-fixed-contract.md) 与
 [ADR-0029](adr/0029-python-manifest-test-contract.md) 与
-[ADR-0030](adr/0030-dotnet-project-root-sdk-resolution.md)。
+[ADR-0030](adr/0030-dotnet-project-root-sdk-resolution.md) 与
+[ADR-0031](adr/0031-crash-safe-database-compaction.md)。

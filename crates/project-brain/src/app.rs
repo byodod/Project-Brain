@@ -14,7 +14,7 @@ use brain_core::{
 use brain_evidence::{
     EvidenceAuthority, EvidenceCoverage, EvidenceFreshness, EvidencePlane, EvidenceReference,
 };
-use brain_store::{BrainStore, SemanticResolutionKind};
+use brain_store::{BrainStore, SemanticResolutionKind, inspect_database_storage};
 use clap::ValueEnum;
 use sha2::{Digest, Sha256};
 
@@ -22,6 +22,7 @@ use crate::{
     analyze, build,
     claude::{self, ClaudeHookInput},
     codex::{self, CodexHookInput},
+    database::{self, DatabaseAccessLock, DatabaseCompactOptions},
     error::AppError,
     git, godot, index,
     prime::{self, PrimeHookInput},
@@ -63,6 +64,7 @@ pub struct App {
     root: PathBuf,
     config: BrainConfig,
     store: BrainStore,
+    _database_lock: DatabaseAccessLock,
 }
 
 impl App {
@@ -369,10 +371,7 @@ impl App {
         let config = initial_config(project_name, generate_project_key(&root)?, profiles);
         config.validate()?;
         fs::write(&config_path, pretty_json(&config)?)?;
-        fs::write(
-            brain_dir.join(".gitignore"),
-            "brain.db\nbrain.db-shm\nbrain.db-wal\n",
-        )?;
+        fs::write(brain_dir.join(".gitignore"), "brain.db*\n.brain.db*\n")?;
         fs::write(
             brain_dir.join("envelope.json"),
             pretty_json(&reconcile::ChangeEnvelope::example())?,
@@ -398,11 +397,15 @@ impl App {
         if migrated_project_key {
             fs::write(&config_path, pretty_json(&config)?)?;
         }
-        let store = BrainStore::open(&brain_dir.join(DATABASE_FILE))?;
+        let database = brain_dir.join(DATABASE_FILE);
+        let database_lock = DatabaseAccessLock::acquire_shared(&database)?;
+        database::ensure_no_pending_operation(&database)?;
+        let store = BrainStore::open(&database)?;
         Ok(Self {
             root,
             config,
             store,
+            _database_lock: database_lock,
         })
     }
 
@@ -1421,6 +1424,44 @@ impl App {
         Ok(())
     }
 
+    pub fn database_stats(explicit_root: Option<PathBuf>) -> Result<(), AppError> {
+        let start = explicit_root.unwrap_or(env::current_dir()?);
+        let root = discover_root(&start).ok_or(AppError::ProjectNotInitialized)?;
+        let brain_dir = root.join(BRAIN_DIRECTORY);
+        let config: BrainConfig = serde_json::from_slice(&fs::read(brain_dir.join(CONFIG_FILE))?)?;
+        config.validate()?;
+        let database = brain_dir.join(DATABASE_FILE);
+        let _database_lock = DatabaseAccessLock::acquire_shared(&database)?;
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "config_schema_version": CURRENT_SCHEMA_VERSION,
+                "project_key": config.project_key,
+                "database": inspect_database_storage(&database)?,
+            }))?
+        );
+        Ok(())
+    }
+
+    pub fn database_compact(
+        explicit_root: Option<PathBuf>,
+        options: &DatabaseCompactOptions,
+    ) -> Result<(), AppError> {
+        let start = explicit_root.unwrap_or(env::current_dir()?);
+        let root = discover_root(&start).ok_or(AppError::ProjectNotInitialized)?;
+        let brain_dir = root.join(BRAIN_DIRECTORY);
+        let config: BrainConfig = serde_json::from_slice(&fs::read(brain_dir.join(CONFIG_FILE))?)?;
+        config.validate()?;
+        let database = brain_dir.join(DATABASE_FILE);
+        let report = if options.apply {
+            database::apply_compaction(&config.project_key, &database, options)?
+        } else {
+            database::preview_compaction(&config.project_key, &database, options)?
+        };
+        println!("{}", pretty_json(&report)?);
+        Ok(())
+    }
+
     pub fn compact_legacy_lineage_proposals(
         &self,
         apply: bool,
@@ -2000,7 +2041,8 @@ mod tests {
         assert_eq!(envelope.allowed_paths, ["."]);
         assert_eq!(envelope.forbidden_paths, [".git"]);
         let ignore = fs::read_to_string(root.join(".project-brain/.gitignore")).unwrap();
-        assert!(ignore.lines().any(|line| line == "brain.db"));
+        assert!(ignore.lines().any(|line| line == "brain.db*"));
+        assert!(ignore.lines().any(|line| line == ".brain.db*"));
         let app = App::open(Some(root.clone())).unwrap();
         assert!(app.config.project_key.starts_with("pb_"));
         drop(app);
