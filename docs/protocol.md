@@ -218,6 +218,17 @@ Stop 只读取当前项目相同 plane/provider 的 head，并再次核对 contr
 Provider authority 与 finding authority。缺少 head、合同漂移、stale、partial、heuristic、warning、
 advisory finding 或未知 code 均不会产生隐式 Block。
 
+.NET Test run schema v1 使用 `dotnet-test.<profile>` provider。它只接受指定
+`dotnet-build.<build_profile>` 当前 head，并要求该 Build 为 fresh、complete、deterministic、无
+finding；CAS manifest 的 project/provider/source/build_target、测试程序集条目与 dotnet executable
+SHA-256 必须精确匹配。实际 argv 固定为 `dotnet vstest <bundle assembly> --Logger:trx
+--ResultsDirectory:<scratch> --nologo`，不读取仓库 runner 参数。
+
+TRX 汇总的 `status` 是 passed/failed/crashed/timed_out/no_tests/provider_failed，`coverage` 是
+covered/empty/unknown。Test Evidence 的通用 coverage 仍表示 Provider 合同观测是否完整：NoTests 可为
+complete + empty，但 TimedOut/ProviderFailed 为 partial。v1 无法从 TRX Counters 证明失败一定是声明的
+assertion，因此 failure finding 默认为 advisory；这刻意阻止“所有测试 error 自动 block”。
+
 Godot probe schema v1 返回 `before/after` 两份 `ProbeProjectState`。每份状态包含
 `project_sha256`、main scene、autoloads，以及所有 `.tscn/.tres` 的 UID、SHA-256、load result 与
 `ResourceLoader.get_dependencies()` 解析结果。转换层会规范排序并忽略 before/after 的 `loaded`

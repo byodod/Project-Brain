@@ -320,10 +320,35 @@ Python v1 是 `validation_only`：以 `-I -S -B` 启动 Project Brain 内置 boo
 完整相对路径清单与 Godot 主程序集的不可变 RuntimeArtifactBundle。Evidence 只保存内容身份，不保存
 机器绝对路径。Runtime 不允许重新构建后冒充该 Build；它只能重新校验并物化 bundle 的精确字节。
 当前 store 不执行隐式 GC；object 缺失或损坏只会令 Runtime 拒绝准备。
+显式 `--install-root` 若位于项目工作树内会被拒绝，避免 CAS 写入反过来改变 Source fingerprint。
 
 `coverage=complete` 表示“完整观测了本次合同”，不表示构建成功。非零退出可同时是
 `complete + build_exit_failure`；工具链、链接器或预还原状态缺失则是
 `partial + build_unavailable`，不能冒充项目违规。CLI 会先保存这份失败证据再返回非零。
+
+## .NET Test Evidence Provider
+
+.NET Test 不从仓库当前 `bin/obj` 运行，也不再次进入 MSBuild。先对测试 `.csproj` 生成成功的
+`dotnet-build.<profile>` Evidence，再从其 CAS bundle 运行精确程序集：
+
+```text
+project-brain evidence test dotnet \
+  --profile game-tests \
+  --build-profile tests-debug \
+  --executable /absolute/path/to/dotnet \
+  --target tests/Game.Tests.csproj \
+  --test-assembly Game.Tests.dll \
+  --trust-local-executable \
+  --trust-repository-test-code
+```
+
+固定合同使用 `dotnet vstest`、TRX logger 与机器私有 results directory，不接受自定义参数，不执行
+build、restore、shell 或 export。它要求 Build head 与 bundle 的 project、provider、target、Source
+fingerprint 和 dotnet executable SHA-256 全部一致。测试代码属于独立信任面；当前不是 OS 网络沙箱。
+
+结果区分 passed/failed/crashed/timed_out/no_tests/provider_failed 与 covered/empty/unknown。NoTests 不是
+Pass。TRX 汇总无法安全区分断言失败和测试/环境异常，因此 v1 的 `dotnet_test_failed` 保持 advisory；
+它不会因 severity=error 自动获得阻断资格。
 
 ## Godot 隔离 Runtime Evidence
 
@@ -693,9 +718,9 @@ crates/
 - Codex 与 Claude Code 已提供直接适配器、用户级 Hook 安装器和按 adapter 选择的 `doctor`；
   Prime Agent 已有独立 direct adapter，但用户级 Extension 安装器与 doctor 尚未实现。
 - Godot Engine Provider、Evidence ledger、Hook 失效传播、.NET/Rust/Python Build Provider v1、Godot
-  C# RuntimeArtifactBundle CAS、隔离 Godot headless Runtime Evidence v1，以及 Test plane/finding 显式
-  effect 映射核心已完成；具体 .NET/Rust/Python/Godot Test Provider 仍未完成，不能声称全部治理能力
-  已经完结。
+  C# RuntimeArtifactBundle CAS、隔离 Godot headless Runtime Evidence v1、Test plane/finding 显式
+  effect 映射核心与精确 CAS .NET Test Provider v1 已完成；Rust/Python/Godot Test Provider 仍未完成，
+  不能声称全部治理能力已经完结。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。

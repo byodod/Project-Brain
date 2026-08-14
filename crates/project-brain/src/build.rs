@@ -466,6 +466,7 @@ fn run_build(
             request.install_root,
             request.project_key,
             &format!("{adapter}.{}", request.profile_id),
+            &target_display,
             &source_after,
             request.project_root,
             root,

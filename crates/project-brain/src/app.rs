@@ -25,7 +25,7 @@ use crate::{
     error::AppError,
     git, godot, index,
     prime::{self, PrimeHookInput},
-    provider, reconcile, runtime, scip_index, setup,
+    provider, reconcile, runtime, scip_index, setup, test,
 };
 
 const BRAIN_DIRECTORY: &str = ".project-brain";
@@ -640,6 +640,53 @@ impl App {
         } else {
             Err(AppError::Provider(
                 "Runtime Evidence 已保存失败结果；运行合同未通过".to_owned(),
+            ))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn evidence_test_dotnet(
+        &self,
+        install_root: Option<&Path>,
+        executable: &Path,
+        profile: &str,
+        build_profile: &str,
+        target: &Path,
+        test_assembly: &Path,
+        trust_local_executable: bool,
+        trust_repository_test_code: bool,
+        timeout_seconds: u64,
+    ) -> Result<(), AppError> {
+        let heads = self.store.list_evidence_heads(&self.config.project_key)?;
+        let report = test::run_dotnet(&test::DotnetTestRequest {
+            project_root: &self.root,
+            install_root,
+            project_key: &self.config.project_key,
+            profile_id: profile,
+            build_profile_id: build_profile,
+            executable,
+            target,
+            test_assembly,
+            trust_local_executable,
+            trust_repository_test_code,
+            timeout_seconds,
+            evidence_heads: &heads,
+        })?;
+        let passed = report.passed();
+        let persistence = self.store.apply_evidence_snapshot(&report.evidence)?;
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": 1,
+                "run": report,
+                "persistence": persistence,
+            }))?
+        );
+        if passed {
+            Ok(())
+        } else {
+            Err(AppError::Provider(
+                "Test Evidence 已保存非通过结果；测试合同未通过".to_owned(),
             ))
         }
     }

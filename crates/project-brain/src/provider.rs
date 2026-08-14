@@ -297,6 +297,7 @@ impl Drop for ProviderRun {
 
 pub(crate) struct ProcessResult {
     pub status: ExitStatus,
+    pub timed_out: bool,
     pub duration: Duration,
     pub stdout: CapturedOutput,
     pub stderr: CapturedOutput,
@@ -1412,6 +1413,51 @@ pub(crate) fn run_process_with_environment(
     timeout: Duration,
     environment: &[(&str, &Path)],
 ) -> Result<ProcessResult, AppError> {
+    run_process_with_environment_inner(
+        executable,
+        launcher_script,
+        arguments,
+        cwd,
+        repository_root,
+        timeout,
+        environment,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_process_with_environment_observing_timeout(
+    executable: &Path,
+    launcher_script: Option<&Path>,
+    arguments: &[String],
+    cwd: &Path,
+    repository_root: Option<&Path>,
+    timeout: Duration,
+    environment: &[(&str, &Path)],
+) -> Result<ProcessResult, AppError> {
+    run_process_with_environment_inner(
+        executable,
+        launcher_script,
+        arguments,
+        cwd,
+        repository_root,
+        timeout,
+        environment,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_process_with_environment_inner(
+    executable: &Path,
+    launcher_script: Option<&Path>,
+    arguments: &[String],
+    cwd: &Path,
+    repository_root: Option<&Path>,
+    timeout: Duration,
+    environment: &[(&str, &Path)],
+    observe_timeout: bool,
+) -> Result<ProcessResult, AppError> {
     let mut command = Command::new(executable);
     if let Some(script) = launcher_script {
         command.arg(provider_cli_path(script));
@@ -1448,19 +1494,24 @@ pub(crate) fn run_process_with_environment(
         .ok_or_else(|| AppError::Provider("无法捕获 Provider stderr".to_owned()))?;
     let stdout_reader = thread::spawn(move || drain_bounded(stdout));
     let stderr_reader = thread::spawn(move || drain_bounded(stderr));
+    let mut timed_out = false;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
         if started.elapsed() >= timeout {
             terminate_process_tree(&mut child);
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(AppError::Provider(format!(
-                "Provider 超时（{} 秒）并已终止",
-                timeout.as_secs()
-            )));
+            let status = child.wait()?;
+            if !observe_timeout {
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(AppError::Provider(format!(
+                    "Provider 超时（{} 秒）并已终止",
+                    timeout.as_secs()
+                )));
+            }
+            timed_out = true;
+            break status;
         }
         thread::sleep(Duration::from_millis(20));
     };
@@ -1472,6 +1523,7 @@ pub(crate) fn run_process_with_environment(
         .map_err(|_| AppError::Provider("Provider stderr reader 异常退出".to_owned()))??;
     Ok(ProcessResult {
         status,
+        timed_out,
         duration: started.elapsed(),
         stdout,
         stderr,

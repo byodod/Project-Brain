@@ -15,6 +15,7 @@ mod reconcile;
 mod runtime;
 mod scip_index;
 mod setup;
+mod test;
 
 use std::{path::PathBuf, process::ExitCode};
 
@@ -245,6 +246,12 @@ enum EvidenceCommand {
         command: BuildEvidenceCommand,
     },
 
+    /// 从已验证 Build bundle 的精确字节运行固定 Test 合同；不会构建、还原或导出
+    Test {
+        #[command(subcommand)]
+        command: TestEvidenceCommand,
+    },
+
     /// 从已验证 Build bundle 的精确字节运行隔离 Godot headless Runtime；绝不构建或导出
     Runtime {
         /// Build Evidence 中的 content-addressed `RuntimeArtifactBundle` fingerprint
@@ -317,6 +324,32 @@ enum BuildEvidenceCommand {
         #[arg(long)]
         trust_local_executable: bool,
         #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TestEvidenceCommand {
+    /// 固定执行 dotnet vstest；只运行 Build CAS 中已验证的测试程序集
+    Dotnet {
+        #[arg(long)]
+        profile: String,
+        /// 必须对应当前 `dotnet-build.<profile>` Evidence head
+        #[arg(long)]
+        build_profile: String,
+        #[arg(long)]
+        executable: PathBuf,
+        /// 与 Build bundle 绑定的项目内 .csproj
+        #[arg(long)]
+        target: PathBuf,
+        /// Build bundle 内的测试程序集相对路径，例如 Game.Tests.dll
+        #[arg(long)]
+        test_assembly: PathBuf,
+        #[arg(long)]
+        trust_local_executable: bool,
+        #[arg(long)]
+        trust_repository_test_code: bool,
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
     },
 }
@@ -648,6 +681,28 @@ fn main() -> ExitCode {
                         &profile,
                         &source_root,
                         trust_local_executable,
+                        timeout_seconds,
+                    ),
+                },
+                EvidenceCommand::Test { command } => match command {
+                    TestEvidenceCommand::Dotnet {
+                        profile,
+                        build_profile,
+                        executable,
+                        target,
+                        test_assembly,
+                        trust_local_executable,
+                        trust_repository_test_code,
+                        timeout_seconds,
+                    } => app.evidence_test_dotnet(
+                        cli.install_root.as_deref(),
+                        &executable,
+                        &profile,
+                        &build_profile,
+                        &target,
+                        &test_assembly,
+                        trust_local_executable,
+                        trust_repository_test_code,
                         timeout_seconds,
                     ),
                 },

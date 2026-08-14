@@ -85,6 +85,11 @@ Build Provider 不复用 Semantic Runner，也不把“编译”并入 Engine。
 中运行并生成产物哈希清单；完整观测到非零退出仍是 complete error evidence，基础设施缺失则降级为
 partial unavailable。Godot C# Build Snapshot 显式引用本次实际消费的 Engine fingerprint。
 
+.NET Test Provider 不使用仓库当前输出，也不调用 `dotnet test` 重新进入 MSBuild。Build CAS manifest
+绑定 `build_target`；Test 核对 fresh Build head、Source、target、toolchain 与 bundle 后，将精确字节
+物化到 scratch，并固定调用 `dotnet vstest`。TRX 汇总形成独立 Test Snapshot。NoTests、timeout 与
+provider failure 保留各自状态；普通 TRX failure 在无法区分 assertion/exception 时保持 advisory。
+
 SCIP 路径以 `project_key + semantic provider profile ID + producer + contract_version` 建立
 Provider 命名空间，并把规范化 language ID 写入 provider key。语言映射逐 Document 执行，
 因此单一 scip-dotnet index 可同时容纳 C# 与 Visual Basic。Producer 自身版本只作为 provenance
@@ -263,4 +268,5 @@ Extension 安装器仍留在后续阶段。
 [ADR-0022](adr/0022-evidence-upstream-freshness-propagation.md) 与
 [ADR-0023](adr/0023-fixed-build-evidence-providers.md) 与
 [ADR-0024](adr/0024-content-addressed-runtime-bundles.md) 与
-[ADR-0025](adr/0025-test-evidence-and-explicit-finding-effects.md)。
+[ADR-0025](adr/0025-test-evidence-and-explicit-finding-effects.md) 与
+[ADR-0026](adr/0026-exact-dotnet-test-bundle.md)。

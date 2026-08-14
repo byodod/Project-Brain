@@ -493,6 +493,7 @@ mod tests {
     fn extracts_only_errors_and_removes_machine_paths() {
         let process = ProcessResult {
             status: success_status(),
+            timed_out: false,
             duration: Duration::ZERO,
             stdout: output(b"normal\nERROR: C:/repo/scenes/main.tscn failed\n"),
             stderr: output(b"SCRIPT ERROR: C:/probe/probe.gd:2\n"),

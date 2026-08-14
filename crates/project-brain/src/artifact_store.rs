@@ -29,6 +29,8 @@ pub(crate) struct RuntimeArtifactBundle {
     schema_version: u32,
     project_key: String,
     build_provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build_target: Option<String>,
     source_fingerprint: String,
     artifact_manifest_fingerprint: String,
     total_bytes: u64,
@@ -43,6 +45,14 @@ impl RuntimeArtifactBundle {
 
     pub(crate) fn build_provider_id(&self) -> &str {
         &self.build_provider_id
+    }
+
+    pub(crate) fn build_target(&self) -> Option<&str> {
+        self.build_target.as_deref()
+    }
+
+    pub(crate) fn entries(&self) -> &[ArtifactEntry] {
+        &self.entries
     }
 
     pub(crate) fn source_fingerprint(&self) -> &str {
@@ -75,16 +85,30 @@ impl RuntimeArtifactBundleReceipt {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn promote_runtime_bundle(
     explicit_install_root: Option<&Path>,
     project_key: &str,
     build_provider_id: &str,
+    build_target: &str,
     source_fingerprint: &str,
     project_root: &Path,
     artifact_root: &Path,
     artifact_manifest: &ArtifactManifest,
 ) -> Result<RuntimeArtifactBundleReceipt, AppError> {
     let install_root = resolve_install_root(explicit_install_root)?;
+    let canonical_project_root = project_root.canonicalize()?;
+    let project_boundary = PathBuf::from(provider::provider_cli_path(&canonical_project_root));
+    let install_boundary = PathBuf::from(provider::provider_cli_path(&install_root));
+    if install_boundary.starts_with(&project_boundary)
+        || install_root.canonicalize().is_ok_and(|path| {
+            PathBuf::from(provider::provider_cli_path(&path)).starts_with(&project_boundary)
+        })
+    {
+        return Err(AppError::Provider(
+            "机器级 artifact store 不得位于项目工作树内".to_owned(),
+        ));
+    }
     let store_root = store_root(&install_root);
     let _lock = MutationLock::acquire(&store_root.join("store.lock"))?;
     let assembly_binding = assembly_binding(project_root, artifact_manifest)?;
@@ -92,6 +116,7 @@ pub(crate) fn promote_runtime_bundle(
         schema_version: STORE_SCHEMA_VERSION,
         project_key: project_key.to_owned(),
         build_provider_id: build_provider_id.to_owned(),
+        build_target: Some(build_target.to_owned()),
         source_fingerprint: source_fingerprint.to_owned(),
         artifact_manifest_fingerprint: artifact_manifest.manifest_fingerprint.clone(),
         total_bytes: artifact_manifest.total_bytes,
@@ -556,6 +581,7 @@ mod tests {
             Some(&install),
             "project-a",
             "dotnet-build.main",
+            "Game.csproj",
             "sha256_source",
             &project,
             &artifacts,
@@ -589,6 +615,7 @@ mod tests {
             Some(&install),
             "project-a",
             "dotnet-build.main",
+            "Game.csproj",
             "sha256_source",
             &project,
             &artifacts,
@@ -603,6 +630,34 @@ mod tests {
         fs::write(object, b"corrupt").unwrap();
 
         assert!(verify_runtime_bundle(Some(&install), &receipt.bundle_fingerprint).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn artifact_store_is_rejected_inside_the_project_worktree() {
+        let root = temp_root("store-boundary");
+        let project = root.join("project");
+        let artifacts = root.join("artifacts");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(artifacts.join("game.dll"), b"bytes").unwrap();
+        let manifest = manifest(&artifacts);
+        let install = project.join(".machine-state");
+
+        assert!(
+            promote_runtime_bundle(
+                Some(&install),
+                "project-a",
+                "dotnet-build.main",
+                "Fixture.csproj",
+                "sha256_source",
+                &project,
+                &artifacts,
+                &manifest,
+            )
+            .is_err()
+        );
+        assert!(!install.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -629,6 +684,7 @@ mod tests {
             schema_version: 1,
             project_key: "project-a".to_owned(),
             build_provider_id: "dotnet-build.main".to_owned(),
+            build_target: Some("Game.csproj".to_owned()),
             source_fingerprint: "sha256_source".to_owned(),
             artifact_manifest_fingerprint: "sha256_manifest".to_owned(),
             total_bytes: 0,
