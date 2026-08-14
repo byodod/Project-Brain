@@ -16,7 +16,7 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - 按项目显式配置的 SCIP 导入与机器级安全 Runner，首批契约覆盖 rust-analyzer、scip-dotnet 与 scip-python；
 - 开放 language ID、逐文档语言映射和四态语义能力声明；
 - Project-scoped semantic lineage ledger、不可变证据与 append-only 显式裁决；
-- SQLite schema v1→v15 迁移、按项目隔离的符号 removed 历史、Evidence ledger、幂等增量更新与显式维护协议；
+- SQLite schema v1→v16 迁移、按项目隔离的符号 removed 历史、Evidence ledger、幂等增量更新与显式维护协议；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
 ## 核心原则
@@ -261,16 +261,30 @@ Engine Snapshot 记录 `project.godot`、main scene、autoload、scene/resource�
 project-brain evidence status
 ```
 
+`evidence status` 不把数据库中的记录状态冒充为当前真相：每个 head 同时输出 `freshness`（ledger
+最后一次已知状态）与 `effective_freshness`（结合当前 Git Source 指纹实时计算），并给出当前指纹或
+不可验证原因。只有后者为 `fresh` 才能参与当前 authority。
+
 完整 ArtifactGraph 按 fingerprint 只保存一次；每次真实运行追加轻量 attestation。Codex、Claude Code
-或 Prime Agent 的 `PostToolUse` 一旦观察到明确的 Create/Modify/Delete，现有 Semantic、Engine、Build、
-Test、Runtime Evidence heads 会作为一个幂等事件变为 `stale`，并在后续 Session/Intent/PreTool/Stop 注入提示。
-Provider 应用新快照时会校验其显式 upstream fingerprint，并把失效传递给真正依赖它的下游；只有逐层
-重新运行对应 Provider 才能恢复各自 `fresh`。
-`stale` 证据永远没有硬阻断资格。即便是 `fresh + complete + deterministic + error` finding，也仍须
-仓库规则显式提供 authority/strength/effect，Provider 本身不能自动 block。
+或 Prime Agent 的 `PostToolUse` 一旦观察到明确的 Create/Modify/Delete，现有 Source、Semantic、Engine、
+Build、Test、Runtime Evidence heads 会作为一个幂等事件变为 `stale`。Execute、GitOperation 及未知工具
+不依赖命令文本猜测：PostTool 重新计算当前 Git Source 指纹，只把指纹不一致的 non-stale heads 精确变为
+`stale`；无法计算时把仍为 fresh 的 heads 变为 `unknown`，匹配的 head 不受其它 provider 旧账牵连。
+失败/未知 tool status 也必须对可能的部分写入做相同对账，事件保存观察到的 Source 指纹和实际转换的
+head 身份。
+
+持久化状态不是权限结论。Session/Intent/PreTool/Stop、Finding hard gate、`--require-engine` 和
+`evidence status` 都会现场重算 `effective_freshness`：persisted fresh 但 Source 不一致时立即按 stale，
+无法验证时按 unknown，因而即使 PostTool 漏报也不能取得硬权限。源码恰好切回旧指纹不会自动恢复
+stale/unknown。Provider 结果在提升 head 前还必须再次匹配当前 Source；不匹配会在任何 Evidence 写入前
+拒绝。提升成功时，同一事务会 stale 同项目其它不同 Source 指纹的 fresh heads，再沿显式 upstream
+传播失效。只有重新运行对应的受信任 Provider 才能恢复各自 `fresh`。
+`stale`/`unknown` 证据永远没有硬阻断资格。即便是 effective-fresh + complete + deterministic + error
+finding，也仍须仓库规则显式提供 authority/strength/effect，Provider 本身不能自动 block。
 
 Test 已作为独立 Evidence Plane 进入协议与 SQLite schema v14。`EvidenceFinding` 默认是 advisory；
-只有精确命中仓库 `finding_effect_mappings`，并同时满足 fresh、complete、deterministic provider 与
+只有精确命中仓库 `finding_effect_mappings`，并同时满足 effective-fresh、当前 Source 指纹匹配、
+complete、deterministic provider 与
 `deterministic_violation` 的 error，才可能在 Stop 产生 ContinueWork。.NET、Rust 与 Godot Scenario
 均使用独立固定 Test 合同；普通 Build/Runtime 结果不会被伪装成 Test Evidence。
 
@@ -306,7 +320,8 @@ project-brain evidence build python \
 版本探测和构建都以项目根为工作目录，使仓库根 `global.json` 约束实际 SDK，且 Evidence 记录的
 toolchain version 与真正构建一致。已准备的 NuGet restore metadata 会复制到机器私有临时目录，
 bin/obj 也只写入该目录。Godot C# 可用
-`--require-engine` 强制引用唯一的 fresh、complete、deterministic Engine head。Rust 固定执行
+`--require-engine` 强制引用唯一的 effective-fresh、当前 Source 匹配、complete、deterministic Engine
+head。Rust 固定执行
 `cargo build --workspace --all-targets --frozen` 并使用临时 target。两者都可能执行仓库控制的
 MSBuild task、build.rs 或 proc macro，因此除了信任机器 executable，还必须单独确认
 `--trust-repository-build-code`。
@@ -398,14 +413,15 @@ project-brain evidence test python \
 Project Brain 先验证清单与 Build target，物理复制 Git Source，再固定执行 `python -I -S -B -X utf8 -c
 <adapter-bootstrap>`。bootstrap 只调用清单中的同步、零参数、模块自有函数；返回值必须为 None。结果由
 adapter 结构化为 passed/assertion_failed/error，不采信仓库提供的消息或结果文件。AssertionError 产生
-`python_test_assertion_failed + deterministic_violation`，但仍必须经过 fresh/complete Evidence 与显式
+`python_test_assertion_failed + deterministic_violation`，但仍必须经过 effective-fresh/complete Evidence 与显式
 finding effect 映射才可能 hard block；其他 exception、runner failure、截断与超时保持 advisory。当前
 执行环境不是 OS 网络沙箱，仓库测试代码仍需独立显式信任。
 
 ## Godot Scenario Test Evidence Provider
 
 Godot Scenario Test 只运行仓库内明确指定的 `.tscn`，并要求其对应的 Godot C# Build 已产生
-fresh、complete、deterministic、无 finding 的 `dotnet-build.<profile>` Evidence：
+effective-fresh、当前 Source 匹配、complete、deterministic、无 finding 的
+`dotnet-build.<profile>` Evidence：
 
 ```text
 project-brain evidence test godot \
@@ -419,7 +435,7 @@ project-brain evidence test godot \
   --quit-after 600
 ```
 
-Provider 要求 Build 精确引用一个匹配 Godot executable SHA-256 的 fresh Engine head；随后物理复制
+Provider 要求 Build 精确引用一个匹配 Godot executable SHA-256 的 effective-fresh Engine head；随后物理复制
 Git Source manifest、物化精确 Build CAS、固定执行 `--import`，再固定运行该场景。它不接受自定义
 Godot 参数、`--script`、shell、restore、build 或任何 export。Source、CAS 与 executable 在运行前后
 都会重新校验；场景若修改暂存源码，结果直接丢弃。
@@ -445,7 +461,7 @@ Godot 参数、`--script`、shell、restore、build 或任何 export。Source、
 
 ## Godot 隔离 Runtime Evidence
 
-Runtime v1 只接受已绑定在当前 fresh、complete、deterministic Build head 上的
+Runtime v1 只接受已绑定在当前 effective-fresh、Source 匹配、complete、deterministic Build head 上的
 `RuntimeArtifactBundle`：
 
 ```text

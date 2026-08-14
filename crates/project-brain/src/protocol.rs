@@ -10,8 +10,39 @@ use brain_core::{
 use brain_evidence::{EvidenceFreshness, EvidencePlane};
 use brain_store::{BrainStore, SemanticResolutionKind, SemanticSourceTrust};
 
+use crate::evidence::{CurrentSourceVerification, effective_evidence_freshness};
 use crate::provider::ProviderTrustStatus;
-use crate::{app::decision_reason, error::AppError, reconcile};
+use crate::{app::decision_reason, error::AppError, git, reconcile};
+
+const SOURCE_BOUND_EVIDENCE_PLANES: [EvidencePlane; 6] = [
+    EvidencePlane::Source,
+    EvidencePlane::Semantic,
+    EvidencePlane::Engine,
+    EvidencePlane::Build,
+    EvidencePlane::Test,
+    EvidencePlane::Runtime,
+];
+
+struct EvidenceStalenessTrigger {
+    invalidation: EvidenceInvalidation,
+    reason: String,
+    changed_paths: Vec<String>,
+}
+
+enum EvidenceInvalidation {
+    AllSourceBound(EvidenceFreshness),
+    ReconcileSource(Option<String>),
+}
+
+impl EvidenceInvalidation {
+    fn freshness(&self) -> EvidenceFreshness {
+        match self {
+            Self::AllSourceBound(freshness) => *freshness,
+            Self::ReconcileSource(Some(_)) => EvidenceFreshness::Stale,
+            Self::ReconcileSource(None) => EvidenceFreshness::Unknown,
+        }
+    }
+}
 
 pub fn process(
     root: &Path,
@@ -23,16 +54,25 @@ pub fn process(
     event.validate()?;
     let payload = match &event.payload {
         HookEventPayload::SessionOpened(_) => {
+            let current_source = CurrentSourceVerification::inspect(root);
             let mut inject = vec![ContextItem {
                 text: session_context(config),
             }];
-            inject.extend(evidence_context(store, &config.project_key, true)?);
+            inject.extend(evidence_context(
+                store,
+                &config.project_key,
+                &current_source,
+                true,
+            )?);
             HookOutcomePayload::SessionOpened { inject }
         }
-        HookEventPayload::IntentDeclared(_) => HookOutcomePayload::IntentDeclared {
-            gate: GateDecision::NoVeto,
-            inject: evidence_context(store, &config.project_key, false)?,
-        },
+        HookEventPayload::IntentDeclared(_) => {
+            let current_source = CurrentSourceVerification::inspect(root);
+            HookOutcomePayload::IntentDeclared {
+                gate: GateDecision::NoVeto,
+                inject: evidence_context(store, &config.project_key, &current_source, false)?,
+            }
+        }
         HookEventPayload::ToolAboutToRun(tool) => {
             let decision = evaluate_action(
                 root,
@@ -44,72 +84,36 @@ pub fn process(
                 &tool.tool_name,
             )?;
             let mut inject = context_from_decision(&decision);
-            inject.extend(evidence_context(store, &config.project_key, false)?);
+            let current_source = CurrentSourceVerification::inspect(root);
+            inject.extend(evidence_context(
+                store,
+                &config.project_key,
+                &current_source,
+                false,
+            )?);
             HookOutcomePayload::ToolAboutToRun {
                 gate: gate_from_decision(&decision),
                 inject,
             }
         }
         HookEventPayload::ToolFinished(tool) => {
-            let decision = evaluate_action(
-                root,
-                config,
-                store,
-                provider_trust,
-                event,
-                &tool.action,
-                &tool.tool_name,
-            )?;
-            let mut feedback = feedback_from_decision(&decision);
-            if explicit_mutation(&tool.action) {
-                let affected_planes = [
-                    EvidencePlane::Semantic,
-                    EvidencePlane::Engine,
-                    EvidencePlane::Build,
-                    EvidencePlane::Test,
-                    EvidencePlane::Runtime,
-                ];
-                let has_affected_head = store
-                    .list_evidence_head_summaries(&config.project_key)?
-                    .iter()
-                    .any(|head| affected_planes.contains(&head.plane));
-                if !has_affected_head {
-                    return Ok(InternalHookOutcome {
-                        protocol_version: HOOK_PROTOCOL_VERSION,
-                        event_id: event.event_id.clone(),
-                        payload: HookOutcomePayload::ToolFinished { feedback },
-                    });
-                }
-                let changed_paths = mutation_paths(&tool.action);
-                let reason = format!(
-                    "PostToolUse observed {:?} {:?}; downstream Evidence must be refreshed",
-                    tool.status, tool.action.kind
-                );
-                let stale = store.mark_evidence_planes_stale(
-                    &config.project_key,
-                    &affected_planes,
-                    &event.event_id,
-                    &reason,
-                    &changed_paths,
-                )?;
-                if stale.heads_marked > 0 {
-                    feedback.push(FeedbackItem {
-                        severity: FeedbackSeverity::Warning,
-                        text: "Project Brain：源码修改后现有 Semantic/Engine/Build/Test/Runtime Evidence 已标记为 stale；stale 证据没有硬阻断资格。请重新运行对应的受信任 Provider 恢复 fresh。".to_owned(),
-                    });
-                }
-            }
-            HookOutcomePayload::ToolFinished { feedback }
+            tool_finished_payload(root, config, store, provider_trust, event, tool)?
         }
         HookEventPayload::TaskStopping(stopping) => {
+            let current_source = CurrentSourceVerification::inspect(root);
             let (stop, mut feedback) = stop_decision(
                 root,
                 config,
                 store,
                 provider_trust,
+                &current_source,
                 stopping.vendor_loop_active,
             );
-            feedback.extend(evidence_feedback(store, &config.project_key)?);
+            feedback.extend(evidence_feedback(
+                store,
+                &config.project_key,
+                &current_source,
+            )?);
             HookOutcomePayload::TaskStopping { stop, feedback }
         }
     };
@@ -120,11 +124,150 @@ pub fn process(
     })
 }
 
+fn tool_finished_payload(
+    root: &Path,
+    config: &BrainConfig,
+    store: &BrainStore,
+    provider_trust: &BTreeMap<String, ProviderTrustStatus>,
+    event: &InternalHookEvent,
+    tool: &brain_core::ToolFinished,
+) -> Result<HookOutcomePayload, AppError> {
+    let decision = evaluate_action(
+        root,
+        config,
+        store,
+        provider_trust,
+        event,
+        &tool.action,
+        &tool.tool_name,
+    )?;
+    let mut feedback = feedback_from_decision(&decision);
+    if let Some(trigger) =
+        evidence_staleness_trigger(root, store, &config.project_key, &tool.action, tool.status)?
+    {
+        let invalidation = match &trigger.invalidation {
+            EvidenceInvalidation::AllSourceBound(EvidenceFreshness::Stale) => store
+                .mark_evidence_planes_stale(
+                    &config.project_key,
+                    &SOURCE_BOUND_EVIDENCE_PLANES,
+                    &event.event_id,
+                    &trigger.reason,
+                    &trigger.changed_paths,
+                )?,
+            EvidenceInvalidation::AllSourceBound(EvidenceFreshness::Unknown) => store
+                .mark_evidence_planes_unknown(
+                    &config.project_key,
+                    &SOURCE_BOUND_EVIDENCE_PLANES,
+                    &event.event_id,
+                    &trigger.reason,
+                    &trigger.changed_paths,
+                )?,
+            EvidenceInvalidation::AllSourceBound(EvidenceFreshness::Fresh) => {
+                unreachable!("invalidation 不能产生 fresh")
+            }
+            EvidenceInvalidation::ReconcileSource(current_source_fingerprint) => store
+                .reconcile_evidence_source(
+                    &config.project_key,
+                    current_source_fingerprint.as_deref(),
+                    &event.event_id,
+                    &trigger.reason,
+                    &trigger.changed_paths,
+                )?,
+        };
+        if invalidation.heads_marked > 0 {
+            let freshness = trigger.invalidation.freshness().as_str();
+            feedback.push(FeedbackItem {
+                severity: FeedbackSeverity::Warning,
+                text: format!("Project Brain：检测到源码变更或无法排除不透明工具的源码变更，现有 Source/Semantic/Engine/Build/Test/Runtime Evidence 已标记为 {freshness}；非 fresh 证据没有硬阻断资格。请重新运行对应的受信任 Provider 恢复 fresh。"),
+            });
+        }
+    }
+    Ok(HookOutcomePayload::ToolFinished { feedback })
+}
+
 fn explicit_mutation(action: &ToolAction) -> bool {
     matches!(
         action.kind,
         ActionKind::Create | ActionKind::Modify | ActionKind::Delete
     )
+}
+
+fn opaque_action_may_mutate_source(action: &ToolAction) -> bool {
+    matches!(
+        action.kind,
+        ActionKind::Execute | ActionKind::GitOperation | ActionKind::Unknown
+    )
+}
+
+fn evidence_staleness_trigger(
+    root: &Path,
+    store: &BrainStore,
+    project_key: &str,
+    action: &ToolAction,
+    status: brain_core::ToolStatus,
+) -> Result<Option<EvidenceStalenessTrigger>, AppError> {
+    let heads = store.list_evidence_head_summaries(project_key)?;
+    let affected_heads = heads
+        .iter()
+        .filter(|head| SOURCE_BOUND_EVIDENCE_PLANES.contains(&head.plane))
+        .collect::<Vec<_>>();
+    if affected_heads.is_empty() {
+        return Ok(None);
+    }
+    if explicit_mutation(action) {
+        return Ok(Some(EvidenceStalenessTrigger {
+            invalidation: EvidenceInvalidation::AllSourceBound(EvidenceFreshness::Stale),
+            reason: format!(
+                "PostToolUse observed {status:?} {:?}; downstream Evidence must be refreshed",
+                action.kind
+            ),
+            changed_paths: mutation_paths(action),
+        }));
+    }
+    if !opaque_action_may_mutate_source(action) {
+        return Ok(None);
+    }
+    if affected_heads
+        .iter()
+        .all(|head| head.freshness == EvidenceFreshness::Stale)
+    {
+        return Ok(None);
+    }
+
+    let Ok(current_fingerprint) = git::worktree_fingerprint(root) else {
+        if !affected_heads
+            .iter()
+            .any(|head| head.freshness == EvidenceFreshness::Fresh)
+        {
+            return Ok(None);
+        }
+        return Ok(Some(EvidenceStalenessTrigger {
+            invalidation: EvidenceInvalidation::ReconcileSource(None),
+            reason: format!(
+                "PostToolUse observed {status:?} opaque {:?}; current Source fingerprint is unavailable, so source-dependent Evidence validity is unknown",
+                action.kind
+            ),
+            changed_paths: git::changed_files(root, "HEAD").unwrap_or_default(),
+        }));
+    };
+    let mismatched_heads = affected_heads
+        .iter()
+        .filter(|head| {
+            head.freshness != EvidenceFreshness::Stale
+                && head.source_fingerprint != current_fingerprint
+        })
+        .count();
+    if mismatched_heads == 0 {
+        return Ok(None);
+    }
+    Ok(Some(EvidenceStalenessTrigger {
+        invalidation: EvidenceInvalidation::ReconcileSource(Some(current_fingerprint)),
+        reason: format!(
+            "PostToolUse observed {status:?} opaque {:?}; current Source fingerprint differs from {mismatched_heads} non-stale source-bound Evidence head(s)",
+            action.kind
+        ),
+        changed_paths: git::changed_files(root, "HEAD").unwrap_or_default(),
+    }))
 }
 
 fn mutation_paths(action: &ToolAction) -> Vec<String> {
@@ -143,46 +286,87 @@ fn mutation_paths(action: &ToolAction) -> Vec<String> {
 fn evidence_context(
     store: &BrainStore,
     project_key: &str,
+    current_source: &CurrentSourceVerification,
     include_fresh: bool,
 ) -> Result<Vec<ContextItem>, AppError> {
     Ok(store
         .list_evidence_head_summaries(project_key)?
         .into_iter()
-        .filter(|head| include_fresh || head.freshness != EvidenceFreshness::Fresh)
-        .map(|head| ContextItem {
-            text: evidence_message(
-                head.plane,
-                &head.provider_id,
+        .filter_map(|head| {
+            let effective = effective_evidence_freshness(
                 head.freshness,
-                &head.snapshot_fingerprint,
-                head.stale_reason.as_deref(),
-            ),
+                &head.source_fingerprint,
+                current_source,
+            );
+            (include_fresh || effective.freshness != EvidenceFreshness::Fresh).then(|| {
+                ContextItem {
+                    text: evidence_message(
+                        head.plane,
+                        &head.provider_id,
+                        head.freshness,
+                        effective.freshness,
+                        &head.snapshot_fingerprint,
+                        combined_freshness_reason(
+                            head.stale_reason.as_deref(),
+                            effective.reason.as_deref(),
+                        )
+                        .as_deref(),
+                    ),
+                }
+            })
         })
         .collect())
 }
 
-fn evidence_feedback(store: &BrainStore, project_key: &str) -> Result<Vec<FeedbackItem>, AppError> {
+fn evidence_feedback(
+    store: &BrainStore,
+    project_key: &str,
+    current_source: &CurrentSourceVerification,
+) -> Result<Vec<FeedbackItem>, AppError> {
     Ok(store
         .list_evidence_head_summaries(project_key)?
         .into_iter()
-        .filter(|head| head.freshness != EvidenceFreshness::Fresh)
-        .map(|head| FeedbackItem {
-            severity: FeedbackSeverity::Warning,
-            text: evidence_message(
-                head.plane,
-                &head.provider_id,
+        .filter_map(|head| {
+            let effective = effective_evidence_freshness(
                 head.freshness,
-                &head.snapshot_fingerprint,
-                head.stale_reason.as_deref(),
-            ),
+                &head.source_fingerprint,
+                current_source,
+            );
+            (effective.freshness != EvidenceFreshness::Fresh).then(|| FeedbackItem {
+                severity: FeedbackSeverity::Warning,
+                text: evidence_message(
+                    head.plane,
+                    &head.provider_id,
+                    head.freshness,
+                    effective.freshness,
+                    &head.snapshot_fingerprint,
+                    combined_freshness_reason(
+                        head.stale_reason.as_deref(),
+                        effective.reason.as_deref(),
+                    )
+                    .as_deref(),
+                ),
+            })
         })
         .collect())
+}
+
+fn combined_freshness_reason(recorded: Option<&str>, effective: Option<&str>) -> Option<String> {
+    match (recorded, effective) {
+        (Some(recorded), Some(effective)) if recorded != effective => {
+            Some(format!("{recorded}；实时验证：{effective}"))
+        }
+        (Some(recorded), _) => Some(recorded.to_owned()),
+        (None, Some(effective)) => Some(effective.to_owned()),
+        (None, None) => None,
+    }
 }
 
 fn evidence_message(
     plane: EvidencePlane,
     provider_id: &str,
-    freshness: EvidenceFreshness,
+    recorded_freshness: EvidenceFreshness,
+    effective_freshness: EvidenceFreshness,
     snapshot_fingerprint: &str,
     stale_reason: Option<&str>,
 ) -> String {
@@ -190,9 +374,10 @@ fn evidence_message(
         .map(|value| format!("；原因：{value}"))
         .unwrap_or_default();
     format!(
-        "Project Brain {} Evidence：provider={provider_id}，freshness={}，snapshot={snapshot_fingerprint}{reason}。只有 fresh + complete + deterministic 的具体 error finding 才可能具备硬阻断资格；仍需仓库规则显式授权。",
+        "Project Brain {} Evidence：provider={provider_id}，recorded_freshness={}，effective_freshness={}，snapshot={snapshot_fingerprint}{reason}。只有 effective_freshness=fresh + complete + deterministic + 当前 Source 指纹匹配的具体 error finding 才可能具备硬阻断资格；仍需仓库规则显式授权。",
         plane.as_str(),
-        freshness.as_str()
+        recorded_freshness.as_str(),
+        effective_freshness.as_str()
     )
 }
 
@@ -477,12 +662,14 @@ fn stop_decision(
     config: &BrainConfig,
     store: &BrainStore,
     provider_trust: &BTreeMap<String, ProviderTrustStatus>,
+    current_source: &CurrentSourceVerification,
     vendor_loop_active: bool,
 ) -> (StopDecision, Vec<FeedbackItem>) {
     if vendor_loop_active {
         return (StopDecision::AllowStop, Vec::new());
     }
-    let (finding_violations, finding_feedback) = evaluate_finding_stop(config, store);
+    let (finding_violations, finding_feedback) =
+        evaluate_finding_stop(config, store, current_source);
     if !config.stop_reconcile.enabled {
         let (mut violations, mut feedback) =
             evaluate_symbol_stop(root, config, store, provider_trust);
@@ -562,6 +749,7 @@ fn stop_decision(
 fn evaluate_finding_stop(
     config: &BrainConfig,
     store: &BrainStore,
+    current_source: &CurrentSourceVerification,
 ) -> (Vec<String>, Vec<FeedbackItem>) {
     let heads = match store.list_evidence_heads(&config.project_key) {
         Ok(heads) => heads,
@@ -611,6 +799,11 @@ fn evaluate_finding_stop(
             });
             continue;
         }
+        let effective = effective_evidence_freshness(
+            head.freshness,
+            &head.snapshot.source_fingerprint,
+            current_source,
+        );
         for finding in head
             .snapshot
             .findings
@@ -625,7 +818,7 @@ fn evaluate_finding_stop(
                 RuleEffect::Block | RuleEffect::Escalate => {
                     if head
                         .snapshot
-                        .finding_can_hard_block(finding, head.freshness, true)
+                        .finding_can_hard_block(finding, effective.freshness, true)
                     {
                         violations.push(format!(
                             "{} 命中 {}/{}/{}：{}",
@@ -639,8 +832,14 @@ fn evaluate_finding_stop(
                         feedback.push(FeedbackItem {
                             severity: FeedbackSeverity::Warning,
                             text: format!(
-                                "Finding effect 映射 {} 命中 {}，但证据不满足 fresh + complete + deterministic violation；按 advisory 处理。",
-                                mapping.id, finding.code
+                                "Finding effect 映射 {} 命中 {}，但证据不满足 effective fresh + complete + deterministic violation + 当前 Source 指纹匹配；按 advisory 处理。{}",
+                                mapping.id,
+                                finding.code,
+                                effective
+                                    .reason
+                                    .as_deref()
+                                    .map(|reason| format!(" 原因：{reason}"))
+                                    .unwrap_or_default()
                             ),
                         });
                     }
@@ -813,6 +1012,7 @@ mod tests {
     };
 
     use super::{evaluate_finding_stop, evaluate_symbol_rules, evaluate_symbol_stop};
+    use crate::evidence::CurrentSourceVerification;
     use crate::git;
     use crate::provider::ProviderTrustStatus;
 
@@ -1173,21 +1373,45 @@ mod tests {
     #[test]
     fn finding_requires_explicit_mapping_and_fresh_authoritative_evidence() {
         let store = BrainStore::open_in_memory().unwrap();
+        let snapshot = test_failure_snapshot();
         store
-            .apply_evidence_snapshot(&test_failure_snapshot())
+            .apply_evidence_snapshot_for_current_source(&snapshot, &snapshot.source_fingerprint)
             .unwrap();
+        let matching_source = CurrentSourceVerification::Verified("sha256_source".to_owned());
 
         let (unmapped, unmapped_feedback) =
-            evaluate_finding_stop(&finding_config(Vec::new()), &store);
+            evaluate_finding_stop(&finding_config(Vec::new()), &store, &matching_source);
         assert!(unmapped.is_empty());
         assert!(unmapped_feedback.is_empty());
 
         let config = finding_config(vec![finding_mapping()]);
         config.validate().unwrap();
-        let (mapped, feedback) = evaluate_finding_stop(&config, &store);
+        let (mapped, feedback) = evaluate_finding_stop(&config, &store, &matching_source);
         assert_eq!(mapped.len(), 1);
         assert!(feedback.is_empty());
         assert!(mapped[0].contains("TEST-ASSERT-001"));
+
+        let mismatched_source =
+            CurrentSourceVerification::Verified("sha256_different_source".to_owned());
+        let (mismatched, mismatched_feedback) =
+            evaluate_finding_stop(&config, &store, &mismatched_source);
+        assert!(mismatched.is_empty());
+        assert!(
+            mismatched_feedback
+                .iter()
+                .any(|item| item.text.contains("当前 Source 指纹匹配"))
+        );
+
+        let unavailable_source =
+            CurrentSourceVerification::Unavailable("git unavailable".to_owned());
+        let (unavailable, unavailable_feedback) =
+            evaluate_finding_stop(&config, &store, &unavailable_source);
+        assert!(unavailable.is_empty());
+        assert!(
+            unavailable_feedback
+                .iter()
+                .any(|item| item.text.contains("无法验证"))
+        );
 
         store
             .mark_evidence_planes_stale(
@@ -1198,7 +1422,7 @@ mod tests {
                 &["src/Save.cs".to_owned()],
             )
             .unwrap();
-        let (stale, stale_feedback) = evaluate_finding_stop(&config, &store);
+        let (stale, stale_feedback) = evaluate_finding_stop(&config, &store, &matching_source);
         assert!(stale.is_empty());
         assert!(
             stale_feedback

@@ -6,6 +6,7 @@ mod claude;
 mod codex;
 mod database;
 mod error;
+mod evidence;
 mod git;
 mod godot;
 mod index;

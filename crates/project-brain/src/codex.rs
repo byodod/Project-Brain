@@ -686,6 +686,7 @@ mod tests {
     use std::{
         fs,
         path::Path,
+        process::Command,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -749,12 +750,36 @@ mod tests {
     }
 
     fn engine_snapshot(project_key: &str) -> EvidenceSnapshot {
+        engine_snapshot_for_source(project_key, "sha256_source-test")
+    }
+
+    fn engine_snapshot_for_source(project_key: &str, source_fingerprint: &str) -> EvidenceSnapshot {
         EvidenceSnapshot::new(
             project_key,
             EvidencePlane::Engine,
             EvidenceProvider {
                 id: "godot-engine-resolver".to_owned(),
                 version: "4.6+sha256.test".to_owned(),
+                contract_version: 1,
+                authority: EvidenceAuthority::Deterministic,
+            },
+            source_fingerprint,
+            EvidenceCoverage::Complete,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn source_snapshot(project_key: &str) -> EvidenceSnapshot {
+        EvidenceSnapshot::new(
+            project_key,
+            EvidencePlane::Source,
+            EvidenceProvider {
+                id: "git-source".to_owned(),
+                version: "1.0+sha256.test".to_owned(),
                 contract_version: 1,
                 authority: EvidenceAuthority::Deterministic,
             },
@@ -895,10 +920,15 @@ mod tests {
     }
 
     #[test]
-    fn successful_post_tool_mutation_marks_engine_evidence_stale_and_reports_it() {
+    fn successful_post_tool_mutation_marks_source_and_downstream_evidence_stale() {
         let store = BrainStore::open_in_memory().unwrap();
+        let engine = engine_snapshot("project_a");
         store
-            .apply_evidence_snapshot(&engine_snapshot("project_a"))
+            .apply_evidence_snapshot_for_current_source(&engine, &engine.source_fingerprint)
+            .unwrap();
+        let source = source_snapshot("project_a");
+        store
+            .apply_evidence_snapshot_for_current_source(&source, &source.source_fingerprint)
             .unwrap();
         let input = CodexHookInput {
             session_id: "session".to_owned(),
@@ -925,12 +955,13 @@ mod tests {
                 .unwrap()
                 .contains("已标记为 stale")
         );
-        let head = store
-            .list_evidence_heads("project_a")
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(head.freshness, EvidenceFreshness::Stale);
+        let heads = store.list_evidence_heads("project_a").unwrap();
+        assert_eq!(heads.len(), 2);
+        assert!(
+            heads
+                .iter()
+                .all(|head| head.freshness == EvidenceFreshness::Stale)
+        );
 
         let session = handle(
             Path::new("C:/repo"),
@@ -949,6 +980,123 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("freshness=stale")
+        );
+    }
+
+    #[test]
+    fn opaque_post_tool_preserves_matching_evidence_and_stales_source_drift() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "project-brain-codex-opaque-source-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        assert!(
+            Command::new("git")
+                .current_dir(&root)
+                .arg("init")
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let source_fingerprint = crate::git::worktree_fingerprint(&root).unwrap();
+        let store = BrainStore::open_in_memory().unwrap();
+        let engine = engine_snapshot_for_source("project_a", &source_fingerprint);
+        store
+            .apply_evidence_snapshot_for_current_source(&engine, &source_fingerprint)
+            .unwrap();
+
+        let read_only_shell = CodexHookInput {
+            session_id: "session".to_owned(),
+            cwd: root.to_string_lossy().into_owned(),
+            turn_id: "turn-1".to_owned(),
+            tool_name: "shell_command".to_owned(),
+            tool_use_id: "shell-read".to_owned(),
+            tool_input: json!({ "command": "git status" }),
+            tool_response: json!({ "exit_code": 0 }),
+            ..CodexHookInput::default()
+        };
+        handle(
+            &root,
+            &config("project_a"),
+            &store,
+            HookEvent::PostToolUse,
+            &read_only_shell,
+        )
+        .unwrap();
+        assert_eq!(
+            store.list_evidence_heads("project_a").unwrap()[0].freshness,
+            EvidenceFreshness::Fresh
+        );
+
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() { println!(\"changed\"); }\n",
+        )
+        .unwrap();
+        let mut mutating_shell = read_only_shell;
+        mutating_shell.turn_id = "turn-2".to_owned();
+        mutating_shell.tool_use_id = "shell-write".to_owned();
+        mutating_shell.tool_input = json!({ "command": "opaque generator invocation" });
+        let output = handle(
+            &root,
+            &config("project_a"),
+            &store,
+            HookEvent::PostToolUse,
+            &mutating_shell,
+        )
+        .unwrap();
+        assert!(
+            output.0["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("已标记为 stale")
+        );
+        assert_eq!(
+            store.list_evidence_heads("project_a").unwrap()[0].freshness,
+            EvidenceFreshness::Stale
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opaque_post_tool_with_unverifiable_source_removes_hard_authority() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let engine = engine_snapshot("project_a");
+        store
+            .apply_evidence_snapshot_for_current_source(&engine, &engine.source_fingerprint)
+            .unwrap();
+        let input = CodexHookInput {
+            session_id: "session".to_owned(),
+            cwd: "Z:/missing-project-brain-repository".to_owned(),
+            turn_id: "turn".to_owned(),
+            tool_name: "shell_command".to_owned(),
+            tool_use_id: "opaque-tool".to_owned(),
+            tool_input: json!({ "command": "opaque command" }),
+            tool_response: json!({ "exit_code": 1 }),
+            ..CodexHookInput::default()
+        };
+        let output = handle(
+            Path::new("Z:/missing-project-brain-repository"),
+            &config("project_a"),
+            &store,
+            HookEvent::PostToolUse,
+            &input,
+        )
+        .unwrap();
+        assert!(
+            output.0["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("标记为 unknown")
+        );
+        assert_eq!(
+            store.list_evidence_heads("project_a").unwrap()[0].freshness,
+            EvidenceFreshness::Unknown
         );
     }
 

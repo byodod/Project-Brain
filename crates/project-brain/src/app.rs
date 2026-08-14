@@ -13,9 +13,14 @@ use brain_core::{
 };
 use brain_evidence::{
     EvidenceAuthority, EvidenceCoverage, EvidenceFreshness, EvidencePlane, EvidenceReference,
+    EvidenceSnapshot,
 };
-use brain_store::{BrainStore, SemanticResolutionKind, inspect_database_storage};
+use brain_store::{
+    BrainStore, EvidenceApplyResult, EvidenceHeadSummary, SemanticResolutionKind,
+    inspect_database_storage,
+};
 use clap::ValueEnum;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -24,6 +29,7 @@ use crate::{
     codex::{self, CodexHookInput},
     database::{self, DatabaseAccessLock, DatabaseCompactOptions},
     error::AppError,
+    evidence::{CurrentSourceVerification, effective_evidence_freshness},
     git, godot, index,
     prime::{self, PrimeHookInput},
     provider, reconcile, runtime, scip_index, setup, test,
@@ -65,6 +71,25 @@ pub struct App {
     config: BrainConfig,
     store: BrainStore,
     _database_lock: DatabaseAccessLock,
+}
+
+#[derive(Debug, Serialize)]
+struct EvidenceStatusHead {
+    #[serde(flatten)]
+    recorded: EvidenceHeadSummary,
+    effective_freshness: EvidenceFreshness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EvidenceStatusReport<'a> {
+    schema_version: u16,
+    project_key: &'a str,
+    current_source_fingerprint: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_source_error: Option<&'a str>,
+    heads: Vec<EvidenceStatusHead>,
 }
 
 impl App {
@@ -578,9 +603,7 @@ impl App {
             trust_local_executable,
             timeout_seconds,
         )?;
-        let persistence = self
-            .store
-            .apply_evidence_snapshot(report.evidence_snapshot())?;
+        let persistence = self.persist_current_evidence_snapshot(report.evidence_snapshot())?;
         println!(
             "{}",
             pretty_json(&serde_json::json!({
@@ -593,13 +616,33 @@ impl App {
     }
 
     pub fn evidence_status(&self) -> Result<(), AppError> {
+        let current_source = CurrentSourceVerification::inspect(&self.root);
+        let heads = self
+            .store
+            .list_evidence_head_summaries(&self.config.project_key)?
+            .into_iter()
+            .map(|recorded| {
+                let effective = effective_evidence_freshness(
+                    recorded.freshness,
+                    &recorded.source_fingerprint,
+                    &current_source,
+                );
+                EvidenceStatusHead {
+                    recorded,
+                    effective_freshness: effective.freshness,
+                    effective_reason: effective.reason,
+                }
+            })
+            .collect();
         println!(
             "{}",
-            pretty_json(
-                &self
-                    .store
-                    .list_evidence_head_summaries(&self.config.project_key)?
-            )?
+            pretty_json(&EvidenceStatusReport {
+                schema_version: 1,
+                project_key: &self.config.project_key,
+                current_source_fingerprint: current_source.fingerprint(),
+                current_source_error: current_source.error(),
+                heads,
+            })?
         );
         Ok(())
     }
@@ -627,9 +670,7 @@ impl App {
             evidence_heads: &heads,
         })?;
         let succeeded = report.succeeded();
-        let persistence = self
-            .store
-            .apply_evidence_snapshot(report.evidence_snapshot())?;
+        let persistence = self.persist_current_evidence_snapshot(report.evidence_snapshot())?;
         println!(
             "{}",
             pretty_json(&serde_json::json!({
@@ -676,7 +717,7 @@ impl App {
             evidence_heads: &heads,
         })?;
         let passed = report.passed();
-        let persistence = self.store.apply_evidence_snapshot(&report.evidence)?;
+        let persistence = self.persist_current_evidence_snapshot(&report.evidence)?;
         println!(
             "{}",
             pretty_json(&serde_json::json!({
@@ -719,7 +760,7 @@ impl App {
             evidence_heads: &heads,
         })?;
         let passed = report.passed();
-        let persistence = self.store.apply_evidence_snapshot(&report.evidence)?;
+        let persistence = self.persist_current_evidence_snapshot(&report.evidence)?;
         println!(
             "{}",
             pretty_json(&serde_json::json!({
@@ -764,7 +805,7 @@ impl App {
             evidence_heads: &heads,
         })?;
         let passed = report.passed();
-        let persistence = self.store.apply_evidence_snapshot(&report.evidence)?;
+        let persistence = self.persist_current_evidence_snapshot(&report.evidence)?;
         println!(
             "{}",
             pretty_json(&serde_json::json!({
@@ -813,7 +854,7 @@ impl App {
             evidence_heads: &heads,
         })?;
         let passed = report.passed();
-        let persistence = self.store.apply_evidence_snapshot(&report.evidence)?;
+        let persistence = self.persist_current_evidence_snapshot(&report.evidence)?;
         println!(
             "{}",
             pretty_json(&serde_json::json!({
@@ -915,9 +956,7 @@ impl App {
 
     fn persist_build_report(&self, report: &build::BuildRunReport) -> Result<(), AppError> {
         let succeeded = report.succeeded();
-        let persistence = self
-            .store
-            .apply_evidence_snapshot(report.evidence_snapshot())?;
+        let persistence = self.persist_current_evidence_snapshot(report.evidence_snapshot())?;
         println!(
             "{}",
             pretty_json(&serde_json::json!({
@@ -935,22 +974,43 @@ impl App {
         }
     }
 
+    fn persist_current_evidence_snapshot(
+        &self,
+        snapshot: &EvidenceSnapshot,
+    ) -> Result<EvidenceApplyResult, AppError> {
+        let current_source_fingerprint = git::worktree_fingerprint(&self.root)?;
+        Ok(self
+            .store
+            .apply_evidence_snapshot_for_current_source(snapshot, &current_source_fingerprint)?)
+    }
+
     fn required_engine_reference(&self) -> Result<EvidenceReference, AppError> {
+        let current_source = CurrentSourceVerification::inspect(&self.root);
         let candidates = self
             .store
             .list_evidence_head_summaries(&self.config.project_key)?
             .into_iter()
             .filter(|head| {
                 head.plane == EvidencePlane::Engine
-                    && head.freshness == EvidenceFreshness::Fresh
+                    && effective_evidence_freshness(
+                        head.freshness,
+                        &head.source_fingerprint,
+                        &current_source,
+                    )
+                    .freshness
+                        == EvidenceFreshness::Fresh
                     && head.coverage == EvidenceCoverage::Complete
                     && head.authority == EvidenceAuthority::Deterministic
             })
             .collect::<Vec<_>>();
         if candidates.len() != 1 {
             return Err(AppError::Provider(format!(
-                "--require-engine 需要且只允许一个 fresh+complete+deterministic Engine head，实际={}",
-                candidates.len()
+                "--require-engine 需要且只允许一个与当前 Source 指纹匹配的 effective-fresh+complete+deterministic Engine head，实际={}{}",
+                candidates.len(),
+                current_source
+                    .error()
+                    .map(|error| format!("；当前 Source fingerprint 无法验证：{error}"))
+                    .unwrap_or_default()
             )));
         }
         let head = &candidates[0];

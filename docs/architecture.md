@@ -149,9 +149,9 @@ SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照�
 进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
 符号 ID、快照 revision、节点/边主键、查询和墓碑更新都包含 `project_key`。数据库 schema v4
 首次建立这组项目隔离约束；对应迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与
-adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v15，并在这些约束上
+adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v16，并在这些约束上
 增加独立的语义血缘账本、append-only 来源证明、不可伪造的源码 Document manifest，以及
-Evidence Plane 当前 head 与 staleness 事件。
+Evidence Plane 当前 head 与带 `stale/unknown` 结果的失效事件。
 数据库迁移拒绝缺失或非整数的已有 `schema_version`，不会把损坏元数据静默当作 v1。
 Adapter 审计依赖 SQLite 唯一约束和 busy timeout，使并发连接对同一项目事件收敛到首次 outcome；
 失败记录可在重开数据库后由成功重试升级，后续重复成功不能覆盖首次成功。
@@ -171,7 +171,7 @@ confirmed / rejected / superseded / invalidated
            └── never rewrites SymbolNode / tombstone / snapshot
 ```
 
-SQLite schema v15 保存 semantic snapshots、append-only source attestations、source manifests、
+SQLite schema v16 保存 semantic snapshots、append-only source attestations、source manifests、
 symbol observations、group/member/generation run、candidate/evidence/decision，以及显式旧账压缩的
 run/group 审计、人工 pair materialization request 与 append-only Provider qualification events。压缩默认只读；apply 必须携带人工确认与幂等 request ID，且逻辑删除与审计同事务。
 物理压缩是后续独立维护协议，不能替代候选资格证明。`database stats` 只读打开当前 schema；
@@ -203,11 +203,15 @@ workspace run 的 union 不构成一致的语义世界，因此协议明确禁�
 
 Engine/Build/Runtime 等跨语言证据使用独立 ledger：不可变 `evidence_snapshots` 只按 fingerprint 保存
 一次完整 JSON，重复真实运行只追加小型 `evidence_attestations`；`evidence_heads` 保存每个项目、plane、
-provider 当前指向及 fresh/stale/unknown 状态。明确的文件 Create/Modify/Delete 完成事件以
-project + event ID 幂等写入 `evidence_staleness_events`，并把现有 Semantic、Engine、Build、Runtime
-heads 原子标为 stale。Provider 应用快照时按其显式 upstream 引用计算 freshness，并向依赖该
-fingerprint 的下游传递失效；重新执行对应真实 Provider 才能恢复自己的 head。这个结构避免重复保存
-大型 ArtifactGraph，也不把 stale finding 提升为硬阻断。
+provider 当前指向及 persisted fresh/stale/unknown 状态。明确的文件 Create/Modify/Delete 完成事件以
+project + event ID 幂等写入 `evidence_staleness_events`，并把现有 Source、Semantic、Engine、Build、
+Test、Runtime heads 原子标为 stale；不透明操作按当前 Git Source 指纹只降级真正不兼容的 heads。
+
+Persisted freshness 本身没有 authority。Session/Intent/PreTool/Stop、Finding gate、当前状态查询与
+upstream 选择都通过现场 Source 指纹计算 effective freshness；不一致/不可验证立即失去 hard authority，
+但源码重新相同不会自动恢复信任。Provider 结果在提升 head 前再次验证当前 Source，并在同一事务中
+stale 其它不同 Source 指纹的 fresh heads，再按显式 upstream 引用向下游传播。这个结构避免重复保存
+大型 ArtifactGraph，也不把过期 finding 提升为硬阻断。
 
 ## 阻断权限
 
@@ -293,4 +297,5 @@ Extension 安装器仍留在后续阶段。
 [ADR-0028](adr/0028-rust-test-fixed-contract.md) 与
 [ADR-0029](adr/0029-python-manifest-test-contract.md) 与
 [ADR-0030](adr/0030-dotnet-project-root-sdk-resolution.md) 与
-[ADR-0031](adr/0031-crash-safe-database-compaction.md)。
+[ADR-0031](adr/0031-crash-safe-database-compaction.md) 与
+[ADR-0032](adr/0032-post-tool-source-fingerprint-reconciliation.md)。

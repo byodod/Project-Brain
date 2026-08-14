@@ -37,6 +37,6 @@ Godot Provider 已能产生确定性 Engine Evidence Snapshot，但只打印 JSO
 ## 后果
 
 - Engine Evidence 成为可查询、可重放且不会因相同运行重复膨胀的项目状态。
-- 当前只对结构化 Create/Modify/Delete 保守失效；shell/git 的真实变更检测仍需基于变更前后源码清单，
-  不能靠命令文本猜测。
+- 本 ADR 最初只对结构化 Create/Modify/Delete 保守失效；shell/git 的缺口已由
+  [ADR-0032](0032-post-tool-source-fingerprint-reconciliation.md) supersede。
 - Build 与 Runtime Provider 可复用同一 ledger；跨 plane upstream 传播仍需在对应 Provider 落地时加入。

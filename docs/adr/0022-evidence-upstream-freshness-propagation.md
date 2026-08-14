@@ -4,7 +4,7 @@
 
 ## 状态
 
-Accepted
+Accepted；第 2 条的 Source 排除已由 ADR-0032 supersede
 
 ## 背景
 
@@ -36,4 +36,6 @@ Build 失效。一次 Hook 事件也可能同时影响多个 plane，而 v12 事
 
 - Build/Runtime Provider 可以安全接入同一 ledger，不会把旧验证误报为当前 fresh。
 - 传播由显式 EvidenceReference 驱动，而不是由 plane 名称猜依赖。
-- shell/git 修改仍不能靠命令文本猜测；后续需要基于变更前后 Source manifest 产生同类多 plane 事件。
+- shell/git 修改不能靠命令文本猜测；[ADR-0032](0032-post-tool-source-fingerprint-reconciliation.md)
+  已以 live Source fingerprint、effective freshness 与精确 head reconciliation 完成该权限边界，并将
+  Source Plane 纳入显式 mutation 失效目标。

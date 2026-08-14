@@ -169,6 +169,11 @@ adapter identity、event ID namespace 与 operation ID namespace，不能跨 ven
 `deny_intent=unsupported`；核心协议保留 `Deny` 类型供后续 adapter/rule 实现使用。
 `PostToolUse.tool_response` 只有存在可识别的 success、exit code、error 或 status 证据时才映射
 为 succeeded/failed，否则记录 unknown，不从事件名称猜测成功。
+明确 Create/Modify/Delete 始终失效全部 Source-bound Evidence，因为失败工具仍可能部分写入。Execute、
+GitOperation 与未知工具结束后不解析命令文本，而是把当前 Git Source 指纹逐一与 non-stale heads 的
+`source_fingerprint` 对账：只把不一致者记录为 `stale`；Git/文件系统无法验证时把 fresh 记录为
+`unknown`，已 stale 不会被覆盖，已 unknown 且重新匹配也不会自动 fresh。事件审计保存实际转换的
+plane/provider/snapshot 身份及观察到的 Source 指纹。
 
 Claude Code adapter v1 提供直接 `hook/dispatch` 协议入口和用户级 `settings.json` 安装器。
 安装器使用独立 manifest、精确 handler hash 与原子替换；只管理五个已实现事件。
@@ -191,6 +196,15 @@ settled continuation。
 项目与 provider 身份、source fingerprint、独立 snapshot fingerprint、coverage、显式 upstream
 引用、ArtifactGraph 与 findings。下游只在当前源码和全部 upstream fingerprint 一致时为 fresh；
 缺少当前证据为 unknown，任一指纹不同为 stale。
+SQLite v16 的 invalidation event 显式保存目标 freshness、观察到的 Source 指纹和实际转换的 head
+身份，确保“已证明漂移”的 stale 与“无法验证”的 unknown 不共享幂等身份；两者均不具备 hard-block
+资格。
+
+`evidence_heads.freshness` 是 persisted freshness，只回答 ledger 最后一次已知状态。任何当前权限消费都
+必须把它与现场 `git::worktree_fingerprint` 合成为 effective freshness：只有 persisted fresh、当前指纹
+可验证且与 snapshot Source 指纹相同，才是 effective fresh。指纹不一致为 effective stale；无法取得为
+effective unknown。自动路径只允许 fresh→stale、fresh→unknown、unknown→stale，不允许 stale/unknown
+因源码再次相同而恢复 fresh。
 
 Artifact ID 绑定 `project_key + provider_id + provider_key`，边的两端必须同时存在于本快照。
 只有 deterministic provider 产生的 complete、fresh、`deterministic_violation` error finding，在精确
@@ -214,12 +228,13 @@ Artifact ID 绑定 `project_key + provider_id + provider_key`，边的两端必�
 }
 ```
 
-Stop 只读取当前项目相同 plane/provider 的 head，并再次核对 contract version、freshness、coverage、
-Provider authority 与 finding authority。缺少 head、合同漂移、stale、partial、heuristic、warning、
-advisory finding 或未知 code 均不会产生隐式 Block。
+Stop 只读取当前项目相同 plane/provider 的 head，并再次核对 contract version、effective freshness、
+当前 Source 指纹、coverage、Provider authority 与 finding authority。缺少 head、合同漂移、Source
+不可验证/不一致、stale/unknown、partial、heuristic、warning、advisory finding 或未知 code 均不会产生
+隐式 Block。
 
 .NET Test run schema v1 使用 `dotnet-test.<profile>` provider。它只接受指定
-`dotnet-build.<build_profile>` 当前 head，并要求该 Build 为 fresh、complete、deterministic、无
+`dotnet-build.<build_profile>` 当前 head，并要求该 Build 为 effective-fresh、Source 匹配、complete、deterministic、无
 finding；CAS manifest 的 project/provider/source/build_target、测试程序集条目与 dotnet executable
 SHA-256 必须精确匹配。实际 argv 固定为 `dotnet vstest <bundle assembly> --Logger:trx
 --ResultsDirectory:<scratch> --nologo`，不读取仓库 runner 参数。
@@ -231,7 +246,7 @@ hard-block 资格。v1 无法从 TRX Counters 证明失败一定是声明的 ass
 advisory；这刻意阻止“所有测试 error 自动 block”。
 
 Rust Test run schema v1 使用 `cargo-test.<profile>` provider。它只接受指定
-`cargo-build.<build_profile>` 当前 head，并要求该 Build 为 fresh、complete、deterministic、无 finding；
+`cargo-build.<build_profile>` 当前 head，并要求该 Build 为 effective-fresh、Source 匹配、complete、deterministic、无 finding；
 Source fingerprint、Build Snapshot 的规范 `build_target` artifact 与 cargo executable SHA-256 必须
 分别匹配当前工作树、当前 `Cargo.toml` 和本次工具链。
 
@@ -242,7 +257,7 @@ feature、filter、runner、shell、env 或网络。多个稳定版 libtest `tes
 `rust_test_failed` 只能是 advisory，因为文本 v1 不能证明失败一定来自声明断言。
 
 Python Test run schema v1 使用 `python-test.<profile>` provider。它只接受指定
-`python-compile.<build_profile>` 当前 head，并要求 Build 为 fresh、complete、deterministic、无 finding；
+`python-compile.<build_profile>` 当前 head，并要求 Build 为 effective-fresh、Source 匹配、complete、deterministic、无 finding；
 Source fingerprint、规范 `build_target=source_root` 与 Python executable SHA-256 必须一致。仓库 manifest
 只接受 schema_version 与有界、无重复、按顺序的 ASCII `module/function`，module 必须唯一映射到
 source_root 内 Git Source 的 Python 文件。
@@ -255,7 +270,7 @@ effect。
 
 Godot Scenario Test schema v1 使用 `godot-scenario-test.<profile>` provider。它只接受与当前 Source、
 `build_target` 和主程序集绑定一致的 `dotnet-build.<build_profile>` CAS，并要求 Build upstream 恰好含
-一个 fresh、complete、deterministic、无 finding 且 executable SHA-256 匹配的 Engine head。Source
+一个 effective-fresh、Source 匹配、complete、deterministic、无 finding 且 executable SHA-256 匹配的 Engine head。Source
 从 Git manifest 物理复制；Build bundle 固定物化到 staged Godot Debug 输出目录。import 与场景 argv
 由 adapter 构造，不允许 repository args、shell、script、build、restore 或 export。
 
@@ -308,9 +323,9 @@ CAS 提升失败时仍保存已完成的 Build 观测，但状态为 `incomplete
 `runtime_bundle_unavailable(warning)`；错误文本只以 fingerprint 进入 Evidence，避免把机器绝对路径
 写入不可变快照。该 Build 不能供 Runtime 使用。
 
-Godot Runtime run schema v1 要求指定 bundle 必须由当前项目同 provider 的 fresh、complete、
+Godot Runtime run schema v1 要求指定 bundle 必须由当前项目同 provider 的 effective-fresh、Source 匹配、complete、
 deterministic Build head 直接绑定，Build 不得含 finding，Source fingerprint 必须与当前 worktree
-相同，Build 引用的 Engine head 也必须仍为 current+fresh，且 Godot executable SHA-256 与该 Engine
+相同，Build 引用的 Engine head 也必须仍为 current+effective-fresh，且 Godot executable SHA-256 与该 Engine
 证明一致。任一准备条件失败只拒绝本次 run，不伪造 Runtime Snapshot。
 
 通过准备后，Runtime 以 Git `ls-files --cached --others --exclude-standard` 建立 staged Source manifest；
@@ -324,19 +339,23 @@ Source B 的 TOCTOU 检查。之后从 CAS 物理复制 bundle 到 Godot 固定�
 Evidence，原始日志保留在 machine-private run 目录。每个目录包含 project-bound marker 与原子 journal；
 自动清理在精确 DB/marker/root 匹配的恢复合同完成前保持禁用。
 
-SQLite schema v14 为 Evidence Protocol 维护四类项目隔离记录：
+SQLite schema v16 为 Evidence Protocol 维护四类项目隔离记录：
 
 - `evidence_snapshots`：不可变完整快照；相同 project/plane/provider/fingerprint 只保存一次 JSON；
 - `evidence_attestations`：每次真实 Provider 运行的轻量 append-only 证明；
-- `evidence_heads`：每个 project/plane/provider 的当前 fingerprint 与 fresh/stale 状态；
-- `evidence_staleness_events`：以 project + event ID 幂等记录一次事件影响的规范 plane 集合。
+- `evidence_heads`：每个 project/plane/provider 的当前 fingerprint 与 fresh/stale/unknown persisted 状态；
+- `evidence_staleness_events`：以 project + event ID 幂等记录目标状态、规范 plane 集合、精确 head 身份、
+  Source 观察和路径辅助证据。
 
-成功应用快照会原子追加 attestation、移动 head，并用当前 upstream heads 验证所有显式引用。缺失引用
+生产 CLI 在成功 Provider run 后重新计算当前 Git Source 指纹；若与结果不一致，任何 snapshot、
+attestation 或 head 提升都不会发生。验证一致后，单个事务会追加 snapshot/attestation、移动 head，并
+把同项目其它不同 Source 指纹的 fresh heads 标 stale，再用当前 upstream heads 验证所有显式引用。缺失引用
 得到 unknown；fingerprint 不一致或上游 stale 得到 stale。上游 head 变化会沿显式引用传递到下游，
 但上游恢复不会自动恢复旧下游；每个 Provider 必须真实重跑才能恢复自己的 head。三种 Agent adapter
-共用的内部 `PostToolUse` 路径在观察到明确 Create/Modify/Delete 后，把现有 Semantic、Engine、Build、
-Test、Runtime heads 作为一个幂等事件原子标为 stale；Session、Intent、PreTool 与 Stop 只注入状态提示，
-不凭 stale 状态自动阻断。失败或未知状态的修改工具也可能已产生部分写入，因此同样保守失效。
+共用的内部 `PostToolUse` 路径在观察到明确 Create/Modify/Delete 后，把现有 Source、Semantic、Engine、
+Build、Test、Runtime heads 作为一个幂等事件原子标为 stale；不透明操作使用逐 head Source 对账。
+Session、Intent、PreTool 与 Stop 注入 recorded/effective 双层状态，Finding hard gate 只接受 effective fresh。
+失败或未知状态的修改工具也可能已产生部分写入，因此同样保守失效。
 
 ## AnalysisReport
 
@@ -487,7 +506,7 @@ V8 的 ambiguity 属于 `semantic_lineage_groups`；candidate 的旧 `ambiguity_
    snapshot 或跨 provider 建 equivalence；
 10. 已导入但不是当前最新的历史 snapshot 不能重新应用为当前符号图。
 
-SQLite schema v15 保存 semantic snapshots、source attestations、source manifests、symbol observations、
+SQLite schema v16 保存 semantic snapshots、source attestations、source manifests、symbol observations、
 lineage groups/members/generation runs、candidate/evidence/decision 与 legacy compaction audit。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升
 为硬证据，也不会从现存 symbol 反推缺失 Document。真实重跑相同 snapshot 时可以首次补录 manifest；
 可信重跑只追加 attestation，不改写 symbol observations 或人工 lineage 状态。attestation 的唯一身份
