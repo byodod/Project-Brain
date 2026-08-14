@@ -223,19 +223,30 @@ project-brain install-hooks claude-code
 ## Prime Agent 独立 Runtime 接入
 
 Prime Agent 不是挂载在 Codex/Claude Code 上的客户端。Project Brain 为其保留独立 adapter、
-事件幂等域与审计域。当前已开放 Rust 侧直接协议入口，供 Prime Extension 开发和 fixture 使用：
+事件幂等域与审计域。先完成机器级安装，再安装全局用户级 Extension：
 
 ```text
+project-brain install
+project-brain install-hooks prime-agent
+project-brain doctor prime-agent
 project-brain capabilities prime-agent
 project-brain hook prime-agent pre-tool-use
 project-brain dispatch prime-agent pre-tool-use
 ```
 
-输入由 Prime Extension 从正式 `input`、`before_agent_start`、`tool_call`、`tool_result` 与
-`agent_end` event 规范化。输出是 Project Brain 自有 JSON，不复用 Codex/Claude vendor JSON；
-`tool_call` 可以依据 `block` 拒绝执行。Prime 当前没有已确认的 settled/Stop continuation 契约，
-因此 `continue_after_stop` 必须保持 `unsupported`。本阶段尚未开放
-`install-hooks prime-agent`，不会向 `~/.prime/agent/extensions/` 写入未经原子安装测试的文件。
+可用 `--prime-home` 显式指定配置根；省略时读取 `PRIME_AGENT_CODING_AGENT_DIR` 或
+`~/.prime/agent`。安装器只创建官方支持的全局
+`extensions/project-brain/index.ts`，扩展以 `shell:false` 直接启动绝对路径稳定 launcher；首次安装
+原子声明专属目录，重复安装幂等，文件、目录成员、manifest 或 launcher hash 漂移均拒绝覆盖。
+`doctor prime-agent` 会验证目录唯一性、Extension/launcher 精确 hash、机器稳定 launcher roundtrip，
+以及目标不在当前项目工作树内。测试还会在 Node 22 可用时加载实际 TypeScript 模块，以无 LLM、
+无 API key 的事件 fixture 验证订阅与 hard block 往返。
+
+Extension 只订阅正式 `session_start`、`input`、`before_agent_start`、`tool_call` 与 `tool_result`：
+session/intent 上下文在 `before_agent_start` 注入，`tool_call` 可依据 `block` 拒绝执行，post-tool 只追加
+反馈而不覆盖原结果。它不订阅 `agent_end`，也不把 heartbeat、goal 或 autonomous loop 折叠成 Hook。
+Prime 当前没有已确认的 settled/Stop continuation 契约，因此 `continue_after_stop` 保持
+`unsupported`。
 
 ## Godot Engine Evidence Provider
 
@@ -880,8 +891,8 @@ crates/
 
 ## 当前限制
 
-- Codex 与 Claude Code 已提供直接适配器、用户级 Hook 安装器和按 adapter 选择的 `doctor`；
-  Prime Agent 已有独立 direct adapter，但用户级 Extension 安装器与 doctor 尚未实现。
+- Codex、Claude Code 与 Prime Agent 均已提供独立适配器、用户级安装器和按 adapter 选择的
+  `doctor`；Prime Extension 不声称 `agent_end`/heartbeat 具有 Stop continuation 语义。
 - Godot Engine Provider、Evidence ledger、Hook 失效传播、.NET/Rust/Python Build Provider v1、Godot
   C# RuntimeArtifactBundle CAS、隔离 Godot headless Runtime Evidence v1、Test plane/finding 显式
   effect 映射核心，以及 .NET、Rust、Python、Godot Scenario Test Provider v1 已完成；其他语言与

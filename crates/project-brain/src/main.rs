@@ -46,6 +46,10 @@ struct Cli {
     #[arg(long, global = true)]
     claude_home: Option<PathBuf>,
 
+    /// Prime Agent 配置根；省略时使用 `PRIME_AGENT_CODING_AGENT_DIR` 或 `~/.prime/agent`
+    #[arg(long, global = true)]
+    prime_home: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -669,7 +673,7 @@ fn main() -> ExitCode {
             let agent_home = match agent {
                 AgentKind::Codex => cli.codex_home.as_deref(),
                 AgentKind::ClaudeCode => cli.claude_home.as_deref(),
-                AgentKind::PrimeAgent => None,
+                AgentKind::PrimeAgent => cli.prime_home.as_deref(),
             };
             App::install_hooks(cli.install_root.as_deref(), agent_home, agent)
         }
@@ -677,7 +681,7 @@ fn main() -> ExitCode {
             let agent_home = match agent {
                 AgentKind::Codex => cli.codex_home.as_deref(),
                 AgentKind::ClaudeCode => cli.claude_home.as_deref(),
-                AgentKind::PrimeAgent => None,
+                AgentKind::PrimeAgent => cli.prime_home.as_deref(),
             };
             App::uninstall_hooks(cli.install_root.as_deref(), agent_home, agent, force)
         }
@@ -688,7 +692,7 @@ fn main() -> ExitCode {
             let agent_home = match agent {
                 AgentKind::Codex => cli.codex_home.as_deref(),
                 AgentKind::ClaudeCode => cli.claude_home.as_deref(),
-                AgentKind::PrimeAgent => None,
+                AgentKind::PrimeAgent => cli.prime_home.as_deref(),
             };
             App::open(cli.project_root)
                 .and_then(|app| app.doctor(cli.install_root.as_deref(), agent, agent_home))

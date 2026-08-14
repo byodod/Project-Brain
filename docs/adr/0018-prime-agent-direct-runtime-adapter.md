@@ -27,7 +27,7 @@ Prime 也提供 JSON/RPC 模式、follow-up/steer、heartbeat 与 schedule，但
 5. Task-stopping 始终声明 continuation `supported=false`。即便核心产生 ContinueWork，也只能保留
    `requested=true` 与原因作为证据，不得触发未确认的自动续轮。
 6. `install-hooks prime-agent`、用户级 Extension 写入与 Prime doctor 在具备原子安装、漂移拒绝和
-   真实 runtime fixture 前必须明确拒绝。
+   真实 runtime fixture 前必须明确拒绝；该前置条件已由 ADR-0036 满足，随后开放。
 
 ## 验证
 
@@ -39,7 +39,7 @@ Prime 也提供 JSON/RPC 模式、follow-up/steer、heartbeat 与 schedule，但
 ## 后果
 
 - Project Brain 可以独立演进 Prime Extension，不污染 Codex/Claude 配置或审计。
-- direct adapter 可测试不等于用户安装已完成；README 与 CLI 必须继续暴露此边界。
+- direct adapter 可测试不等于用户安装已完成；ADR-0036 以独立 provisioning 合同补齐该边界。
 - Prime 的 heartbeat/schedule 属于 runtime 唤醒机制，不属于 Project Brain Hook 事件本身。
 
 ## 依据

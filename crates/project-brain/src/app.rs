@@ -123,9 +123,10 @@ impl App {
                 );
             }
             AgentKind::PrimeAgent => {
-                return Err(AppError::Setup(
-                    "Prime Agent 是独立 runtime；Extension 原子安装器尚未启用".to_owned(),
-                ));
+                println!(
+                    "{}",
+                    pretty_json(&setup::install_prime_extension(install_root, agent_home)?)?
+                );
             }
         }
         Ok(())
@@ -159,9 +160,14 @@ impl App {
                 );
             }
             AgentKind::PrimeAgent => {
-                return Err(AppError::Setup(
-                    "Prime Agent Extension 安装器尚未启用，没有可卸载的托管集成".to_owned(),
-                ));
+                println!(
+                    "{}",
+                    pretty_json(&setup::uninstall_prime_extension(
+                        install_root,
+                        agent_home,
+                        force,
+                    )?)?
+                );
             }
         }
         Ok(())
@@ -196,11 +202,7 @@ impl App {
         let adapter = match agent {
             AgentKind::Codex => setup::DoctorAdapter::Codex,
             AgentKind::ClaudeCode => setup::DoctorAdapter::ClaudeCode,
-            AgentKind::PrimeAgent => {
-                return Err(AppError::Setup(
-                    "Prime Agent Extension 尚未安装；doctor 不伪造未实现的就绪状态".to_owned(),
-                ));
-            }
+            AgentKind::PrimeAgent => setup::DoctorAdapter::PrimeAgent,
         };
         let mut report = setup::doctor(
             install_root,

@@ -70,6 +70,55 @@ fn run_installed_handler(handler: &Value, cwd: &Path, stdin: &str) -> Output {
     child.wait_with_output().expect("wait for handler")
 }
 
+fn run_prime_extension_fixture(
+    extension: &Path,
+    project: &Path,
+    install_root: &Path,
+) -> Option<Output> {
+    let version = Command::new("node").arg("--version").output().ok()?;
+    let major = String::from_utf8_lossy(&version.stdout)
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()?
+        .parse::<u32>()
+        .ok()?;
+    if !version.status.success() || major < 22 {
+        return None;
+    }
+    let fixture = r#"
+import { pathToFileURL } from "node:url";
+const extensionPath = process.argv[1];
+const cwd = process.argv[2];
+const handlers = new Map();
+const module = await import(pathToFileURL(extensionPath).href);
+await module.default({ on(name, handler) { handlers.set(name, handler); } });
+const ctx = { cwd, sessionManager: { getSessionFile() { return "prime-fixture-session"; } } };
+await handlers.get("session_start")({ reason: "startup" }, ctx);
+const decision = await handlers.get("tool_call")({
+  toolName: "edit",
+  toolCallId: "prime-fixture-tool",
+  input: { path: ".project-brain/config.json", oldText: "old", newText: "new" },
+}, ctx);
+process.stdout.write(JSON.stringify({ events: [...handlers.keys()], decision }));
+"#;
+    Command::new("node")
+        .args([
+            "--experimental-strip-types",
+            "--input-type=module",
+            "-e",
+            fixture,
+        ])
+        .arg(extension)
+        .arg(project)
+        .env("PROJECT_BRAIN_INSTALL_ROOT", install_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -231,6 +280,233 @@ fn prime_direct_adapter_blocks_without_claiming_stop_continuation() {
     assert_success(&capabilities);
     let capabilities: Value = serde_json::from_slice(&capabilities.stdout).unwrap();
     assert_eq!(capabilities["continue_after_stop"], "unsupported");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Prime Extension 黑盒测试覆盖安装、桥接、doctor、漂移和卸载的完整安全边界"
+)]
+fn prime_extension_install_is_idempotent_drift_safe_and_doctor_verified() {
+    let root = temp_root("prime-extension");
+    let install_root = root.join("machine/Project Brain");
+    let prime_home = root.join("Prime Home");
+    let project = root.join("repo");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(prime_home.join("extensions")).unwrap();
+    fs::write(
+        prime_home.join("extensions/user-extension.ts"),
+        "export default () => {};\n",
+    )
+    .unwrap();
+
+    let source = PathBuf::from(env!("CARGO_BIN_EXE_project-brain"));
+    assert_success(&run(
+        &source,
+        &["--install-root", install_root.to_str().unwrap(), "install"],
+        &root,
+        None,
+    ));
+    let launcher = install_root.join("bin").join(source.file_name().unwrap());
+    assert_success(&run(
+        &launcher,
+        &["--project-root", project.to_str().unwrap(), "init"],
+        &root,
+        None,
+    ));
+    let config_path = project.join(".project-brain/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["rules"] = serde_json::json!([{
+        "id": "PROTECT",
+        "status": "active",
+        "authority": "repository_rule",
+        "strength": "hard",
+        "effect": "block",
+        "include_paths": [".project-brain/config.json"],
+        "actions": ["modify"],
+        "message": "protected"
+    }]);
+    fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    assert_success(&run(
+        &launcher,
+        &[
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--project-root",
+            project.to_str().unwrap(),
+            "bootstrap",
+        ],
+        &root,
+        None,
+    ));
+
+    let install_args = [
+        "--install-root",
+        install_root.to_str().unwrap(),
+        "--prime-home",
+        prime_home.to_str().unwrap(),
+        "install-hooks",
+        "prime-agent",
+    ];
+    let first = run(&launcher, &install_args, &root, None);
+    assert_success(&first);
+    let first_report: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first_report["changed"], true);
+    assert_eq!(first_report["managed_handler_count"], 5);
+    assert_eq!(
+        first_report["trust_state"],
+        "extension_contract_and_launcher_verified"
+    );
+
+    let extension = prime_home.join("extensions/project-brain/index.ts");
+    let installed_bytes = fs::read(&extension).unwrap();
+    let installed_text = String::from_utf8(installed_bytes.clone()).unwrap();
+    assert!(installed_text.contains("spawn(LAUNCHER"));
+    assert!(installed_text.contains("shell: false"));
+    assert!(installed_text.contains("pi.on(\"tool_call\""));
+    assert!(installed_text.contains("pi.on(\"tool_result\""));
+    assert!(!installed_text.contains("pi.on(\"agent_end\""));
+    assert!(!installed_text.contains("heartbeat"));
+    assert!(!installed_text.contains("sendMessage"));
+    assert!(
+        install_root
+            .join("state/integrations/prime-agent.json")
+            .is_file()
+    );
+    if let Some(fixture) = run_prime_extension_fixture(&extension, &project, &install_root) {
+        assert_success(&fixture);
+        let fixture: Value = serde_json::from_slice(&fixture.stdout).unwrap();
+        assert_eq!(
+            fixture["events"],
+            serde_json::json!([
+                "session_start",
+                "input",
+                "before_agent_start",
+                "tool_call",
+                "tool_result"
+            ])
+        );
+        assert_eq!(fixture["decision"]["block"], true);
+    }
+
+    let second = run(&launcher, &install_args, &root, None);
+    assert_success(&second);
+    let second_report: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second_report["changed"], false);
+    assert_eq!(fs::read(&extension).unwrap(), installed_bytes);
+
+    let pre_tool = format!(
+        "{{\"session_id\":\"prime-session\",\"cwd\":{},\"tool_name\":\"edit\",\"tool_use_id\":\"prime-tool\",\"tool_input\":{{\"path\":\".project-brain/config.json\",\"oldText\":\"old\",\"newText\":\"new\"}}}}",
+        serde_json::to_string(project.to_str().unwrap()).unwrap()
+    );
+    let bridge = run(
+        &launcher,
+        &[
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "dispatch",
+            "prime-agent",
+            "pre-tool-use",
+        ],
+        &project,
+        Some(&pre_tool),
+    );
+    assert_success(&bridge);
+    let bridge: Value = serde_json::from_slice(&bridge.stdout).unwrap();
+    assert_eq!(bridge["block"], true);
+
+    let doctor_args = [
+        "--install-root",
+        install_root.to_str().unwrap(),
+        "--prime-home",
+        prime_home.to_str().unwrap(),
+        "--project-root",
+        project.to_str().unwrap(),
+        "doctor",
+        "prime-agent",
+    ];
+    let doctor = run(&launcher, &doctor_args, &project, None);
+    assert_success(&doctor);
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(doctor["status"], "ready");
+    assert_eq!(doctor["adapter"], "prime_agent");
+    assert_eq!(doctor["adapter_hooks"], "pass");
+    assert_eq!(
+        doctor["adapter_trust_state"],
+        "extension_contract_and_launcher_verified"
+    );
+
+    let mut drifted = installed_bytes.clone();
+    drifted.extend_from_slice(b"// user edit\n");
+    fs::write(&extension, &drifted).unwrap();
+    let drift_install = run(&launcher, &install_args, &root, None);
+    assert!(!drift_install.status.success());
+    assert_eq!(fs::read(&extension).unwrap(), drifted);
+    let drift_doctor = run(&launcher, &doctor_args, &project, None);
+    assert!(!drift_doctor.status.success());
+    let drift_uninstall = run(
+        &launcher,
+        &[
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--prime-home",
+            prime_home.to_str().unwrap(),
+            "uninstall-hooks",
+            "prime-agent",
+        ],
+        &root,
+        None,
+    );
+    assert!(!drift_uninstall.status.success());
+    assert_eq!(fs::read(&extension).unwrap(), drifted);
+    fs::write(&extension, &installed_bytes).unwrap();
+
+    let uninstall = run(
+        &launcher,
+        &[
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--prime-home",
+            prime_home.to_str().unwrap(),
+            "uninstall-hooks",
+            "prime-agent",
+        ],
+        &root,
+        None,
+    );
+    assert_success(&uninstall);
+    assert!(!extension.exists());
+    assert!(prime_home.join("extensions/user-extension.ts").is_file());
+
+    let second_uninstall = run(
+        &launcher,
+        &[
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--prime-home",
+            prime_home.to_str().unwrap(),
+            "uninstall-hooks",
+            "prime-agent",
+        ],
+        &root,
+        None,
+    );
+    assert_success(&second_uninstall);
+    let second_uninstall: Value = serde_json::from_slice(&second_uninstall.stdout).unwrap();
+    assert_eq!(second_uninstall["changed"], false);
+
+    let unmanaged_directory = prime_home.join("extensions/project-brain");
+    fs::create_dir(&unmanaged_directory).unwrap();
+    let unmanaged = b"export default function userExtension() {}\n";
+    fs::write(unmanaged_directory.join("index.ts"), unmanaged).unwrap();
+    let collision = run(&launcher, &install_args, &root, None);
+    assert!(!collision.status.success());
+    assert_eq!(
+        fs::read(unmanaged_directory.join("index.ts")).unwrap(),
+        unmanaged
+    );
+
     fs::remove_dir_all(root).unwrap();
 }
 

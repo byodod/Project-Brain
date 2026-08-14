@@ -257,7 +257,9 @@ Prime Agent 是独立 runtime；其 Extension `tool_call` 可同步 block，但�
 `agent_end` 只表示一次 prompt 结束，且未提供稳定 `agent_settled` 契约，因此 Stop continuation
 必须报告 unsupported。Prime direct adapter 使用独立身份、幂等域、审计域与自有输出 JSON，
 不复用 Codex/Claude vendor JSON。Codex 与 Claude Code adapter 都包含用户级安装器；Prime 的
-Extension 安装器仍留在后续阶段。
+Extension 安装器把机器托管的 `index.ts` 放入全局 `~/.prime/agent/extensions/project-brain/`，
+以绝对路径、无 shell 子进程桥接稳定 launcher。安装 manifest 同时绑定 Extension、launcher、事件集
+与 API contract hash；漂移默认拒绝。Prime Extension 不订阅 `agent_end`，不会用消息注入伪造续轮。
 
 ## 下一阶段
 
@@ -269,9 +271,9 @@ Extension 安装器仍留在后续阶段。
    producer 行为的合成 fixture 固定 C#/VB、空 Python language、未指定 kind 与 implementation 契约。
 3. Semantic lineage 裁决与 symbol-scoped rules 已实现；下一步扩展 symbol set、split/merge 和调用图
    影响面，但仍不允许自动确认或 LLM hard block。
-4. Claude Code 已覆盖安装后 exec-form handler 的真实子进程 fixture；Prime Agent 独立 direct
-   adapter 已完成，下一步增加原子 Extension 安装与真实 Prime runtime fixture。按 adapter 选择的
-   doctor 已由 ADR-0016 完成。
+4. Claude Code 已覆盖安装后 exec-form handler 的真实子进程 fixture；Prime Agent 已完成原子
+   Extension 安装、漂移保护、launcher roundtrip doctor，以及 Node 22 可用时无需 LLM/API key 的
+   TypeScript 加载与 hard-block fixture。按 adapter 选择的 doctor 已覆盖三种 runtime。
 5. Source、Semantic、Engine、Build、Test、Runtime 分层 Evidence Plane、独立 ArtifactGraph、SQLite
    快照/attestation/head/staleness ledger 与 Hook 新鲜度提示已经完成；Godot Engine 以及
    .NET/Rust/Python Build Evidence Provider v1 已通过真实项目验证；Godot C# 最终产物还会提升到

@@ -22,6 +22,7 @@ const DOCTOR_SCHEMA_VERSION: u32 = 2;
 const REGISTRY_SCHEMA_VERSION: u32 = 1;
 const CODEX_INTEGRATION_VERSION: u32 = 1;
 const CLAUDE_INTEGRATION_VERSION: u32 = 1;
+const PRIME_INTEGRATION_VERSION: u32 = 1;
 const INSTALL_ROOT_ENV: &str = "PROJECT_BRAIN_INSTALL_ROOT";
 const LAUNCHED_ENV: &str = "PROJECT_BRAIN_LAUNCHED";
 const REQUIRED_CODEX_EVENTS: [&str; 5] = [
@@ -37,6 +38,13 @@ const REQUIRED_CLAUDE_EVENTS: [&str; 5] = [
     "PreToolUse",
     "PostToolUse",
     "Stop",
+];
+const REQUIRED_PRIME_EVENTS: [&str; 5] = [
+    "session_start",
+    "input",
+    "before_agent_start",
+    "tool_call",
+    "tool_result",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,6 +84,18 @@ struct ClaudeIntegrationManifest {
     managed_handler_hashes: BTreeMap<String, String>,
     before_hash: String,
     after_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PrimeIntegrationManifest {
+    schema_version: u32,
+    integration_version: u32,
+    api_contract: String,
+    target_path: PathBuf,
+    target_sha256: String,
+    launcher_path: PathBuf,
+    launcher_sha256: String,
+    managed_events: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +157,7 @@ pub struct DoctorReport {
 pub enum DoctorAdapter {
     Codex,
     ClaudeCode,
+    PrimeAgent,
 }
 
 impl DoctorAdapter {
@@ -144,6 +165,7 @@ impl DoctorAdapter {
         match self {
             Self::Codex => "codex",
             Self::ClaudeCode => "claude_code",
+            Self::PrimeAgent => "prime_agent",
         }
     }
 
@@ -151,7 +173,16 @@ impl DoctorAdapter {
         match self {
             Self::Codex => "Codex",
             Self::ClaudeCode => "Claude Code",
+            Self::PrimeAgent => "Prime Agent",
         }
+    }
+}
+
+const fn adapter_trust_state(adapter: DoctorAdapter, valid: bool) -> &'static str {
+    if matches!(adapter, DoctorAdapter::PrimeAgent) && valid {
+        "extension_contract_and_launcher_verified"
+    } else {
+        "not_programmatically_verifiable"
     }
 }
 
@@ -629,6 +660,172 @@ pub fn uninstall_claude_hooks(
     })
 }
 
+pub fn install_prime_extension(
+    explicit_install_root: Option<&Path>,
+    explicit_prime_home: Option<&Path>,
+) -> Result<HookInstallReport, AppError> {
+    let install_root = resolve_install_root(explicit_install_root)?;
+    let _install = ensure_install_ready(&install_root)?;
+    let launcher = stable_launcher_path(&install_root, &env::current_exe()?)?;
+    if !launcher.is_file() {
+        return Err(AppError::Setup(format!(
+            "稳定 launcher 不存在：{}；请重新执行 project-brain install",
+            launcher.display()
+        )));
+    }
+
+    let prime_home = resolve_prime_home(explicit_prime_home)?;
+    let extension_root = prime_home.join("extensions");
+    let extension_directory = extension_root.join("project-brain");
+    let target = extension_directory.join("index.ts");
+    let integration_path = install_root.join("state/integrations/prime-agent.json");
+    let expected = render_prime_extension(&launcher)?;
+    let expected_hash = digest_bytes(&expected);
+    let launcher_hash = digest_bytes(&fs::read(&launcher)?);
+    if !prime_launcher_fixture_valid(&launcher) {
+        return Err(AppError::Setup(format!(
+            "Prime Agent stable launcher capability roundtrip 失败：{}",
+            launcher.display()
+        )));
+    }
+    let expected_manifest = PrimeIntegrationManifest {
+        schema_version: INSTALL_SCHEMA_VERSION,
+        integration_version: PRIME_INTEGRATION_VERSION,
+        api_contract: "prime-agent-extension-v1".to_owned(),
+        target_path: target.clone(),
+        target_sha256: expected_hash.clone(),
+        launcher_path: launcher.clone(),
+        launcher_sha256: launcher_hash,
+        managed_events: REQUIRED_PRIME_EVENTS
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    };
+
+    fs::create_dir_all(&extension_root)?;
+    fs::create_dir_all(integration_path.parent().expect("integration has parent"))?;
+    let _lock = MutationLock::acquire(&install_root.join("state/integrations/prime-agent.lock"))?;
+
+    if integration_path.is_file() {
+        let manifest_bytes = fs::read(&integration_path)?;
+        let manifest: PrimeIntegrationManifest = serde_json::from_slice(&manifest_bytes)?;
+        validate_prime_integration_manifest(&manifest, &target)?;
+        if !prime_extension_directory_exact(&extension_directory, &target)
+            || digest_bytes(&fs::read(&target)?) != manifest.target_sha256
+            || manifest.target_sha256 != expected_hash
+        {
+            return Err(AppError::IntegrationDrift(target));
+        }
+        if manifest == expected_manifest {
+            return Ok(HookInstallReport {
+                schema_version: PRIME_INTEGRATION_VERSION,
+                target_path: target,
+                changed: false,
+                managed_handler_count: REQUIRED_PRIME_EVENTS.len(),
+                trust_state: "extension_contract_and_launcher_verified",
+            });
+        }
+        atomic_replace(
+            &integration_path,
+            &pretty_json_bytes(&expected_manifest)?,
+            Some(&digest_bytes(&manifest_bytes)),
+        )?;
+        return Ok(HookInstallReport {
+            schema_version: PRIME_INTEGRATION_VERSION,
+            target_path: target,
+            changed: true,
+            managed_handler_count: REQUIRED_PRIME_EVENTS.len(),
+            trust_state: "extension_contract_and_launcher_verified",
+        });
+    }
+
+    if extension_directory.exists() {
+        return Err(AppError::IntegrationDrift(target));
+    }
+    fs::create_dir(&extension_directory)?;
+    if let Err(error) = atomic_replace(&target, &expected, None) {
+        let _ = fs::remove_dir(&extension_directory);
+        return Err(error);
+    }
+    if let Err(error) = atomic_replace(
+        &integration_path,
+        &pretty_json_bytes(&expected_manifest)?,
+        None,
+    ) {
+        if target_hash_exact(&target).as_deref() == Some(expected_hash.as_str()) {
+            let _ = fs::remove_file(&target);
+            let _ = fs::remove_dir(&extension_directory);
+        }
+        return Err(error);
+    }
+
+    Ok(HookInstallReport {
+        schema_version: PRIME_INTEGRATION_VERSION,
+        target_path: target,
+        changed: true,
+        managed_handler_count: REQUIRED_PRIME_EVENTS.len(),
+        trust_state: "extension_contract_and_launcher_verified",
+    })
+}
+
+pub fn uninstall_prime_extension(
+    explicit_install_root: Option<&Path>,
+    explicit_prime_home: Option<&Path>,
+    force: bool,
+) -> Result<HookInstallReport, AppError> {
+    let install_root = resolve_install_root(explicit_install_root)?;
+    let prime_home = resolve_prime_home(explicit_prime_home)?;
+    let extension_directory = prime_home.join("extensions/project-brain");
+    let target = extension_directory.join("index.ts");
+    let integration_path = install_root.join("state/integrations/prime-agent.json");
+    let _lock = MutationLock::acquire(&install_root.join("state/integrations/prime-agent.lock"))?;
+    let target_exists = fs::symlink_metadata(&target).is_ok();
+    let manifest_exists = integration_path.is_file();
+
+    if !target_exists && !manifest_exists {
+        return Ok(HookInstallReport {
+            schema_version: PRIME_INTEGRATION_VERSION,
+            target_path: target,
+            changed: false,
+            managed_handler_count: 0,
+            trust_state: "extension_contract_and_launcher_verified",
+        });
+    }
+    if target_exists && !manifest_exists {
+        return Err(AppError::IntegrationDrift(target));
+    }
+    if !force && !target_exists {
+        return Err(AppError::IntegrationDrift(target));
+    }
+
+    if manifest_exists {
+        let manifest: PrimeIntegrationManifest = read_json(&integration_path)?;
+        validate_prime_integration_manifest(&manifest, &target)?;
+        if !force
+            && (!prime_extension_directory_exact(&extension_directory, &target)
+                || target_hash_exact(&target).as_deref() != Some(manifest.target_sha256.as_str()))
+        {
+            return Err(AppError::IntegrationDrift(target));
+        }
+    }
+
+    if target_exists {
+        fs::remove_file(&target)?;
+    }
+    if manifest_exists && let Err(error) = fs::remove_file(&integration_path) {
+        return Err(error.into());
+    }
+    let _ = fs::remove_dir(&extension_directory);
+
+    Ok(HookInstallReport {
+        schema_version: PRIME_INTEGRATION_VERSION,
+        target_path: target,
+        changed: true,
+        managed_handler_count: 0,
+        trust_state: "extension_contract_and_launcher_verified",
+    })
+}
+
 pub fn doctor(
     explicit_install_root: Option<&Path>,
     adapter: DoctorAdapter,
@@ -703,6 +900,11 @@ pub fn doctor(
             &install_root,
             resolve_claude_home(explicit_agent_home).ok().as_deref(),
         ),
+        DoctorAdapter::PrimeAgent => prime_integration_valid(
+            &install_root,
+            resolve_prime_home(explicit_agent_home).ok().as_deref(),
+            &canonical_root,
+        ),
     };
     if !adapter_hooks_valid {
         issues.push(format!(
@@ -724,7 +926,7 @@ pub fn doctor(
         providers: providers.ready.into(),
         adapter: adapter.name(),
         adapter_hooks: adapter_hooks_valid.into(),
-        adapter_trust_state: "not_programmatically_verifiable",
+        adapter_trust_state: adapter_trust_state(adapter, adapter_hooks_valid),
         semantic_coverage: None,
         issues,
         warnings: Vec::new(),
@@ -783,6 +985,27 @@ fn validate_claude_integration_manifest(
         || manifest.integration_version != CLAUDE_INTEGRATION_VERSION
         || manifest.target_path != target
         || manifest.managed_handler_hashes.len() != REQUIRED_CLAUDE_EVENTS.len()
+    {
+        return Err(AppError::IntegrationDrift(target.to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_prime_integration_manifest(
+    manifest: &PrimeIntegrationManifest,
+    target: &Path,
+) -> Result<(), AppError> {
+    let expected_events = REQUIRED_PRIME_EVENTS
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if manifest.schema_version != INSTALL_SCHEMA_VERSION
+        || manifest.integration_version != PRIME_INTEGRATION_VERSION
+        || manifest.api_contract != "prime-agent-extension-v1"
+        || manifest.target_path != target
+        || manifest.target_sha256.len() != 64
+        || manifest.launcher_sha256.len() != 64
+        || manifest.managed_events != expected_events
     {
         return Err(AppError::IntegrationDrift(target.to_owned()));
     }
@@ -911,6 +1134,18 @@ fn resolve_claude_home(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
     user_home()
         .map(|home| home.join(".claude"))
         .ok_or_else(|| AppError::Setup("无法确定 Claude home；请传入 --claude-home".to_owned()))
+}
+
+fn resolve_prime_home(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
+    if let Some(path) = explicit {
+        return absolute_path(path);
+    }
+    if let Some(path) = env::var_os("PRIME_AGENT_CODING_AGENT_DIR") {
+        return absolute_path(Path::new(&path));
+    }
+    user_home()
+        .map(|home| home.join(".prime/agent"))
+        .ok_or_else(|| AppError::Setup("无法确定 Prime Agent home；请传入 --prime-home".to_owned()))
 }
 
 fn user_home() -> Option<PathBuf> {
@@ -1071,6 +1306,191 @@ fn managed_claude_handlers(launcher: &Path) -> BTreeMap<String, Value> {
         })
         .collect()
 }
+
+fn render_prime_extension(launcher: &Path) -> Result<Vec<u8>, AppError> {
+    let launcher_json = serde_json::to_string(&launcher.to_string_lossy().into_owned())?;
+    let source = PRIME_EXTENSION_TEMPLATE.replace("__PROJECT_BRAIN_LAUNCHER__", &launcher_json);
+    Ok(source.into_bytes())
+}
+
+const PRIME_EXTENSION_TEMPLATE: &str = r#"// Managed by Project Brain. Manual edits are treated as integration drift.
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+
+const LAUNCHER = __PROJECT_BRAIN_LAUNCHER__;
+const MAX_BYTES = 1024 * 1024;
+const TIMEOUT_MS = 10000;
+const instanceId = randomUUID();
+let pendingContext = [];
+
+function sessionId(ctx) {
+  return ctx.sessionManager.getSessionFile() ?? `prime-ephemeral-${instanceId}`;
+}
+
+function textItems(value, key) {
+  if (!value || !Array.isArray(value[key])) return [];
+  return value[key].filter((item) => typeof item === "string" && item.length > 0);
+}
+
+function invokeBrain(eventName, payload, cwd) {
+  return new Promise((resolve, reject) => {
+    const request = Buffer.from(JSON.stringify(payload), "utf8");
+    if (request.length > MAX_BYTES) {
+      reject(new Error("Project Brain request exceeds 1 MiB"));
+      return;
+    }
+
+    const child = spawn(LAUNCHER, ["dispatch", "prime-agent", eventName], {
+      cwd,
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const stdout = [];
+    const stderr = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill();
+      fail(new Error("Project Brain launcher timed out"));
+    }, TIMEOUT_MS);
+
+    function fail(error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    }
+
+    child.on("error", fail);
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > MAX_BYTES) {
+        child.kill();
+        fail(new Error("Project Brain stdout exceeds 1 MiB"));
+        return;
+      }
+      stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes <= MAX_BYTES) stderr.push(chunk);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const stderrText = Buffer.concat(stderr).toString("utf8").trim();
+      if (code !== 0) {
+        reject(new Error(`Project Brain exited ${code}: ${stderrText}`));
+        return;
+      }
+      const text = Buffer.concat(stdout).toString("utf8").trim();
+      if (text.length === 0) {
+        resolve(null);
+        return;
+      }
+      try {
+        resolve(JSON.parse(text));
+      } catch {
+        reject(new Error("Project Brain returned invalid JSON"));
+      }
+    });
+    child.stdin.on("error", fail);
+    child.stdin.end(request);
+  });
+}
+
+export default function projectBrainExtension(pi) {
+  pi.on("session_start", async (event, ctx) => {
+    try {
+      const source = event.reason === "resume" ? "resume"
+        : event.reason === "new" ? "clear"
+        : event.reason === "reload" ? "compact"
+        : "startup";
+      const output = await invokeBrain("session-start", {
+        session_id: sessionId(ctx),
+        cwd: ctx.cwd,
+        source,
+      }, ctx.cwd);
+      pendingContext.push(...textItems(output, "context"));
+    } catch (error) {
+      pendingContext.push(`Project Brain session check degraded: ${String(error)}`);
+    }
+  });
+
+  pi.on("input", async (event, ctx) => {
+    try {
+      const output = await invokeBrain("user-prompt-submit", {
+        session_id: sessionId(ctx),
+        cwd: ctx.cwd,
+        source: event.source,
+        prompt: event.text,
+      }, ctx.cwd);
+      pendingContext.push(...textItems(output, "context"));
+    } catch (error) {
+      pendingContext.push(`Project Brain intent check degraded: ${String(error)}`);
+    }
+    return { action: "continue" };
+  });
+
+  pi.on("before_agent_start", () => {
+    if (pendingContext.length === 0) return;
+    const content = pendingContext.join("\n\n");
+    pendingContext = [];
+    return {
+      message: {
+        customType: "project-brain-context",
+        content,
+        display: true,
+      },
+    };
+  });
+
+  pi.on("tool_call", async (event, ctx) => {
+    try {
+      const output = await invokeBrain("pre-tool-use", {
+        session_id: sessionId(ctx),
+        cwd: ctx.cwd,
+        tool_name: event.toolName,
+        tool_use_id: event.toolCallId,
+        tool_input: event.input,
+      }, ctx.cwd);
+      if (output?.block === true) {
+        return { block: true, reason: output.reason ?? "Blocked by Project Brain" };
+      }
+      return;
+    } catch (error) {
+      return { block: true, reason: `Project Brain governance failed closed: ${String(error)}` };
+    }
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
+    let feedback = [];
+    try {
+      const output = await invokeBrain("post-tool-use", {
+        session_id: sessionId(ctx),
+        cwd: ctx.cwd,
+        tool_name: event.toolName,
+        tool_use_id: event.toolCallId,
+        tool_input: event.input,
+        tool_response: { success: !event.isError },
+      }, ctx.cwd);
+      feedback = textItems(output, "feedback");
+    } catch (error) {
+      feedback = [`Project Brain post-tool audit degraded: ${String(error)}`];
+    }
+    if (feedback.length === 0) return;
+    return {
+      content: [
+        ...event.content,
+        { type: "text", text: `Project Brain feedback:\n${feedback.join("\n")}` },
+      ],
+    };
+  });
+}
+"#;
 
 fn event_arg(event: &str) -> &'static str {
     match event {
@@ -1338,6 +1758,107 @@ fn claude_integration_valid(install_root: &Path, claude_home: Option<&Path>) -> 
     };
     validate_claude_integration_manifest(&manifest, &target).is_ok()
         && observed_claude_managed_hashes(&document) == manifest.managed_handler_hashes
+}
+
+fn prime_integration_valid(
+    install_root: &Path,
+    prime_home: Option<&Path>,
+    project_root: &Path,
+) -> bool {
+    let Some(prime_home) = prime_home else {
+        return false;
+    };
+    let extension_root = prime_home.join("extensions");
+    let extension_directory = extension_root.join("project-brain");
+    let target = extension_directory.join("index.ts");
+    let integration = install_root.join("state/integrations/prime-agent.json");
+    let Ok(manifest) = read_json::<PrimeIntegrationManifest>(&integration) else {
+        return false;
+    };
+    if validate_prime_integration_manifest(&manifest, &target).is_err()
+        || !prime_extension_directory_exact(&extension_directory, &target)
+        || target_hash_exact(&target).as_deref() != Some(manifest.target_sha256.as_str())
+        || prime_extension_conflict_exists(&extension_root)
+    {
+        return false;
+    }
+    let Ok(expected_launcher) =
+        stable_launcher_path(install_root, &env::current_exe().unwrap_or_default())
+    else {
+        return false;
+    };
+    if manifest.launcher_path != expected_launcher {
+        return false;
+    }
+    let Ok(launcher_bytes) = fs::read(&manifest.launcher_path) else {
+        return false;
+    };
+    if digest_bytes(&launcher_bytes) != manifest.launcher_sha256 {
+        return false;
+    }
+    let Ok(expected) = render_prime_extension(&manifest.launcher_path) else {
+        return false;
+    };
+    if digest_bytes(&expected) != manifest.target_sha256 {
+        return false;
+    }
+    let target_outside_project = canonical_directory_boundary(&extension_directory)
+        .ok()
+        .zip(canonical_directory_boundary(project_root).ok())
+        .is_some_and(|(extension, project)| !extension.starts_with(project));
+    target_outside_project && prime_launcher_fixture_valid(&manifest.launcher_path)
+}
+
+fn prime_extension_directory_exact(extension_directory: &Path, target: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(target) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(extension_directory) else {
+        return false;
+    };
+    let entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.len() == 1 && entries[0].path() == target
+}
+
+fn prime_extension_conflict_exists(extension_root: &Path) -> bool {
+    [
+        "project-brain.ts",
+        "project-brain.js",
+        "project_brain.ts",
+        "project_brain.js",
+    ]
+    .iter()
+    .any(|name| extension_root.join(name).exists())
+}
+
+fn prime_launcher_fixture_valid(launcher: &Path) -> bool {
+    let Ok(output) = Command::new(launcher)
+        .args(["capabilities", "prime-agent"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    serde_json::from_slice::<Value>(&output.stdout).is_ok_and(|value| {
+        value.get("deny_tool").and_then(Value::as_str) == Some("supported")
+            && value.get("continue_after_stop").and_then(Value::as_str) == Some("unsupported")
+    })
+}
+
+fn target_hash_exact(path: &Path) -> Option<String> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    fs::read(path).ok().map(|bytes| digest_bytes(&bytes))
 }
 
 fn quote_posix(path: &str) -> String {

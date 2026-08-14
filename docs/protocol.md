@@ -181,14 +181,22 @@ Claude Code adapter v1 提供直接 `hook/dispatch` 协议入口和用户级 `se
 handler 使用 `command` 指向稳定 launcher、`args` 保存三个独立参数的 exec form；不得通过 shell
 字符串拼接 launcher 路径或生命周期参数。固定 `statusMessage` 用作托管签名的一部分，实际路径与
 完整 handler 仍由 manifest hash 校验。
-`doctor [codex|claude-code]` 选择对应的配置、manifest 和 handler hash 域；未给参数时为兼容旧调用
-默认检查 Codex。Doctor v2 使用通用 adapter 字段，不把 Claude 状态伪装成 Codex 状态。
+`doctor [codex|claude-code|prime-agent]` 选择对应的配置、manifest 和 handler/Extension hash 域；
+未给参数时为兼容旧调用默认检查 Codex。Doctor v2 使用通用 adapter 字段，不把其他 runtime 状态
+伪装成 Codex 状态。Prime doctor 还验证专属目录只有托管 `index.ts`、无同名全局冲突、launcher
+绑定精确、目标位于项目工作树之外，并执行稳定 launcher capability roundtrip。
 
 Prime Agent direct adapter v1 通过 `project-brain hook/dispatch prime-agent <event>` 暴露 Rust
 控制面。Extension 应把正式 runtime event 映射到同一内部事件语义，但输出使用独立 schema：
 pre-tool 返回 `block/reason/context`，post-tool 返回 `feedback`，停止阶段返回带
 `supported=false` 的 continuation 描述。Project Brain 不因内部规则想继续而伪造 Prime 已支持
 settled continuation。
+
+Prime Extension Provisioning v1 订阅 `session_start`、`input`、`before_agent_start`、`tool_call`、
+`tool_result`。前两类返回的上下文延迟到 `before_agent_start` 作为持久 custom message 注入；
+pre-tool 只把 `block=true` 转成 Prime veto；post-tool 只追加反馈。扩展不订阅 `agent_end`，也不映射
+heartbeat、goal、schedule 或 autonomous loop。它用 Node `spawn(executable, argv, {shell:false})`
+向稳定 launcher 的 stdin/stdout 传递有界 JSON，禁止 shell 字符串和 repo 路径覆盖。
 
 ## Evidence Protocol v1
 
