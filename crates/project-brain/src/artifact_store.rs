@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::Write,
     path::{Component, Path, PathBuf},
 };
 
@@ -18,13 +18,6 @@ use crate::{
 const STORE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct AssemblyBindingAttestation {
-    pub(crate) assembly_name: String,
-    pub(crate) relative_path: String,
-    pub(crate) sha256: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RuntimeArtifactBundle {
     schema_version: u32,
     project_key: String,
@@ -35,7 +28,6 @@ pub(crate) struct RuntimeArtifactBundle {
     artifact_manifest_fingerprint: String,
     total_bytes: u64,
     entries: Vec<ArtifactEntry>,
-    assembly_binding: Option<AssemblyBindingAttestation>,
 }
 
 impl RuntimeArtifactBundle {
@@ -58,14 +50,6 @@ impl RuntimeArtifactBundle {
     pub(crate) fn source_fingerprint(&self) -> &str {
         &self.source_fingerprint
     }
-
-    pub(crate) fn assembly_binding(&self) -> Option<&AssemblyBindingAttestation> {
-        self.assembly_binding.as_ref()
-    }
-
-    pub(crate) fn canonical_manifest_bytes(&self) -> Result<Vec<u8>, AppError> {
-        canonical_json(self)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,7 +58,6 @@ pub(crate) struct RuntimeArtifactBundleReceipt {
     pub(crate) artifact_manifest_fingerprint: String,
     pub(crate) file_count: usize,
     pub(crate) total_bytes: u64,
-    pub(crate) assembly_binding: Option<AssemblyBindingAttestation>,
     #[serde(skip)]
     canonical_manifest: Vec<u8>,
 }
@@ -105,7 +88,6 @@ pub(crate) fn promote_runtime_bundle(
     }
     let store_root = store_root(&install_root);
     let _lock = MutationLock::acquire(&store_root.join("store.lock"))?;
-    let assembly_binding = assembly_binding(project_root, artifact_manifest)?;
     let bundle = RuntimeArtifactBundle {
         schema_version: STORE_SCHEMA_VERSION,
         project_key: project_key.to_owned(),
@@ -115,7 +97,6 @@ pub(crate) fn promote_runtime_bundle(
         artifact_manifest_fingerprint: artifact_manifest.manifest_fingerprint.clone(),
         total_bytes: artifact_manifest.total_bytes,
         entries: artifact_manifest.entries.clone(),
-        assembly_binding,
     };
     let canonical_manifest = canonical_json(&bundle)?;
     let bundle_fingerprint = content_fingerprint(&canonical_manifest);
@@ -150,7 +131,6 @@ pub(crate) fn promote_runtime_bundle(
         artifact_manifest_fingerprint: bundle.artifact_manifest_fingerprint,
         file_count: bundle.entries.len(),
         total_bytes: bundle.total_bytes,
-        assembly_binding: bundle.assembly_binding,
         canonical_manifest,
     })
 }
@@ -365,62 +345,6 @@ fn atomic_create_or_verify(target: &Path, bytes: &[u8]) -> Result<(), AppError> 
     Ok(())
 }
 
-fn assembly_binding(
-    project_root: &Path,
-    manifest: &ArtifactManifest,
-) -> Result<Option<AssemblyBindingAttestation>, AppError> {
-    let project_file = project_root.join("project.godot");
-    if !project_file.is_file() {
-        return Ok(None);
-    }
-    let mut source = String::new();
-    File::open(project_file)?.read_to_string(&mut source)?;
-    let mut section = "";
-    let mut assembly_name = None;
-    for raw_line in source.lines() {
-        let line = raw_line.trim();
-        if line.starts_with('[') && line.ends_with(']') {
-            section = &line[1..line.len() - 1];
-            continue;
-        }
-        if section == "dotnet"
-            && let Some(value) = line.strip_prefix("project/assembly_name=")
-        {
-            assembly_name = serde_json::from_str::<String>(value).ok();
-            break;
-        }
-    }
-    let Some(assembly_name) = assembly_name else {
-        return Err(AppError::Provider(
-            "Godot C# 项目缺少 [dotnet] project/assembly_name，无法绑定主程序集".to_owned(),
-        ));
-    };
-    if assembly_name.is_empty()
-        || !assembly_name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    {
-        return Err(AppError::Provider(
-            "Godot project/assembly_name 含不安全字符".to_owned(),
-        ));
-    }
-    let relative_path = format!("{assembly_name}.dll");
-    let entry = manifest
-        .entries
-        .iter()
-        .find(|entry| entry.relative_path.eq_ignore_ascii_case(&relative_path))
-        .ok_or_else(|| {
-            AppError::Provider(format!(
-                "Build 最终产物不含 Godot 主程序集 {relative_path:?}"
-            ))
-        })?;
-    Ok(Some(AssemblyBindingAttestation {
-        assembly_name,
-        relative_path: entry.relative_path.clone(),
-        sha256: entry.sha256.clone(),
-    }))
-}
-
 fn store_root(install_root: &Path) -> PathBuf {
     install_root.join("state/artifact-store/v1")
 }
@@ -518,8 +442,7 @@ mod tests {
     use std::{fs, time::SystemTime};
 
     use super::{
-        RuntimeArtifactBundle, assembly_binding, canonical_json, promote_runtime_bundle,
-        verify_runtime_bundle,
+        RuntimeArtifactBundle, canonical_json, promote_runtime_bundle, verify_runtime_bundle,
     };
     use crate::{
         build::{ArtifactEntry, ArtifactManifest},
@@ -563,11 +486,6 @@ mod tests {
         let artifacts = root.join("artifacts");
         fs::create_dir_all(&project).unwrap();
         fs::create_dir_all(&artifacts).unwrap();
-        fs::write(
-            project.join("project.godot"),
-            "[dotnet]\nproject/assembly_name=\"game\"\n",
-        )
-        .unwrap();
         fs::write(artifacts.join("game.dll"), b"exact-build-bytes").unwrap();
         let manifest = manifest(&artifacts);
 
@@ -586,7 +504,6 @@ mod tests {
 
         assert_eq!(verified.entries, manifest.entries);
         assert_eq!(receipt.file_count, 1);
-        assert_eq!(receipt.assembly_binding.unwrap().assembly_name, "game");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -598,11 +515,6 @@ mod tests {
         let artifacts = root.join("artifacts");
         fs::create_dir_all(&project).unwrap();
         fs::create_dir_all(&artifacts).unwrap();
-        fs::write(
-            project.join("project.godot"),
-            "[dotnet]\nproject/assembly_name=\"game\"\n",
-        )
-        .unwrap();
         fs::write(artifacts.join("game.dll"), b"exact-build-bytes").unwrap();
         let manifest = manifest(&artifacts);
         let receipt = promote_runtime_bundle(
@@ -656,23 +568,6 @@ mod tests {
     }
 
     #[test]
-    fn assembly_binding_requires_declared_output() {
-        let root = temp_root("binding");
-        fs::write(
-            root.join("project.godot"),
-            "[dotnet]\nproject/assembly_name=\"missing\"\n",
-        )
-        .unwrap();
-        let artifacts = root.join("artifacts");
-        fs::create_dir(&artifacts).unwrap();
-        fs::write(artifacts.join("game.dll"), b"bytes").unwrap();
-        let manifest = manifest(&artifacts);
-
-        assert!(assembly_binding(&root, &manifest).is_err());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn canonical_manifest_fingerprint_covers_all_bundle_fields() {
         let bundle = RuntimeArtifactBundle {
             schema_version: 1,
@@ -683,7 +578,6 @@ mod tests {
             artifact_manifest_fingerprint: "sha256_manifest".to_owned(),
             total_bytes: 0,
             entries: Vec::new(),
-            assembly_binding: None,
         };
         let bytes = canonical_json(&bundle).unwrap();
         assert_eq!(content_fingerprint(&bytes), content_fingerprint(&bytes));

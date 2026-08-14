@@ -50,7 +50,7 @@ restore metadata。Project Brain 的 Build 在机器 scratch 中完成后会删�
 ## 后果
 
 - Test 运行字节与 Build Evidence 一致，不依赖仓库 `bin/obj` 或第二次构建。
-- .NET Test 的 TRX 边界保持不变；Godot scenario 由 ADR-0027 定义独立结构化合同，Rust Test 由
-  ADR-0028 固定离线 Cargo 合同，Python Test 由 ADR-0029 固定 manifest/bootstrap 合同。
+- .NET Test 的 TRX 边界保持不变；Rust Test 由 ADR-0028 固定离线 Cargo 合同，Python Test 由
+  ADR-0029 固定 manifest/bootstrap 合同；其它框架通过外部 Evidence Provider 接入。
 - 当前通用 CAS 类型沿用历史 `RuntimeArtifactBundle` 名称；协议上它已承担受控 execution bundle。后续
   若改名必须保持 manifest 与既有 Runtime 的向后兼容。

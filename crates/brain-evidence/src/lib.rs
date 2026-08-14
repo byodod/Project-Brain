@@ -5,6 +5,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const EVIDENCE_PROTOCOL_VERSION: u32 = 1;
+pub const INPUT_DEPENDENCY_CONTRACT_VERSION: u32 = 1;
+pub const INPUT_PATH_MATCHER_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -216,7 +218,7 @@ pub struct ArtifactNode {
     pub id: String,
     pub project_key: String,
     pub provider_id: String,
-    /// Provider 开放 kind，例如 `godot_scene`、`dotnet_assembly` 或 `runtime_scenario`。
+    /// Provider 开放 kind，例如 `engine_asset`、`dotnet_assembly` 或 `runtime_scenario`。
     pub kind: String,
     pub provider_key: String,
     pub display_name: String,
@@ -263,6 +265,473 @@ pub struct EvidenceFinding {
     pub message: String,
     pub artifact_id: Option<String>,
     pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyCoverage {
+    Complete,
+    Conservative,
+    Incomplete,
+}
+
+impl DependencyCoverage {
+    pub const fn hard_authority_eligible(self) -> bool {
+        matches!(self, Self::Complete | Self::Conservative)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Conservative => "conservative",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRole {
+    Source,
+    Control,
+    DependencyDeclaration,
+    GeneratedInput,
+}
+
+impl InputRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Control => "control",
+            Self::DependencyDeclaration => "dependency_declaration",
+            Self::GeneratedInput => "generated_input",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum InputPathUniverse {
+    /// Git 已跟踪及未忽略的未跟踪文件，与 Source fingerprint v1 的边界一致。
+    RepositoryVisible,
+    /// selector 覆盖的项目文件系统；用于显式声明被 Provider 读取的 ignored/generated input。
+    ProjectFilesystem,
+}
+
+impl InputPathUniverse {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RepositoryVisible => "repository_visible",
+            Self::ProjectFilesystem => "project_filesystem",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PathMatcherV1 {
+    pub matcher_version: u32,
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+impl PathMatcherV1 {
+    /// 建立使用 `/`、无 shell/环境变量/brace expansion 的有限 glob matcher。
+    /// `**` 只允许作为完整 path segment；`*` 与 `?` 只匹配单个 segment。
+    ///
+    /// # Errors
+    ///
+    /// pattern 为空、越出 root、包含不支持的语法或重复时返回错误。
+    pub fn new(mut include: Vec<String>, mut exclude: Vec<String>) -> Result<Self, EvidenceError> {
+        include.sort();
+        include.dedup();
+        exclude.sort();
+        exclude.dedup();
+        let matcher = Self {
+            matcher_version: INPUT_PATH_MATCHER_VERSION,
+            include,
+            exclude,
+        };
+        matcher.validate()?;
+        Ok(matcher)
+    }
+
+    pub fn matches(&self, relative_path: &str) -> bool {
+        valid_project_path(relative_path)
+            && self
+                .include
+                .iter()
+                .any(|pattern| glob_matches(pattern, relative_path))
+            && !self
+                .exclude
+                .iter()
+                .any(|pattern| glob_matches(pattern, relative_path))
+    }
+
+    fn validate(&self) -> Result<(), EvidenceError> {
+        if self.matcher_version != INPUT_PATH_MATCHER_VERSION
+            || self.include.is_empty()
+            || self.include.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.exclude.windows(2).any(|pair| pair[0] >= pair[1])
+            || self
+                .include
+                .iter()
+                .chain(&self.exclude)
+                .any(|pattern| !valid_glob_pattern(pattern))
+        {
+            return Err(EvidenceError::InvalidInputContract(
+                "PathMatcherV1 非法或不是规范顺序".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InputSelectorV1 {
+    ExactPath {
+        path: String,
+        role: InputRole,
+        presence_sensitive: bool,
+    },
+    Tree {
+        /// 空字符串表示项目根；其它值必须是规范项目相对目录。
+        root: String,
+        universe: InputPathUniverse,
+        matcher: PathMatcherV1,
+        role: InputRole,
+    },
+}
+
+impl InputSelectorV1 {
+    pub fn matches_project_path(&self, path: &str) -> bool {
+        if !valid_project_path(path) {
+            return false;
+        }
+        match self {
+            Self::ExactPath { path: exact, .. } => path == exact,
+            Self::Tree { root, matcher, .. } => {
+                tree_relative_path(root, path).is_some_and(|relative| matcher.matches(relative))
+            }
+        }
+    }
+
+    fn validate(&self) -> Result<(), EvidenceError> {
+        match self {
+            Self::ExactPath { path, .. } => {
+                if !valid_project_path(path) {
+                    return Err(EvidenceError::InvalidPath(path.clone()));
+                }
+            }
+            Self::Tree { root, matcher, .. } => {
+                if !root.is_empty() && !valid_project_path(root) {
+                    return Err(EvidenceError::InvalidPath(root.clone()));
+                }
+                matcher.validate()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputDependencyContractV1 {
+    pub contract_version: u32,
+    pub project_key: String,
+    pub profile_id: String,
+    pub provider_contract_id: String,
+    pub provider_contract_version: u32,
+    pub profile_contract_hash: String,
+    pub dependency_contract_hash: String,
+    pub selectors: Vec<InputSelectorV1>,
+    pub coverage: DependencyCoverage,
+}
+
+impl InputDependencyContractV1 {
+    /// 建立规范排序、不可由调用者伪造 hash 的 Provider/Profile 输入合同。
+    ///
+    /// # Errors
+    ///
+    /// 身份、hash 或 selector 非法时返回错误。
+    pub fn new(
+        project_key: &str,
+        profile_id: &str,
+        provider_contract_id: &str,
+        provider_contract_version: u32,
+        profile_contract_hash: &str,
+        mut selectors: Vec<InputSelectorV1>,
+        coverage: DependencyCoverage,
+    ) -> Result<Self, EvidenceError> {
+        selectors.sort();
+        selectors.dedup();
+        let mut contract = Self {
+            contract_version: INPUT_DEPENDENCY_CONTRACT_VERSION,
+            project_key: project_key.to_owned(),
+            profile_id: profile_id.to_owned(),
+            provider_contract_id: provider_contract_id.to_owned(),
+            provider_contract_version,
+            profile_contract_hash: profile_contract_hash.to_owned(),
+            dependency_contract_hash: String::new(),
+            selectors,
+            coverage,
+        };
+        contract.validate_without_hash()?;
+        contract.dependency_contract_hash = contract.computed_hash();
+        Ok(contract)
+    }
+
+    /// 重新验证规范字段和内容派生 hash。
+    ///
+    /// # Errors
+    ///
+    /// 合同字段、selector、规范顺序或派生 hash 不匹配时返回错误。
+    pub fn validate(&self) -> Result<(), EvidenceError> {
+        self.validate_without_hash()?;
+        let expected = self.computed_hash();
+        if self.dependency_contract_hash != expected {
+            return Err(EvidenceError::InputContractHashMismatch {
+                actual: self.dependency_contract_hash.clone(),
+                expected,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn matches_project_path(&self, path: &str) -> bool {
+        self.selectors
+            .iter()
+            .any(|selector| selector.matches_project_path(path))
+    }
+
+    fn validate_without_hash(&self) -> Result<(), EvidenceError> {
+        if self.contract_version != INPUT_DEPENDENCY_CONTRACT_VERSION
+            || self.provider_contract_version == 0
+            || self.selectors.is_empty()
+        {
+            return Err(EvidenceError::InvalidInputContract(
+                "合同版本、Provider 合同版本或 selector 为空".to_owned(),
+            ));
+        }
+        validate_identifier("input.project_key", &self.project_key, 128)?;
+        validate_identifier("input.profile_id", &self.profile_id, 128)?;
+        validate_identifier(
+            "input.provider_contract_id",
+            &self.provider_contract_id,
+            128,
+        )?;
+        validate_fingerprint("input.profile_contract_hash", &self.profile_contract_hash)?;
+        if self.selectors.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(EvidenceError::NonCanonicalOrder("input.selectors"));
+        }
+        for selector in &self.selectors {
+            selector.validate()?;
+        }
+        Ok(())
+    }
+
+    fn computed_hash(&self) -> String {
+        let mut bytes = Vec::new();
+        append_part(&mut bytes, b"project-brain/input-dependency-contract/v1");
+        append_part(&mut bytes, &u64::from(self.contract_version).to_be_bytes());
+        append_part(&mut bytes, self.project_key.as_bytes());
+        append_part(&mut bytes, self.profile_id.as_bytes());
+        append_part(&mut bytes, self.provider_contract_id.as_bytes());
+        append_part(
+            &mut bytes,
+            &u64::from(self.provider_contract_version).to_be_bytes(),
+        );
+        append_part(&mut bytes, self.profile_contract_hash.as_bytes());
+        append_part(&mut bytes, self.coverage.as_str().as_bytes());
+        for selector in &self.selectors {
+            match selector {
+                InputSelectorV1::ExactPath {
+                    path,
+                    role,
+                    presence_sensitive,
+                } => {
+                    append_part(&mut bytes, b"exact_path");
+                    append_part(&mut bytes, path.as_bytes());
+                    append_part(&mut bytes, role.as_str().as_bytes());
+                    append_part(&mut bytes, &[u8::from(*presence_sensitive)]);
+                }
+                InputSelectorV1::Tree {
+                    root,
+                    universe,
+                    matcher,
+                    role,
+                } => {
+                    append_part(&mut bytes, b"tree");
+                    append_part(&mut bytes, root.as_bytes());
+                    append_part(&mut bytes, universe.as_str().as_bytes());
+                    append_part(&mut bytes, role.as_str().as_bytes());
+                    append_part(
+                        &mut bytes,
+                        &u64::from(matcher.matcher_version).to_be_bytes(),
+                    );
+                    for pattern in &matcher.include {
+                        append_part(&mut bytes, b"include");
+                        append_part(&mut bytes, pattern.as_bytes());
+                    }
+                    for pattern in &matcher.exclude {
+                        append_part(&mut bytes, b"exclude");
+                        append_part(&mut bytes, pattern.as_bytes());
+                    }
+                }
+            }
+        }
+        content_fingerprint(&bytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum InputPathState {
+    PresentRegularFile,
+    Absent,
+}
+
+impl InputPathState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PresentRegularFile => "present_regular_file",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InputManifestEntry {
+    pub path: String,
+    pub state: InputPathState,
+    pub role: InputRole,
+    pub content_sha256: Option<String>,
+    pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceInputManifestV1 {
+    pub manifest_version: u32,
+    pub contract: InputDependencyContractV1,
+    pub source_fingerprint_at_creation: String,
+    pub manifest_hash: String,
+    pub entries: Vec<InputManifestEntry>,
+}
+
+impl EvidenceInputManifestV1 {
+    /// 建立 selector 在一个稳定 Source state 上解析出的不可变输入清单。
+    ///
+    /// # Errors
+    ///
+    /// 合同、Source fingerprint、entry 状态或规范顺序非法时返回错误。
+    pub fn new(
+        contract: InputDependencyContractV1,
+        source_fingerprint_at_creation: &str,
+        mut entries: Vec<InputManifestEntry>,
+    ) -> Result<Self, EvidenceError> {
+        entries.sort();
+        entries.dedup();
+        let mut manifest = Self {
+            manifest_version: 1,
+            contract,
+            source_fingerprint_at_creation: source_fingerprint_at_creation.to_owned(),
+            manifest_hash: String::new(),
+            entries,
+        };
+        manifest.validate_without_hash()?;
+        manifest.manifest_hash = manifest.computed_hash();
+        Ok(manifest)
+    }
+
+    /// 重新验证输入条目、合同和内容派生 hash。
+    ///
+    /// # Errors
+    ///
+    /// Manifest 版本、条目状态、规范顺序或派生 hash 不匹配时返回错误。
+    pub fn validate(&self) -> Result<(), EvidenceError> {
+        self.validate_without_hash()?;
+        let expected = self.computed_hash();
+        if self.manifest_hash != expected {
+            return Err(EvidenceError::InputManifestHashMismatch {
+                actual: self.manifest_hash.clone(),
+                expected,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_without_hash(&self) -> Result<(), EvidenceError> {
+        if self.manifest_version != 1 {
+            return Err(EvidenceError::InvalidInputManifest(
+                "manifest_version 必须为 1".to_owned(),
+            ));
+        }
+        self.contract.validate()?;
+        validate_fingerprint(
+            "input.source_fingerprint_at_creation",
+            &self.source_fingerprint_at_creation,
+        )?;
+        if self.entries.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(EvidenceError::NonCanonicalOrder("input.entries"));
+        }
+        let mut paths = BTreeSet::new();
+        for entry in &self.entries {
+            if !valid_project_path(&entry.path) || !paths.insert(entry.path.as_str()) {
+                return Err(EvidenceError::InvalidPath(entry.path.clone()));
+            }
+            match entry.state {
+                InputPathState::PresentRegularFile => {
+                    let hash = entry.content_sha256.as_deref().ok_or_else(|| {
+                        EvidenceError::InvalidInputManifest(format!(
+                            "present entry={:?} 缺少 content_sha256",
+                            entry.path
+                        ))
+                    })?;
+                    validate_fingerprint("input.entry.content_sha256", hash)?;
+                    if entry.size.is_none() {
+                        return Err(EvidenceError::InvalidInputManifest(format!(
+                            "present entry={:?} 缺少 size",
+                            entry.path
+                        )));
+                    }
+                }
+                InputPathState::Absent => {
+                    if entry.content_sha256.is_some() || entry.size.is_some() {
+                        return Err(EvidenceError::InvalidInputManifest(format!(
+                            "absent entry={:?} 不得携带 hash/size",
+                            entry.path
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn computed_hash(&self) -> String {
+        let mut bytes = Vec::new();
+        append_part(&mut bytes, b"project-brain/evidence-input-manifest/v1");
+        append_part(
+            &mut bytes,
+            self.contract.dependency_contract_hash.as_bytes(),
+        );
+        append_part(&mut bytes, self.contract.profile_contract_hash.as_bytes());
+        for entry in &self.entries {
+            append_part(&mut bytes, entry.path.as_bytes());
+            append_part(&mut bytes, entry.state.as_str().as_bytes());
+            append_part(&mut bytes, entry.role.as_str().as_bytes());
+            append_part(
+                &mut bytes,
+                entry
+                    .content_sha256
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            append_part(&mut bytes, &entry.size.unwrap_or_default().to_be_bytes());
+        }
+        content_fingerprint(&bytes)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -661,6 +1130,14 @@ pub enum EvidenceError {
     UnknownFindingArtifact(String),
     #[error("项目相对路径无效：{0:?}")]
     InvalidPath(String),
+    #[error("Evidence 输入依赖合同无效：{0}")]
+    InvalidInputContract(String),
+    #[error("Evidence 输入依赖合同 hash 不匹配：actual={actual}, expected={expected}")]
+    InputContractHashMismatch { actual: String, expected: String },
+    #[error("Evidence 输入清单无效：{0}")]
+    InvalidInputManifest(String),
+    #[error("Evidence 输入清单 hash 不匹配：actual={actual}, expected={expected}")]
+    InputManifestHashMismatch { actual: String, expected: String },
 }
 
 pub fn artifact_id(project_key: &str, provider_id: &str, provider_key: &str) -> String {
@@ -717,6 +1194,99 @@ fn valid_project_path(path: &str) -> bool {
             .any(|part| part.is_empty() || matches!(part, "." | ".."))
 }
 
+fn valid_glob_pattern(pattern: &str) -> bool {
+    if pattern.is_empty()
+        || pattern.contains(['\\', ':', '\0'])
+        || pattern.starts_with('/')
+        || pattern.contains('{')
+        || pattern.contains('}')
+        || pattern.contains('[')
+        || pattern.contains(']')
+        || pattern.contains('$')
+    {
+        return false;
+    }
+    pattern.split('/').all(|segment| {
+        !segment.is_empty()
+            && !matches!(segment, "." | "..")
+            && (!segment.contains("**") || segment == "**")
+            && segment.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'.' | b'-' | b'_' | b'+' | b'#' | b'@' | b'*' | b'?')
+            })
+    })
+}
+
+fn tree_relative_path<'a>(root: &str, path: &'a str) -> Option<&'a str> {
+    if root.is_empty() {
+        return Some(path);
+    }
+    if path == root {
+        return None;
+    }
+    path.strip_prefix(root)?.strip_prefix('/')
+}
+
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.split('/').collect::<Vec<_>>();
+    let path = path.split('/').collect::<Vec<_>>();
+    let mut memo = BTreeMap::new();
+    glob_segments_match(&pattern, &path, 0, 0, &mut memo)
+}
+
+fn glob_segments_match(
+    pattern: &[&str],
+    path: &[&str],
+    pattern_index: usize,
+    path_index: usize,
+    memo: &mut BTreeMap<(usize, usize), bool>,
+) -> bool {
+    if let Some(cached) = memo.get(&(pattern_index, path_index)) {
+        return *cached;
+    }
+    let matched = if pattern_index == pattern.len() {
+        path_index == path.len()
+    } else if pattern[pattern_index] == "**" {
+        glob_segments_match(pattern, path, pattern_index + 1, path_index, memo)
+            || (path_index < path.len()
+                && glob_segments_match(pattern, path, pattern_index, path_index + 1, memo))
+    } else {
+        path_index < path.len()
+            && glob_segment_matches(pattern[pattern_index], path[path_index])
+            && glob_segments_match(pattern, path, pattern_index + 1, path_index + 1, memo)
+    };
+    memo.insert((pattern_index, path_index), matched);
+    matched
+}
+
+fn glob_segment_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let mut previous = vec![false; value.len() + 1];
+    previous[0] = true;
+    for token in pattern {
+        let mut current = vec![false; value.len() + 1];
+        match token {
+            b'*' => {
+                current[0] = previous[0];
+                for index in 1..=value.len() {
+                    current[index] = previous[index] || current[index - 1];
+                }
+            }
+            b'?' => {
+                current[1..=value.len()].copy_from_slice(&previous[..value.len()]);
+            }
+            literal => {
+                for index in 1..=value.len() {
+                    current[index] = previous[index - 1] && value[index - 1] == *literal;
+                }
+            }
+        }
+        previous = current;
+    }
+    previous[value.len()]
+}
+
 fn fingerprint(parts: &[&[u8]]) -> String {
     format!("sha256_{}", stable_digest(parts))
 }
@@ -739,9 +1309,38 @@ fn append_part(target: &mut Vec<u8>, part: &[u8]) {
 mod tests {
     use super::*;
 
+    fn input_contract() -> InputDependencyContractV1 {
+        InputDependencyContractV1::new(
+            "project-a",
+            "python-main",
+            "python-compile",
+            1,
+            "sha256_profile",
+            vec![
+                InputSelectorV1::ExactPath {
+                    path: "pyproject.toml".to_owned(),
+                    role: InputRole::DependencyDeclaration,
+                    presence_sensitive: true,
+                },
+                InputSelectorV1::Tree {
+                    root: "src".to_owned(),
+                    universe: InputPathUniverse::RepositoryVisible,
+                    matcher: PathMatcherV1::new(
+                        vec!["**/*.py".to_owned(), "*.py".to_owned()],
+                        vec!["generated/**".to_owned()],
+                    )
+                    .unwrap(),
+                    role: InputRole::Source,
+                },
+            ],
+            DependencyCoverage::Complete,
+        )
+        .unwrap()
+    }
+
     fn provider(authority: EvidenceAuthority) -> EvidenceProvider {
         EvidenceProvider {
-            id: "godot-engine-v1".to_owned(),
+            id: "engine-provider-v1".to_owned(),
             version: "4.6.0".to_owned(),
             contract_version: 1,
             authority,
@@ -751,8 +1350,8 @@ mod tests {
     fn artifact(key: &str, path: &str) -> ArtifactNode {
         ArtifactNode::from_provider_key(
             "project-a",
-            "godot-engine-v1",
-            "godot_scene",
+            "engine-provider-v1",
+            "engine_asset",
             key,
             key,
             Some(path),
@@ -769,9 +1368,90 @@ mod tests {
     }
 
     #[test]
+    fn input_contract_is_canonical_and_matches_added_paths() {
+        let contract = input_contract();
+        contract.validate().unwrap();
+        assert!(contract.matches_project_path("pyproject.toml"));
+        assert!(contract.matches_project_path("src/main.py"));
+        assert!(contract.matches_project_path("src/pkg/module.py"));
+        assert!(!contract.matches_project_path("src/generated/output.py"));
+        assert!(!contract.matches_project_path("docs/readme.md"));
+
+        let reordered = InputDependencyContractV1::new(
+            "project-a",
+            "python-main",
+            "python-compile",
+            1,
+            "sha256_profile",
+            contract.selectors.iter().cloned().rev().collect(),
+            DependencyCoverage::Complete,
+        )
+        .unwrap();
+        assert_eq!(contract, reordered);
+    }
+
+    #[test]
+    fn input_manifest_hash_covers_absence_content_and_contract() {
+        let contract = input_contract();
+        let manifest = EvidenceInputManifestV1::new(
+            contract.clone(),
+            "sha256_source",
+            vec![
+                InputManifestEntry {
+                    path: "src/main.py".to_owned(),
+                    state: InputPathState::PresentRegularFile,
+                    role: InputRole::Source,
+                    content_sha256: Some("sha256_content".to_owned()),
+                    size: Some(12),
+                },
+                InputManifestEntry {
+                    path: "pyproject.toml".to_owned(),
+                    state: InputPathState::Absent,
+                    role: InputRole::DependencyDeclaration,
+                    content_sha256: None,
+                    size: None,
+                },
+            ],
+        )
+        .unwrap();
+        manifest.validate().unwrap();
+
+        let present = EvidenceInputManifestV1::new(
+            contract,
+            "sha256_source",
+            vec![
+                InputManifestEntry {
+                    path: "pyproject.toml".to_owned(),
+                    state: InputPathState::PresentRegularFile,
+                    role: InputRole::DependencyDeclaration,
+                    content_sha256: Some("sha256_config".to_owned()),
+                    size: Some(1),
+                },
+                InputManifestEntry {
+                    path: "src/main.py".to_owned(),
+                    state: InputPathState::PresentRegularFile,
+                    role: InputRole::Source,
+                    content_sha256: Some("sha256_content".to_owned()),
+                    size: Some(12),
+                },
+            ],
+        )
+        .unwrap();
+        assert_ne!(manifest.manifest_hash, present.manifest_hash);
+    }
+
+    #[test]
+    fn matcher_rejects_ambiguous_or_shell_like_patterns() {
+        for invalid in ["", "../*.rs", "src/**x.rs", "src/{a,b}.rs", "$ROOT/**"] {
+            assert!(PathMatcherV1::new(vec![invalid.to_owned()], Vec::new()).is_err());
+        }
+        assert!(PathMatcherV1::new(vec!["**/*.rs".to_owned()], Vec::new()).is_ok());
+    }
+
+    #[test]
     fn snapshot_fingerprint_is_independent_of_input_order() {
-        let first = artifact("first", "scenes/first.tscn");
-        let second = artifact("second", "scenes/second.tscn");
+        let first = artifact("first", "assets/first.asset");
+        let second = artifact("second", "assets/second.asset");
         let edge = ArtifactEdge {
             source_id: first.id.clone(),
             target_id: second.id.clone(),
@@ -850,12 +1530,12 @@ mod tests {
     #[test]
     fn only_fresh_complete_deterministic_errors_can_hard_block() {
         let finding = EvidenceFinding {
-            code: "GODOT_MISSING_RESOURCE".to_owned(),
+            code: "MISSING_RESOURCE".to_owned(),
             severity: FindingSeverity::Error,
             authority: FindingAuthority::DeterministicViolation,
             message: "scene references a missing resource".to_owned(),
             artifact_id: None,
-            path: Some("scenes/main.tscn".to_owned()),
+            path: Some("assets/main.asset".to_owned()),
         };
         let make = |authority, coverage| {
             EvidenceSnapshot::new(
@@ -968,7 +1648,7 @@ mod tests {
 
     #[test]
     fn artifact_graph_rejects_dangling_edges_and_cross_project_nodes() {
-        let scene = artifact("main", "scenes/main.tscn");
+        let scene = artifact("main", "assets/main.asset");
         let dangling = EvidenceSnapshot::new(
             "project-a",
             EvidencePlane::Engine,
@@ -986,7 +1666,7 @@ mod tests {
         );
         assert!(matches!(dangling, Err(EvidenceError::DanglingEdge { .. })));
 
-        let mut foreign = artifact("foreign", "scenes/foreign.tscn");
+        let mut foreign = artifact("foreign", "assets/foreign.asset");
         foreign.project_key = "project-b".to_owned();
         let cross_project = EvidenceSnapshot::new(
             "project-a",
@@ -1004,7 +1684,7 @@ mod tests {
             Err(EvidenceError::ArtifactBoundary(_))
         ));
 
-        let windows_path = artifact("windows", "scenes\\windows.tscn");
+        let windows_path = artifact("windows", "assets\\windows.asset");
         assert!(matches!(
             EvidenceSnapshot::new(
                 "project-a",

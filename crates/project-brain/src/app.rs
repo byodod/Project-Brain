@@ -13,8 +13,8 @@ use brain_core::{
     SymbolResolutionPolicy, normalize_project_path,
 };
 use brain_evidence::{
-    EvidenceAuthority, EvidenceCoverage, EvidenceFreshness, EvidencePlane, EvidenceReference,
-    EvidenceSnapshot,
+    DependencyCoverage, EvidenceAuthority, EvidenceFreshness, EvidenceInputManifestV1,
+    EvidencePlane, EvidenceSnapshot,
 };
 use brain_store::{
     BrainStore, EvidenceApplyResult, EvidenceHeadSummary, SemanticResolutionKind,
@@ -26,14 +26,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     analyze, build,
-    claude::{self, ClaudeHookInput},
     codex::{self, CodexHookInput},
     database::{self, DatabaseAccessLock, DatabaseCompactOptions},
+    dsh,
     error::AppError,
-    evidence::{CurrentSourceVerification, effective_evidence_freshness},
-    git, godot, index,
-    prime::{self, PrimeHookInput},
-    provider, qualification, reconcile, runtime, scip_index, setup, test,
+    evidence::{CurrentSourceVerification, effective_evidence_freshness_v2},
+    evidence_provider, git, index, opencode, pi, provider, qualification, reconcile, scip_index,
+    setup, test,
 };
 
 const BRAIN_DIRECTORY: &str = ".project-brain";
@@ -44,8 +43,9 @@ const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum AgentKind {
     Codex,
-    ClaudeCode,
-    PrimeAgent,
+    Pi,
+    Opencode,
+    Dsh,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -81,6 +81,40 @@ struct EvidenceStatusHead {
     effective_freshness: EvidenceFreshness,
     #[serde(skip_serializing_if = "Option::is_none")]
     effective_reason: Option<String>,
+    input_dependency: EvidenceInputStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct EvidenceInputStatus {
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<DependencyCoverage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_contract_hash: Option<String>,
+    input_count: usize,
+}
+
+impl EvidenceInputStatus {
+    fn from_manifest(manifest: Option<&EvidenceInputManifestV1>) -> Self {
+        manifest.map_or(
+            Self {
+                mode: "legacy_project_wide",
+                coverage: None,
+                manifest_hash: None,
+                profile_contract_hash: None,
+                input_count: 0,
+            },
+            |manifest| Self {
+                mode: "manifest_v1",
+                coverage: Some(manifest.contract.coverage),
+                manifest_hash: Some(manifest.manifest_hash.clone()),
+                profile_contract_hash: Some(manifest.contract.profile_contract_hash.clone()),
+                input_count: manifest.entries.len(),
+            },
+        )
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +141,7 @@ impl App {
     pub fn install_hooks(
         install_root: Option<&Path>,
         agent_home: Option<&Path>,
+        dsh_profile: Option<&str>,
         agent: AgentKind,
     ) -> Result<(), AppError> {
         match agent {
@@ -116,16 +151,29 @@ impl App {
                     pretty_json(&setup::install_codex_hooks(install_root, agent_home)?)?
                 );
             }
-            AgentKind::ClaudeCode => {
+            AgentKind::Pi => {
                 println!(
                     "{}",
-                    pretty_json(&setup::install_claude_hooks(install_root, agent_home)?)?
+                    pretty_json(&setup::install_pi_extension(install_root, agent_home)?)?
                 );
             }
-            AgentKind::PrimeAgent => {
+            AgentKind::Opencode => {
                 println!(
                     "{}",
-                    pretty_json(&setup::install_prime_extension(install_root, agent_home)?)?
+                    pretty_json(&setup::install_opencode_plugin(install_root, agent_home)?)?
+                );
+            }
+            AgentKind::Dsh => {
+                let profile = dsh_profile.ok_or_else(|| {
+                    AppError::Setup("dsh Hook 安装需要显式 --dsh-profile".to_owned())
+                })?;
+                println!(
+                    "{}",
+                    pretty_json(&setup::install_dsh_plugin(
+                        install_root,
+                        agent_home,
+                        profile
+                    )?)?
                 );
             }
         }
@@ -135,6 +183,7 @@ impl App {
     pub fn uninstall_hooks(
         install_root: Option<&Path>,
         agent_home: Option<&Path>,
+        dsh_profile: Option<&str>,
         agent: AgentKind,
         force: bool,
     ) -> Result<(), AppError> {
@@ -149,22 +198,36 @@ impl App {
                     )?)?
                 );
             }
-            AgentKind::ClaudeCode => {
+            AgentKind::Pi => {
                 println!(
                     "{}",
-                    pretty_json(&setup::uninstall_claude_hooks(
+                    pretty_json(&setup::uninstall_pi_extension(
                         install_root,
                         agent_home,
                         force,
                     )?)?
                 );
             }
-            AgentKind::PrimeAgent => {
+            AgentKind::Opencode => {
                 println!(
                     "{}",
-                    pretty_json(&setup::uninstall_prime_extension(
+                    pretty_json(&setup::uninstall_opencode_plugin(
                         install_root,
                         agent_home,
+                        force,
+                    )?)?
+                );
+            }
+            AgentKind::Dsh => {
+                let profile = dsh_profile.ok_or_else(|| {
+                    AppError::Setup("dsh Hook 卸载需要显式 --dsh-profile".to_owned())
+                })?;
+                println!(
+                    "{}",
+                    pretty_json(&setup::uninstall_dsh_plugin(
+                        install_root,
+                        agent_home,
+                        profile,
                         force,
                     )?)?
                 );
@@ -198,17 +261,20 @@ impl App {
         install_root: Option<&Path>,
         agent: AgentKind,
         agent_home: Option<&Path>,
+        dsh_profile: Option<&str>,
         require_qualified: bool,
     ) -> Result<(), AppError> {
         let adapter = match agent {
             AgentKind::Codex => setup::DoctorAdapter::Codex,
-            AgentKind::ClaudeCode => setup::DoctorAdapter::ClaudeCode,
-            AgentKind::PrimeAgent => setup::DoctorAdapter::PrimeAgent,
+            AgentKind::Pi => setup::DoctorAdapter::Pi,
+            AgentKind::Opencode => setup::DoctorAdapter::Opencode,
+            AgentKind::Dsh => setup::DoctorAdapter::Dsh,
         };
         let mut report = setup::doctor(
             install_root,
             adapter,
             agent_home,
+            dsh_profile,
             &self.root,
             &self.config.project_key,
             &self.config.semantic_providers,
@@ -342,51 +408,18 @@ impl App {
                 println!("{}", pretty_json(&output)?);
                 Ok(())
             }
-            AgentKind::ClaudeCode => {
-                let input: ClaudeHookInput = match read_stdin_json_limited(MAX_HOOK_INPUT_BYTES) {
-                    Ok(input) => input,
-                    Err(_) => return Ok(()),
-                };
-                let Some((root, registered_project_key)) =
-                    setup::registered_project_for_cwd(install_root, Path::new(input.cwd()))?
-                else {
-                    return Ok(());
-                };
-                let app = Self::open(Some(root))?;
-                if app.config.project_key != registered_project_key {
-                    let error = format!(
-                        "本机注册 project_key={} 与仓库 project_key={} 不一致",
-                        registered_project_key, app.config.project_key
-                    );
-                    if let Some(output) = claude::failure_output(event, &input, &error) {
-                        println!("{}", pretty_json(&output)?);
-                        return Ok(());
-                    }
-                    return Err(AppError::Setup(error));
-                }
-                let provider_trust = provider::trust_status(
-                    install_root,
-                    &app.root,
-                    &app.config.project_key,
-                    &app.config.semantic_providers,
-                );
-                let output = claude::handle_with_provider_trust(
-                    &app.root,
-                    &app.config,
-                    &app.store,
-                    &provider_trust,
-                    event,
-                    &input,
-                )?;
-                println!("{}", pretty_json(&output)?);
-                Ok(())
+            AgentKind::Pi | AgentKind::Opencode | AgentKind::Dsh => {
+                Self::dispatch_extension_hook(install_root, agent, event)
             }
-            AgentKind::PrimeAgent => Self::dispatch_prime_hook(install_root, event),
         }
     }
 
-    fn dispatch_prime_hook(install_root: Option<&Path>, event: HookEvent) -> Result<(), AppError> {
-        let input: PrimeHookInput = match read_stdin_json_limited(MAX_HOOK_INPUT_BYTES) {
+    fn dispatch_extension_hook(
+        install_root: Option<&Path>,
+        agent: AgentKind,
+        event: HookEvent,
+    ) -> Result<(), AppError> {
+        let input: CodexHookInput = match read_stdin_json_limited(MAX_HOOK_INPUT_BYTES) {
             Ok(input) => input,
             Err(_) => return Ok(()),
         };
@@ -397,16 +430,17 @@ impl App {
         };
         let app = Self::open(Some(root))?;
         if app.config.project_key != registered_project_key {
-            println!(
-                "{}",
-                pretty_json(&prime::failure_output(
-                    event,
-                    &format!(
-                        "本机注册 project_key={} 与仓库 project_key={} 不一致",
-                        registered_project_key, app.config.project_key
-                    )
-                ))?
+            let error = format!(
+                "本机注册 project_key={} 与仓库 project_key={} 不一致",
+                registered_project_key, app.config.project_key
             );
+            let output = match agent {
+                AgentKind::Pi => pi::failure_output(event, &input, &error),
+                AgentKind::Opencode => opencode::failure_output(event, &input, &error),
+                AgentKind::Dsh => dsh::failure_output(event, &input, &error),
+                AgentKind::Codex => unreachable!("Codex 使用原生 dispatcher"),
+            };
+            println!("{}", pretty_json(&output)?);
             return Ok(());
         }
         let provider_trust = provider::trust_status(
@@ -415,14 +449,33 @@ impl App {
             &app.config.project_key,
             &app.config.semantic_providers,
         );
-        let output = prime::handle_with_provider_trust(
-            &app.root,
-            &app.config,
-            &app.store,
-            &provider_trust,
-            event,
-            &input,
-        );
+        let output = match agent {
+            AgentKind::Pi => pi::handle_with_provider_trust(
+                &app.root,
+                &app.config,
+                &app.store,
+                &provider_trust,
+                event,
+                &input,
+            ),
+            AgentKind::Opencode => opencode::handle_with_provider_trust(
+                &app.root,
+                &app.config,
+                &app.store,
+                &provider_trust,
+                event,
+                &input,
+            ),
+            AgentKind::Dsh => dsh::handle_with_provider_trust(
+                &app.root,
+                &app.config,
+                &app.store,
+                &provider_trust,
+                event,
+                &input,
+            ),
+            AgentKind::Codex => unreachable!("Codex 使用原生 dispatcher"),
+        };
         println!("{}", pretty_json(&output)?);
         Ok(())
     }
@@ -430,8 +483,9 @@ impl App {
     pub fn capabilities(agent: AgentKind) -> Result<(), AppError> {
         let capabilities = match agent {
             AgentKind::Codex => codex::capabilities(),
-            AgentKind::ClaudeCode => claude::capabilities(),
-            AgentKind::PrimeAgent => prime::capabilities(),
+            AgentKind::Pi => pi::capabilities(),
+            AgentKind::Opencode => opencode::capabilities(),
+            AgentKind::Dsh => dsh::capabilities(),
         };
         println!("{}", pretty_json(&capabilities)?);
         Ok(())
@@ -575,76 +629,36 @@ impl App {
                 println!("{}", pretty_json(&output)?);
                 Ok(())
             }
-            AgentKind::ClaudeCode => {
-                let input: ClaudeHookInput = match read_stdin_json() {
-                    Ok(input) => input,
-                    Err(error) => {
-                        if let Some(output) = claude::failure_output(
-                            event,
-                            &ClaudeHookInput::default(),
-                            &error.to_string(),
-                        ) {
-                            println!("{}", pretty_json(&output)?);
-                            return Ok(());
-                        }
-                        return Err(error);
-                    }
-                };
-                let app = match Self::open(explicit_root) {
-                    Ok(app) => app,
-                    Err(error) => {
-                        if let Some(output) =
-                            claude::failure_output(event, &input, &error.to_string())
-                        {
-                            println!("{}", pretty_json(&output)?);
-                            return Ok(());
-                        }
-                        return Err(error);
-                    }
-                };
-                let provider_trust = provider::trust_status(
-                    install_root,
-                    &app.root,
-                    &app.config.project_key,
-                    &app.config.semantic_providers,
-                );
-                let output = claude::handle_with_provider_trust(
-                    &app.root,
-                    &app.config,
-                    &app.store,
-                    &provider_trust,
-                    event,
-                    &input,
-                )?;
-                println!("{}", pretty_json(&output)?);
-                Ok(())
+            AgentKind::Pi | AgentKind::Opencode | AgentKind::Dsh => {
+                Self::run_extension_hook(explicit_root, install_root, agent, event)
             }
-            AgentKind::PrimeAgent => Self::run_prime_hook(explicit_root, install_root, event),
         }
     }
 
-    fn run_prime_hook(
+    fn run_extension_hook(
         explicit_root: Option<PathBuf>,
         install_root: Option<&Path>,
+        agent: AgentKind,
         event: HookEvent,
     ) -> Result<(), AppError> {
-        let input: PrimeHookInput = match read_stdin_json() {
+        let input: CodexHookInput = match read_stdin_json() {
             Ok(input) => input,
             Err(error) => {
-                println!(
-                    "{}",
-                    pretty_json(&prime::failure_output(event, &error.to_string()))?
+                let output = extension_failure_output(
+                    agent,
+                    event,
+                    &CodexHookInput::default(),
+                    &error.to_string(),
                 );
+                println!("{}", pretty_json(&output)?);
                 return Ok(());
             }
         };
         let app = match Self::open(explicit_root) {
             Ok(app) => app,
             Err(error) => {
-                println!(
-                    "{}",
-                    pretty_json(&prime::failure_output(event, &error.to_string()))?
-                );
+                let output = extension_failure_output(agent, event, &input, &error.to_string());
+                println!("{}", pretty_json(&output)?);
                 return Ok(());
             }
         };
@@ -654,14 +668,33 @@ impl App {
             &app.config.project_key,
             &app.config.semantic_providers,
         );
-        let output = prime::handle_with_provider_trust(
-            &app.root,
-            &app.config,
-            &app.store,
-            &provider_trust,
-            event,
-            &input,
-        );
+        let output = match agent {
+            AgentKind::Pi => pi::handle_with_provider_trust(
+                &app.root,
+                &app.config,
+                &app.store,
+                &provider_trust,
+                event,
+                &input,
+            ),
+            AgentKind::Opencode => opencode::handle_with_provider_trust(
+                &app.root,
+                &app.config,
+                &app.store,
+                &provider_trust,
+                event,
+                &input,
+            ),
+            AgentKind::Dsh => dsh::handle_with_provider_trust(
+                &app.root,
+                &app.config,
+                &app.store,
+                &provider_trust,
+                event,
+                &input,
+            ),
+            AgentKind::Codex => unreachable!("Codex 使用原生 hook 路径"),
+        };
         println!("{}", pretty_json(&output)?);
         Ok(())
     }
@@ -672,31 +705,6 @@ impl App {
         Ok(())
     }
 
-    pub fn evidence_godot(
-        &self,
-        executable: &Path,
-        trust_local_executable: bool,
-        timeout_seconds: u64,
-    ) -> Result<(), AppError> {
-        let report = godot::run(
-            &self.root,
-            &self.config.project_key,
-            executable,
-            trust_local_executable,
-            timeout_seconds,
-        )?;
-        let persistence = self.persist_current_evidence_snapshot(report.evidence_snapshot())?;
-        println!(
-            "{}",
-            pretty_json(&serde_json::json!({
-                "schema_version": 1,
-                "run": report,
-                "persistence": persistence,
-            }))?
-        );
-        Ok(())
-    }
-
     pub fn evidence_status(&self) -> Result<(), AppError> {
         let current_source = CurrentSourceVerification::inspect(&self.root);
         let heads = self
@@ -704,22 +712,27 @@ impl App {
             .list_evidence_head_summaries(&self.config.project_key)?
             .into_iter()
             .map(|recorded| {
-                let effective = effective_evidence_freshness(
+                let effective = effective_evidence_freshness_v2(
+                    &self.root,
                     recorded.freshness,
                     &recorded.source_fingerprint,
+                    recorded.input_manifest.as_ref(),
                     &current_source,
                 );
+                let input_dependency =
+                    EvidenceInputStatus::from_manifest(recorded.input_manifest.as_ref());
                 EvidenceStatusHead {
                     recorded,
                     effective_freshness: effective.freshness,
                     effective_reason: effective.reason,
+                    input_dependency,
                 }
             })
             .collect();
         println!(
             "{}",
             pretty_json(&EvidenceStatusReport {
-                schema_version: 1,
+                schema_version: 2,
                 project_key: &self.config.project_key,
                 current_source_fingerprint: current_source.fingerprint(),
                 current_source_error: current_source.error(),
@@ -729,30 +742,124 @@ impl App {
         Ok(())
     }
 
+    pub fn evidence_inputs_show(
+        &self,
+        plane: EvidencePlane,
+        provider_id: &str,
+    ) -> Result<(), AppError> {
+        let head = self
+            .store
+            .list_evidence_heads(&self.config.project_key)?
+            .into_iter()
+            .find(|head| head.plane == plane && head.provider_id == provider_id)
+            .ok_or_else(|| {
+                AppError::Provider(format!(
+                    "找不到 Evidence head：plane={}, provider_id={provider_id}",
+                    plane.as_str()
+                ))
+            })?;
+        let current_source = CurrentSourceVerification::inspect(&self.root);
+        let effective = effective_evidence_freshness_v2(
+            &self.root,
+            head.freshness,
+            &head.snapshot.source_fingerprint,
+            head.input_manifest.as_ref(),
+            &current_source,
+        );
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": 1,
+                "project_key": self.config.project_key,
+                "plane": plane,
+                "provider_id": provider_id,
+                "snapshot_fingerprint": head.snapshot_fingerprint,
+                "recorded_freshness": head.freshness,
+                "effective_freshness": effective.freshness,
+                "effective_reason": effective.reason,
+                "mode": if head.input_manifest.is_some() { "manifest_v1" } else { "legacy_project_wide" },
+                "manifest": head.input_manifest,
+            }))?
+        );
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub fn evidence_runtime_godot(
+    pub fn evidence_provider_bind(
         &self,
         install_root: Option<&Path>,
-        bundle_fingerprint: &str,
+        profile: &str,
         executable: &Path,
+        authority_ceiling: EvidenceAuthority,
+        replace: bool,
         trust_local_executable: bool,
-        quit_after: u32,
         timeout_seconds: u64,
     ) -> Result<(), AppError> {
-        let heads = self.store.list_evidence_heads(&self.config.project_key)?;
-        let report = runtime::run_godot(&runtime::RuntimeRequest {
-            project_root: &self.root,
+        let report = evidence_provider::bind(
             install_root,
-            project_key: &self.config.project_key,
-            bundle_fingerprint,
+            &self.root,
+            &self.config.project_key,
+            profile,
             executable,
+            authority_ceiling,
+            replace,
             trust_local_executable,
-            quit_after,
             timeout_seconds,
-            evidence_heads: &heads,
-        })?;
-        let succeeded = report.succeeded();
-        let persistence = self.persist_current_evidence_snapshot(report.evidence_snapshot())?;
+        )?;
+        println!("{}", pretty_json(&report)?);
+        Ok(())
+    }
+
+    pub fn evidence_provider_unbind(
+        &self,
+        install_root: Option<&Path>,
+        profile: &str,
+    ) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&evidence_provider::unbind(
+                install_root,
+                &self.config.project_key,
+                profile,
+            )?)?
+        );
+        Ok(())
+    }
+
+    pub fn evidence_provider_list(&self, install_root: Option<&Path>) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&evidence_provider::list(
+                install_root,
+                &self.config.project_key,
+            )?)?
+        );
+        Ok(())
+    }
+
+    pub fn evidence_provider_run(
+        &self,
+        install_root: Option<&Path>,
+        profile: &str,
+        plane: EvidencePlane,
+        contract: &Path,
+        config: Option<&Path>,
+        timeout_seconds: u64,
+    ) -> Result<(), AppError> {
+        let report = evidence_provider::run(
+            install_root,
+            &self.root,
+            &self.config.project_key,
+            profile,
+            plane,
+            contract,
+            config,
+            timeout_seconds,
+        )?;
+        let persistence = self.persist_current_evidence_snapshot_with_inputs(
+            &report.evidence,
+            report.input_manifest(),
+        )?;
         println!(
             "{}",
             pretty_json(&serde_json::json!({
@@ -761,13 +868,7 @@ impl App {
                 "persistence": persistence,
             }))?
         );
-        if succeeded {
-            Ok(())
-        } else {
-            Err(AppError::Provider(
-                "Runtime Evidence 已保存失败结果；运行合同未通过".to_owned(),
-            ))
-        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -799,7 +900,10 @@ impl App {
             evidence_heads: &heads,
         })?;
         let passed = report.passed();
-        let persistence = self.persist_current_evidence_snapshot(&report.evidence)?;
+        let persistence = self.persist_current_evidence_snapshot_with_inputs(
+            &report.evidence,
+            report.input_manifest(),
+        )?;
         println!(
             "{}",
             pretty_json(&serde_json::json!({
@@ -842,7 +946,10 @@ impl App {
             evidence_heads: &heads,
         })?;
         let passed = report.passed();
-        let persistence = self.persist_current_evidence_snapshot(&report.evidence)?;
+        let persistence = self.persist_current_evidence_snapshot_with_inputs(
+            &report.evidence,
+            report.input_manifest(),
+        )?;
         println!(
             "{}",
             pretty_json(&serde_json::json!({
@@ -887,7 +994,10 @@ impl App {
             evidence_heads: &heads,
         })?;
         let passed = report.passed();
-        let persistence = self.persist_current_evidence_snapshot(&report.evidence)?;
+        let persistence = self.persist_current_evidence_snapshot_with_inputs(
+            &report.evidence,
+            report.input_manifest(),
+        )?;
         println!(
             "{}",
             pretty_json(&serde_json::json!({
@@ -906,71 +1016,16 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn evidence_test_godot(
-        &self,
-        install_root: Option<&Path>,
-        executable: &Path,
-        profile: &str,
-        build_profile: &str,
-        target: &Path,
-        scenario: &Path,
-        trust_local_executable: bool,
-        trust_repository_test_code: bool,
-        quit_after: u32,
-        timeout_seconds: u64,
-    ) -> Result<(), AppError> {
-        let heads = self.store.list_evidence_heads(&self.config.project_key)?;
-        let report = test::run_godot_scenario(&test::GodotScenarioTestRequest {
-            project_root: &self.root,
-            install_root,
-            project_key: &self.config.project_key,
-            profile_id: profile,
-            build_profile_id: build_profile,
-            executable,
-            target,
-            scenario,
-            trust_local_executable,
-            trust_repository_test_code,
-            quit_after,
-            timeout_seconds,
-            evidence_heads: &heads,
-        })?;
-        let passed = report.passed();
-        let persistence = self.persist_current_evidence_snapshot(&report.evidence)?;
-        println!(
-            "{}",
-            pretty_json(&serde_json::json!({
-                "schema_version": 1,
-                "run": report,
-                "persistence": persistence,
-            }))?
-        );
-        if passed {
-            Ok(())
-        } else {
-            Err(AppError::Provider(
-                "Godot Scenario Test Evidence 已保存非通过结果；测试合同未通过".to_owned(),
-            ))
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub fn evidence_build_dotnet(
         &self,
         install_root: Option<&Path>,
         executable: &Path,
         profile: &str,
         target: &Path,
-        require_engine: bool,
         trust_local_executable: bool,
         trust_repository_build_code: bool,
         timeout_seconds: u64,
     ) -> Result<(), AppError> {
-        let upstream = if require_engine {
-            vec![self.required_engine_reference()?]
-        } else {
-            Vec::new()
-        };
         let report = build::run_dotnet(&build::BuildRequest {
             project_root: &self.root,
             install_root,
@@ -981,7 +1036,7 @@ impl App {
             trust_local_executable,
             trust_repository_build_code,
             timeout_seconds,
-            upstream,
+            upstream: Vec::new(),
         })?;
         self.persist_build_report(&report)
     }
@@ -1038,7 +1093,10 @@ impl App {
 
     fn persist_build_report(&self, report: &build::BuildRunReport) -> Result<(), AppError> {
         let succeeded = report.succeeded();
-        let persistence = self.persist_current_evidence_snapshot(report.evidence_snapshot())?;
+        let persistence = self.persist_current_evidence_snapshot_with_inputs(
+            report.evidence_snapshot(),
+            report.input_manifest(),
+        )?;
         println!(
             "{}",
             pretty_json(&serde_json::json!({
@@ -1056,51 +1114,19 @@ impl App {
         }
     }
 
-    fn persist_current_evidence_snapshot(
+    fn persist_current_evidence_snapshot_with_inputs(
         &self,
         snapshot: &EvidenceSnapshot,
+        input_manifest: &brain_evidence::EvidenceInputManifestV1,
     ) -> Result<EvidenceApplyResult, AppError> {
         let current_source_fingerprint = git::worktree_fingerprint(&self.root)?;
         Ok(self
             .store
-            .apply_evidence_snapshot_for_current_source(snapshot, &current_source_fingerprint)?)
-    }
-
-    fn required_engine_reference(&self) -> Result<EvidenceReference, AppError> {
-        let current_source = CurrentSourceVerification::inspect(&self.root);
-        let candidates = self
-            .store
-            .list_evidence_head_summaries(&self.config.project_key)?
-            .into_iter()
-            .filter(|head| {
-                head.plane == EvidencePlane::Engine
-                    && effective_evidence_freshness(
-                        head.freshness,
-                        &head.source_fingerprint,
-                        &current_source,
-                    )
-                    .freshness
-                        == EvidenceFreshness::Fresh
-                    && head.coverage == EvidenceCoverage::Complete
-                    && head.authority == EvidenceAuthority::Deterministic
-            })
-            .collect::<Vec<_>>();
-        if candidates.len() != 1 {
-            return Err(AppError::Provider(format!(
-                "--require-engine 需要且只允许一个与当前 Source 指纹匹配的 effective-fresh+complete+deterministic Engine head，实际={}{}",
-                candidates.len(),
-                current_source
-                    .error()
-                    .map(|error| format!("；当前 Source fingerprint 无法验证：{error}"))
-                    .unwrap_or_default()
-            )));
-        }
-        let head = &candidates[0];
-        Ok(EvidenceReference {
-            plane: EvidencePlane::Engine,
-            provider_id: head.provider_id.clone(),
-            snapshot_fingerprint: head.snapshot_fingerprint.clone(),
-        })
+            .apply_evidence_snapshot_for_current_source_with_inputs(
+                snapshot,
+                &current_source_fingerprint,
+                input_manifest,
+            )?)
     }
 
     pub fn analyze(&self, base: &str) -> Result<(), AppError> {
@@ -2145,6 +2171,20 @@ fn pretty_json<T: serde::Serialize>(value: &T) -> Result<String, serde_json::Err
     let mut output = serde_json::to_string_pretty(value)?;
     output.push('\n');
     Ok(output)
+}
+
+fn extension_failure_output(
+    agent: AgentKind,
+    event: HookEvent,
+    input: &CodexHookInput,
+    error: &str,
+) -> pi::ExtensionHookOutput {
+    match agent {
+        AgentKind::Pi => pi::failure_output(event, input, error),
+        AgentKind::Opencode => opencode::failure_output(event, input, error),
+        AgentKind::Dsh => dsh::failure_output(event, input, error),
+        AgentKind::Codex => unreachable!("Codex 使用原生 hook 路径"),
+    }
 }
 
 pub fn decision_reason(decision: &brain_core::Decision) -> String {

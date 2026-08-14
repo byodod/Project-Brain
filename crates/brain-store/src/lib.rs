@@ -15,10 +15,13 @@ pub use maintenance::{
 };
 
 use brain_core::{
-    ActionDescriptor, Decision, HOOK_PROTOCOL_VERSION, InternalHookEvent, InternalHookOutcome,
+    ActionDescriptor, AdapterKind, Decision, HOOK_PROTOCOL_VERSION, InternalHookEvent,
+    InternalHookOutcome,
 };
 use brain_evidence::{
-    EvidenceAuthority, EvidenceCoverage, EvidenceFreshness, EvidencePlane, EvidenceSnapshot,
+    DependencyCoverage, EvidenceAuthority, EvidenceCoverage, EvidenceFreshness,
+    EvidenceInputManifestV1, EvidencePlane, EvidenceSnapshot, InputDependencyContractV1,
+    InputManifestEntry, InputPathState, InputPathUniverse, InputRole, InputSelectorV1,
 };
 use brain_symbols::{
     GraphDelta, IdentityQuality, LINEAGE_EVIDENCE_SCHEMA_VERSION, LineageCandidateProposal,
@@ -35,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const DATABASE_SCHEMA_VERSION: i64 = 18;
+pub const DATABASE_SCHEMA_VERSION: i64 = 20;
 const ADAPTER_BUSY_RETRY_DELAYS_MS: [u64; 3] = [20, 80, 320];
 const ALL_EVIDENCE_PLANES: [EvidencePlane; 6] = [
     EvidencePlane::Source,
@@ -172,6 +175,8 @@ pub struct EvidenceHeadRecord {
     pub updated_at_unix_seconds: i64,
     pub last_attestation_sequence: u64,
     pub snapshot: EvidenceSnapshot,
+    /// v19 之前的快照为 `None`，其权限继续采用 `LegacyProjectWide` 语义。
+    pub input_manifest: Option<EvidenceInputManifestV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +195,8 @@ pub struct EvidenceHeadSummary {
     pub stale_reason: Option<String>,
     pub updated_at_unix_seconds: i64,
     pub last_attestation_sequence: u64,
+    #[serde(skip_serializing)]
+    pub input_manifest: Option<EvidenceInputManifestV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -216,6 +223,53 @@ pub struct EvidenceInvalidationResult {
     pub event_id: String,
     pub heads_marked: u64,
     pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EvidenceHeadIdentity {
+    pub plane: EvidencePlane,
+    pub provider_id: String,
+    pub snapshot_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceHeadTransition {
+    pub identity: EvidenceHeadIdentity,
+    /// 只允许 stale/unknown；fresh 通过 `preserved` 单独审计，不允许恢复信任。
+    pub freshness: EvidenceFreshness,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceImpactPlan {
+    pub event_id: String,
+    pub hook_event_id: Option<String>,
+    pub operation_id: Option<String>,
+    pub observed_source_fingerprint: Option<String>,
+    pub transitions: Vec<EvidenceHeadTransition>,
+    pub preserved: Vec<EvidenceHeadIdentity>,
+    pub changed_paths: Vec<String>,
+    pub unknown_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceImpactResult {
+    pub event_id: String,
+    pub heads_marked: u64,
+    pub heads_preserved: u64,
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceOperationBaseline {
+    pub project_key: String,
+    pub adapter_kind: AdapterKind,
+    pub session_key: String,
+    pub operation_id: String,
+    pub pre_event_id: String,
+    pub source_fingerprint: String,
+    pub source_state_json: String,
+    pub source_state_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -681,6 +735,8 @@ impl BrainStore {
         self.ensure_lineage_v15_materialization_requests()?;
         self.ensure_evidence_v16_invalidation_outcome()?;
         self.ensure_lineage_v17_compaction_backup()?;
+        self.initialize_evidence_input_v19_schema()?;
+        self.ensure_adapter_domain_v20_schema()?;
         self.ensure_database_instance_id()?;
         self.initialize_adapter_audit_schema()?;
         self.connection.execute(
@@ -903,6 +959,141 @@ impl BrainStore {
                      ADD COLUMN observed_source_fingerprint TEXT;",
             )?;
         }
+        Ok(())
+    }
+
+    fn initialize_evidence_input_v19_schema(&self) -> Result<(), StoreError> {
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS evidence_input_manifests (
+                 evidence_id TEXT PRIMARY KEY,
+                 project_key TEXT NOT NULL,
+                 plane TEXT NOT NULL,
+                 provider_id TEXT NOT NULL,
+                 snapshot_fingerprint TEXT NOT NULL,
+                 manifest_version INTEGER NOT NULL CHECK(manifest_version = 1),
+                 profile_id TEXT NOT NULL,
+                 dependency_contract_version INTEGER NOT NULL,
+                 dependency_contract_hash TEXT NOT NULL,
+                 provider_contract_id TEXT NOT NULL,
+                 provider_contract_version INTEGER NOT NULL,
+                 profile_contract_hash TEXT NOT NULL,
+                 source_fingerprint TEXT NOT NULL,
+                 coverage TEXT NOT NULL CHECK(coverage IN ('complete', 'conservative', 'incomplete')),
+                 manifest_hash TEXT NOT NULL,
+                 entry_count INTEGER NOT NULL,
+                 selector_count INTEGER NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 UNIQUE(project_key, plane, provider_id, snapshot_fingerprint),
+                 FOREIGN KEY(project_key, plane, provider_id, snapshot_fingerprint)
+                     REFERENCES evidence_snapshots(project_key, plane, provider_id, snapshot_fingerprint)
+                     ON DELETE RESTRICT
+             );
+             CREATE INDEX IF NOT EXISTS idx_evidence_input_manifest_project
+                 ON evidence_input_manifests(project_key, plane, provider_id);
+             CREATE TABLE IF NOT EXISTS evidence_input_selectors (
+                 evidence_id TEXT NOT NULL,
+                 ordinal INTEGER NOT NULL,
+                 selector_kind TEXT NOT NULL CHECK(selector_kind IN ('exact_path', 'tree')),
+                 root_or_path TEXT NOT NULL,
+                 universe TEXT CHECK(universe IN ('repository_visible', 'project_filesystem')),
+                 matcher_json TEXT,
+                 role TEXT NOT NULL CHECK(role IN ('source', 'control', 'dependency_declaration', 'generated_input')),
+                 presence_sensitive INTEGER CHECK(presence_sensitive IN (0, 1)),
+                 PRIMARY KEY(evidence_id, ordinal),
+                 FOREIGN KEY(evidence_id) REFERENCES evidence_input_manifests(evidence_id)
+                     ON DELETE RESTRICT
+             );
+             CREATE TABLE IF NOT EXISTS evidence_input_entries (
+                 evidence_id TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK(state IN ('present_regular_file', 'absent')),
+                 role TEXT NOT NULL CHECK(role IN ('source', 'control', 'dependency_declaration', 'generated_input')),
+                 content_sha256 TEXT,
+                 size INTEGER,
+                 PRIMARY KEY(evidence_id, path),
+                 FOREIGN KEY(evidence_id) REFERENCES evidence_input_manifests(evidence_id)
+                     ON DELETE RESTRICT
+             );
+             CREATE TABLE IF NOT EXISTS evidence_impact_events (
+                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                 project_key TEXT NOT NULL,
+                 event_id TEXT NOT NULL,
+                 hook_event_id TEXT,
+                 operation_id TEXT,
+                 observed_source_fingerprint TEXT,
+                 result TEXT NOT NULL CHECK(result IN ('reconciled', 'verification_unknown')),
+                 transition_plan_json TEXT NOT NULL,
+                 preserved_heads_json TEXT NOT NULL,
+                 affected_head_count INTEGER NOT NULL,
+                 preserved_head_count INTEGER NOT NULL,
+                 changed_paths_json TEXT NOT NULL,
+                 unknown_reason TEXT,
+                 event_hash TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 UNIQUE(project_key, event_id)
+             );
+             CREATE TABLE IF NOT EXISTS source_operation_baselines (
+                 project_key TEXT NOT NULL,
+                 adapter_kind TEXT NOT NULL,
+                 session_key TEXT NOT NULL,
+                 operation_id TEXT NOT NULL,
+                 pre_event_id TEXT NOT NULL,
+                 source_fingerprint TEXT NOT NULL,
+                 source_state_json TEXT NOT NULL,
+                 source_state_hash TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 PRIMARY KEY(project_key, adapter_kind, session_key, operation_id),
+                 UNIQUE(project_key, pre_event_id)
+             );",
+        )?;
+        Ok(())
+    }
+
+    fn ensure_adapter_domain_v20_schema(&self) -> Result<(), StoreError> {
+        let table_sql = self
+            .connection
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'source_operation_baselines'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(table_sql) = table_sql else {
+            return Ok(());
+        };
+        if !table_sql.contains("adapter_kind IN") {
+            return Ok(());
+        }
+        self.connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE source_operation_baselines_v20 (
+                 project_key TEXT NOT NULL,
+                 adapter_kind TEXT NOT NULL,
+                 session_key TEXT NOT NULL,
+                 operation_id TEXT NOT NULL,
+                 pre_event_id TEXT NOT NULL,
+                 source_fingerprint TEXT NOT NULL,
+                 source_state_json TEXT NOT NULL,
+                 source_state_hash TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 PRIMARY KEY(project_key, adapter_kind, session_key, operation_id),
+                 UNIQUE(project_key, pre_event_id)
+             );
+             INSERT INTO source_operation_baselines_v20(
+                 project_key, adapter_kind, session_key, operation_id, pre_event_id,
+                 source_fingerprint, source_state_json, source_state_hash,
+                 created_at_unix_seconds
+             )
+             SELECT project_key, adapter_kind, session_key, operation_id, pre_event_id,
+                    source_fingerprint, source_state_json, source_state_hash,
+                    created_at_unix_seconds
+             FROM source_operation_baselines;
+             DROP TABLE source_operation_baselines;
+             ALTER TABLE source_operation_baselines_v20
+                 RENAME TO source_operation_baselines;
+             COMMIT;",
+        )?;
         Ok(())
     }
 
@@ -1517,7 +1708,7 @@ impl BrainStore {
         &self,
         snapshot: &EvidenceSnapshot,
     ) -> Result<EvidenceApplyResult, StoreError> {
-        self.apply_evidence_snapshot_internal(snapshot, None)
+        self.apply_evidence_snapshot_internal(snapshot, None, None)
     }
 
     /// 只在快照绑定已实时验证的当前 Source 指纹时，将它提升为 provider head。
@@ -1537,7 +1728,39 @@ impl BrainStore {
                 snapshot.source_fingerprint
             )));
         }
-        self.apply_evidence_snapshot_internal(snapshot, Some(current_source_fingerprint))
+        self.apply_evidence_snapshot_internal(snapshot, Some(current_source_fingerprint), None)
+    }
+
+    /// 把已通过 Source TOCTOU 验证的 Evidence Snapshot 与不可变 Input Manifest 原子提升。
+    /// 旧快照没有 manifest 时仍可走 legacy API；生产 Provider 应使用本方法。
+    ///
+    /// # Errors
+    ///
+    /// Snapshot、manifest、项目/Provider 合同或 Source 绑定不一致时，在任何写入前拒绝。
+    pub fn apply_evidence_snapshot_for_current_source_with_inputs(
+        &self,
+        snapshot: &EvidenceSnapshot,
+        current_source_fingerprint: &str,
+        input_manifest: &EvidenceInputManifestV1,
+    ) -> Result<EvidenceApplyResult, StoreError> {
+        if snapshot.source_fingerprint != current_source_fingerprint
+            || input_manifest.source_fingerprint_at_creation != current_source_fingerprint
+            || input_manifest.contract.project_key != snapshot.project_key
+            || input_manifest.contract.provider_contract_version
+                != u32::from(snapshot.provider.contract_version)
+        {
+            return Err(StoreError::InvalidEvidence(
+                "Evidence Snapshot、Input Manifest 与当前 Source/Provider 合同不一致".to_owned(),
+            ));
+        }
+        input_manifest
+            .validate()
+            .map_err(|error| StoreError::InvalidEvidence(error.to_string()))?;
+        self.apply_evidence_snapshot_internal(
+            snapshot,
+            Some(current_source_fingerprint),
+            Some(input_manifest),
+        )
     }
 
     #[allow(
@@ -1548,6 +1771,7 @@ impl BrainStore {
         &self,
         snapshot: &EvidenceSnapshot,
         current_source_fingerprint: Option<&str>,
+        input_manifest: Option<&EvidenceInputManifestV1>,
     ) -> Result<EvidenceApplyResult, StoreError> {
         snapshot
             .validate()
@@ -1599,6 +1823,9 @@ impl BrainStore {
                     now,
                 ],
             )?;
+        }
+        if let Some(input_manifest) = input_manifest {
+            persist_evidence_input_manifest(&transaction, snapshot, input_manifest, now)?;
         }
         transaction.execute(
             "INSERT INTO evidence_attestations(
@@ -1660,8 +1887,8 @@ impl BrainStore {
             &apply_event_id,
             now,
         )?;
-        let incompatible_source_heads_staled = if let Some(current_source_fingerprint) =
-            current_source_fingerprint
+        let incompatible_source_heads_staled = if input_manifest.is_none()
+            && let Some(current_source_fingerprint) = current_source_fingerprint
         {
             let reconcile_event_id = format!("evidence-source-reconcile-{attestation_sequence}");
             let (heads_staled, first_staled) = stale_incompatible_source_heads(
@@ -1763,6 +1990,13 @@ impl BrainStore {
                     "Evidence head 与不可变 snapshot 的身份字段不一致".to_owned(),
                 ));
             }
+            let input_manifest = load_evidence_input_manifest(
+                &self.connection,
+                &stored_project_key,
+                plane,
+                &provider_id,
+                &snapshot_fingerprint,
+            )?;
             records.push(EvidenceHeadRecord {
                 project_key: stored_project_key,
                 plane,
@@ -1776,6 +2010,7 @@ impl BrainStore {
                     |_| StoreError::Integrity("Evidence attestation sequence 为负数".to_owned()),
                 )?,
                 snapshot,
+                input_manifest,
             });
         }
         Ok(records)
@@ -1840,11 +2075,19 @@ impl BrainStore {
                 updated_at_unix_seconds,
                 last_attestation_sequence,
             ) = row?;
+            let parsed_plane = EvidencePlane::parse(&plane).ok_or_else(|| {
+                StoreError::InvalidEvidence(format!("无法识别 evidence plane={plane:?}"))
+            })?;
+            let input_manifest = load_evidence_input_manifest(
+                &self.connection,
+                &stored_project_key,
+                parsed_plane,
+                &provider_id,
+                &snapshot_fingerprint,
+            )?;
             records.push(EvidenceHeadSummary {
                 project_key: stored_project_key,
-                plane: EvidencePlane::parse(&plane).ok_or_else(|| {
-                    StoreError::InvalidEvidence(format!("无法识别 evidence plane={plane:?}"))
-                })?,
+                plane: parsed_plane,
                 provider_id,
                 provider_version,
                 provider_contract_version: u16::try_from(provider_contract_version).map_err(
@@ -1873,9 +2116,398 @@ impl BrainStore {
                 last_attestation_sequence: u64::try_from(last_attestation_sequence).map_err(
                     |_| StoreError::Integrity("Evidence attestation sequence 为负数".to_owned()),
                 )?,
+                input_manifest,
             });
         }
         Ok(records)
+    }
+
+    /// 记录允许执行的 `PreTool` Source state；同一 operation 只接受逐字相同的重放。
+    ///
+    /// # Errors
+    ///
+    /// 身份、Source state 或同一 operation 的重放内容不一致时返回错误。
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_source_operation_baseline(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+        operation_id: &str,
+        pre_event_id: &str,
+        source_fingerprint: &str,
+        source_state_json: &str,
+    ) -> Result<SourceOperationBaseline, StoreError> {
+        if !is_valid_project_key(project_key)
+            || [session_key, operation_id, pre_event_id, source_fingerprint]
+                .iter()
+                .any(|value| {
+                    value.trim().is_empty()
+                        || value.len() > 512
+                        || value.contains(['\0', '\n', '\r'])
+                })
+            || source_state_json.is_empty()
+            || source_state_json.len() > 256 * 1024 * 1024
+        {
+            return Err(StoreError::InvalidEvidence(
+                "Source operation baseline identity/state 非法".to_owned(),
+            ));
+        }
+        let source_state_hash = fingerprint_parts(&[
+            b"project-brain/source-operation-baseline/v1",
+            source_state_json.as_bytes(),
+        ]);
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT pre_event_id, source_fingerprint, source_state_json, source_state_hash
+                 FROM source_operation_baselines
+                 WHERE project_key = ?1 AND adapter_kind = ?2 AND session_key = ?3 AND operation_id = ?4",
+                params![project_key, adapter_kind.as_str(), session_key, operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((existing_event, existing_source, existing_json, existing_hash)) = existing {
+            if existing_event != pre_event_id
+                || existing_source != source_fingerprint
+                || existing_json != source_state_json
+                || existing_hash != source_state_hash
+            {
+                return Err(StoreError::EvidenceIdempotencyConflict(
+                    operation_id.to_owned(),
+                ));
+            }
+        } else {
+            self.connection.execute(
+                "INSERT INTO source_operation_baselines(
+                     project_key, adapter_kind, session_key, operation_id, pre_event_id,
+                     source_fingerprint, source_state_json, source_state_hash, created_at_unix_seconds
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    project_key,
+                    adapter_kind.as_str(),
+                    session_key,
+                    operation_id,
+                    pre_event_id,
+                    source_fingerprint,
+                    source_state_json,
+                    source_state_hash,
+                    unix_seconds()?,
+                ],
+            )?;
+        }
+        Ok(SourceOperationBaseline {
+            project_key: project_key.to_owned(),
+            adapter_kind,
+            session_key: session_key.to_owned(),
+            operation_id: operation_id.to_owned(),
+            pre_event_id: pre_event_id.to_owned(),
+            source_fingerprint: source_fingerprint.to_owned(),
+            source_state_json: source_state_json.to_owned(),
+            source_state_hash,
+        })
+    }
+
+    /// # Errors
+    ///
+    /// 数据库读取失败时返回错误。
+    pub fn source_operation_baseline(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+        operation_id: &str,
+    ) -> Result<Option<SourceOperationBaseline>, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT pre_event_id, source_fingerprint, source_state_json, source_state_hash
+                 FROM source_operation_baselines
+                 WHERE project_key = ?1 AND adapter_kind = ?2 AND session_key = ?3 AND operation_id = ?4",
+                params![project_key, adapter_kind.as_str(), session_key, operation_id],
+                |row| {
+                    Ok(SourceOperationBaseline {
+                        project_key: project_key.to_owned(),
+                        adapter_kind,
+                        session_key: session_key.to_owned(),
+                        operation_id: operation_id.to_owned(),
+                        pre_event_id: row.get(0)?,
+                        source_fingerprint: row.get(1)?,
+                        source_state_json: row.get(2)?,
+                        source_state_hash: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// # Errors
+    ///
+    /// 数据库删除失败时返回错误。
+    pub fn delete_source_operation_baseline(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+        operation_id: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "DELETE FROM source_operation_baselines
+             WHERE project_key = ?1 AND adapter_kind = ?2 AND session_key = ?3 AND operation_id = ?4",
+            params![project_key, adapter_kind.as_str(), session_key, operation_id],
+        )? == 1)
+    }
+
+    /// 原子应用在 `SQLite` 事务外完成 Source/Input TOCTOU 验证后形成的精确 head 影响计划。
+    /// 该路径只允许单调降权；preserved 只进入审计，绝不会把 stale/unknown 恢复 fresh。
+    ///
+    /// # Errors
+    ///
+    /// 计划身份、顺序、路径或事件幂等内容非法，或当前 head 身份已不匹配时返回错误。
+    #[allow(
+        clippy::too_many_lines,
+        reason = "精确影响计划的 canonicalization、幂等审计、CAS 降权与 upstream 传播必须在一个事务内"
+    )]
+    pub fn apply_evidence_impact_plan(
+        &self,
+        project_key: &str,
+        plan: &EvidenceImpactPlan,
+    ) -> Result<EvidenceImpactResult, StoreError> {
+        if !is_valid_project_key(project_key)
+            || plan.event_id.trim().is_empty()
+            || plan.event_id.len() > 256
+            || plan.event_id.contains(['\0', '\n', '\r'])
+            || plan
+                .observed_source_fingerprint
+                .as_deref()
+                .is_some_and(|value| {
+                    value.trim().is_empty()
+                        || value.len() > 256
+                        || value.contains(['\0', '\n', '\r'])
+                })
+        {
+            return Err(StoreError::InvalidEvidence(
+                "Evidence impact plan 缺少合法 project/event/source identity".to_owned(),
+            ));
+        }
+        let mut transitions = plan.transitions.clone();
+        transitions.sort_by(|left, right| {
+            (&left.identity, left.freshness.as_str(), &left.reason).cmp(&(
+                &right.identity,
+                right.freshness.as_str(),
+                &right.reason,
+            ))
+        });
+        let mut preserved = plan.preserved.clone();
+        preserved.sort();
+        preserved.dedup();
+        let mut paths = plan.changed_paths.clone();
+        paths.sort();
+        paths.dedup();
+        if transitions
+            .windows(2)
+            .any(|pair| pair[0].identity == pair[1].identity)
+            || transitions.iter().any(|transition| {
+                !matches!(
+                    transition.freshness,
+                    EvidenceFreshness::Stale | EvidenceFreshness::Unknown
+                ) || transition.reason.trim().is_empty()
+                    || transition.reason.len() > 2_048
+                    || transition.reason.contains('\0')
+                    || preserved.binary_search(&transition.identity).is_ok()
+            })
+            || paths.len() > 4_096
+            || paths.iter().any(|path| {
+                path.trim().is_empty() || path.len() > 4_096 || path.contains(['\0', '\n', '\r'])
+            })
+        {
+            return Err(StoreError::InvalidEvidence(
+                "Evidence impact plan transition/preserved/path 非法或重复".to_owned(),
+            ));
+        }
+        let transition_plan_json = serde_json::to_string(&transitions)?;
+        let preserved_heads_json = serde_json::to_string(&preserved)?;
+        let changed_paths_json = serde_json::to_string(&paths)?;
+        let result = if transitions
+            .iter()
+            .any(|transition| transition.freshness == EvidenceFreshness::Unknown)
+            || plan.unknown_reason.is_some()
+        {
+            "verification_unknown"
+        } else {
+            "reconciled"
+        };
+        let event_hash = fingerprint_parts(&[
+            project_key.as_bytes(),
+            plan.event_id.as_bytes(),
+            plan.hook_event_id.as_deref().unwrap_or_default().as_bytes(),
+            plan.operation_id.as_deref().unwrap_or_default().as_bytes(),
+            plan.observed_source_fingerprint
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+            result.as_bytes(),
+            transition_plan_json.as_bytes(),
+            preserved_heads_json.as_bytes(),
+            changed_paths_json.as_bytes(),
+            plan.unknown_reason
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        ]);
+        let now = unix_seconds()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT event_hash, affected_head_count, preserved_head_count
+                 FROM evidence_impact_events WHERE project_key = ?1 AND event_id = ?2",
+                params![project_key, plan.event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((existing_hash, affected, preserved_count)) = existing {
+            if existing_hash != event_hash {
+                return Err(StoreError::EvidenceIdempotencyConflict(
+                    plan.event_id.clone(),
+                ));
+            }
+            transaction.commit()?;
+            return Ok(EvidenceImpactResult {
+                event_id: plan.event_id.clone(),
+                heads_marked: u64::try_from(affected).map_err(|_| {
+                    StoreError::Integrity("Evidence impact affected count 为负数".to_owned())
+                })?,
+                heads_preserved: u64::try_from(preserved_count).map_err(|_| {
+                    StoreError::Integrity("Evidence impact preserved count 为负数".to_owned())
+                })?,
+                replayed: true,
+            });
+        }
+        let current_heads = load_stored_evidence_heads(&transaction, project_key)?;
+        let current_identities = current_heads
+            .iter()
+            .map(|head| EvidenceHeadIdentity {
+                plane: head.plane,
+                provider_id: head.provider_id.clone(),
+                snapshot_fingerprint: head.snapshot_fingerprint.clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        if transitions
+            .iter()
+            .map(|transition| &transition.identity)
+            .chain(&preserved)
+            .any(|identity| !current_identities.contains(identity))
+        {
+            return Err(StoreError::InvalidEvidence(
+                "Evidence impact plan 引用了已经变化或不存在的 current head".to_owned(),
+            ));
+        }
+        let mut heads_marked = 0_u64;
+        let mut changed_identities = Vec::new();
+        for transition in &transitions {
+            let freshness_predicate = match transition.freshness {
+                EvidenceFreshness::Stale => "freshness IN ('fresh', 'unknown')",
+                EvidenceFreshness::Unknown => "freshness = 'fresh'",
+                EvidenceFreshness::Fresh => unreachable!("前置验证拒绝 fresh transition"),
+            };
+            let sql = format!(
+                "UPDATE evidence_heads
+                 SET freshness = ?1, stale_event_id = ?2, stale_reason = ?3,
+                     updated_at_unix_seconds = ?4
+                 WHERE project_key = ?5 AND plane = ?6 AND provider_id = ?7
+                   AND snapshot_fingerprint = ?8 AND {freshness_predicate}"
+            );
+            let changed = transaction.execute(
+                &sql,
+                params![
+                    transition.freshness.as_str(),
+                    plan.event_id,
+                    transition.reason,
+                    now,
+                    project_key,
+                    transition.identity.plane.as_str(),
+                    transition.identity.provider_id,
+                    transition.identity.snapshot_fingerprint,
+                ],
+            )?;
+            if changed > 0 {
+                heads_marked = heads_marked
+                    .checked_add(u64::try_from(changed).map_err(|_| {
+                        StoreError::Integrity("Evidence impact changed count 溢出".to_owned())
+                    })?)
+                    .ok_or_else(|| {
+                        StoreError::Integrity("Evidence impact changed count 溢出".to_owned())
+                    })?;
+                changed_identities.push(transition.identity.clone());
+            }
+        }
+        transaction.execute(
+            "INSERT INTO evidence_impact_events(
+                 project_key, event_id, hook_event_id, operation_id,
+                 observed_source_fingerprint, result, transition_plan_json,
+                 preserved_heads_json, affected_head_count, preserved_head_count,
+                 changed_paths_json, unknown_reason, event_hash, created_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                project_key,
+                plan.event_id,
+                plan.hook_event_id,
+                plan.operation_id,
+                plan.observed_source_fingerprint,
+                result,
+                transition_plan_json,
+                preserved_heads_json,
+                i64::try_from(heads_marked).map_err(|_| {
+                    StoreError::Integrity("Evidence impact affected count 溢出".to_owned())
+                })?,
+                i64::try_from(preserved.len()).map_err(|_| {
+                    StoreError::Integrity("Evidence impact preserved count 溢出".to_owned())
+                })?,
+                changed_paths_json,
+                plan.unknown_reason,
+                event_hash,
+                now,
+            ],
+        )?;
+        for identity in changed_identities {
+            propagate_evidence_staleness(
+                &transaction,
+                project_key,
+                identity.plane,
+                &identity.provider_id,
+                &format!(
+                    "evidence-impact-propagate-{}",
+                    &fingerprint_parts(&[
+                        plan.event_id.as_bytes(),
+                        identity.plane.as_str().as_bytes(),
+                        identity.provider_id.as_bytes(),
+                    ])[7..]
+                ),
+                now,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(EvidenceImpactResult {
+            event_id: plan.event_id.clone(),
+            heads_marked,
+            heads_preserved: u64::try_from(preserved.len()).map_err(|_| {
+                StoreError::Integrity("Evidence impact preserved count 溢出".to_owned())
+            })?,
+            replayed: false,
+        })
     }
 
     /// 以幂等事件把项目某个 Evidence Plane 的所有当前 heads 标记为 stale。
@@ -6302,6 +6934,423 @@ fn evidence_freshness_from_heads(
     }
 }
 
+fn evidence_input_id(snapshot: &EvidenceSnapshot) -> String {
+    evidence_input_id_parts(
+        &snapshot.project_key,
+        snapshot.plane,
+        &snapshot.provider.id,
+        &snapshot.snapshot_fingerprint,
+    )
+}
+
+fn evidence_input_id_parts(
+    project_key: &str,
+    plane: EvidencePlane,
+    provider_id: &str,
+    snapshot_fingerprint: &str,
+) -> String {
+    format!(
+        "evidence_input_v1_{}",
+        &fingerprint_parts(&[
+            project_key.as_bytes(),
+            plane.as_str().as_bytes(),
+            provider_id.as_bytes(),
+            snapshot_fingerprint.as_bytes(),
+        ])[7..]
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "输入合同、selector 与 entry 必须在同一事务边界内完整持久化"
+)]
+fn persist_evidence_input_manifest(
+    transaction: &Transaction<'_>,
+    snapshot: &EvidenceSnapshot,
+    manifest: &EvidenceInputManifestV1,
+    now: i64,
+) -> Result<(), StoreError> {
+    manifest
+        .validate()
+        .map_err(|error| StoreError::InvalidEvidence(error.to_string()))?;
+    let evidence_id = evidence_input_id(snapshot);
+    let existing = transaction
+        .query_row(
+            "SELECT manifest_hash, dependency_contract_hash, profile_contract_hash,
+                    source_fingerprint
+             FROM evidence_input_manifests WHERE evidence_id = ?1",
+            [&evidence_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        if existing
+            != (
+                manifest.manifest_hash.clone(),
+                manifest.contract.dependency_contract_hash.clone(),
+                manifest.contract.profile_contract_hash.clone(),
+                manifest.source_fingerprint_at_creation.clone(),
+            )
+        {
+            return Err(StoreError::InvalidEvidence(format!(
+                "Evidence input manifest evidence_id={evidence_id} 的不可变内容发生冲突"
+            )));
+        }
+        let loaded = load_evidence_input_manifest(
+            transaction,
+            &snapshot.project_key,
+            snapshot.plane,
+            &snapshot.provider.id,
+            &snapshot.snapshot_fingerprint,
+        )?
+        .ok_or_else(|| {
+            StoreError::Integrity(format!(
+                "Evidence input manifest evidence_id={evidence_id} header 存在但明细缺失"
+            ))
+        })?;
+        if loaded != *manifest {
+            return Err(StoreError::InvalidEvidence(format!(
+                "Evidence input manifest evidence_id={evidence_id} 的 selector/entry 发生冲突"
+            )));
+        }
+        return Ok(());
+    }
+    transaction.execute(
+        "INSERT INTO evidence_input_manifests(
+             evidence_id, project_key, plane, provider_id, snapshot_fingerprint,
+             manifest_version, profile_id, dependency_contract_version,
+             dependency_contract_hash, provider_contract_id, provider_contract_version,
+             profile_contract_hash, source_fingerprint, coverage, manifest_hash,
+             entry_count, selector_count, created_at_unix_seconds
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                   ?14, ?15, ?16, ?17, ?18)",
+        params![
+            evidence_id,
+            snapshot.project_key,
+            snapshot.plane.as_str(),
+            snapshot.provider.id,
+            snapshot.snapshot_fingerprint,
+            i64::from(manifest.manifest_version),
+            manifest.contract.profile_id,
+            i64::from(manifest.contract.contract_version),
+            manifest.contract.dependency_contract_hash,
+            manifest.contract.provider_contract_id,
+            i64::from(manifest.contract.provider_contract_version),
+            manifest.contract.profile_contract_hash,
+            manifest.source_fingerprint_at_creation,
+            manifest.contract.coverage.as_str(),
+            manifest.manifest_hash,
+            i64::try_from(manifest.entries.len())
+                .map_err(|_| StoreError::Integrity("Evidence input entry 数量溢出".to_owned()))?,
+            i64::try_from(manifest.contract.selectors.len()).map_err(|_| StoreError::Integrity(
+                "Evidence input selector 数量溢出".to_owned()
+            ))?,
+            now,
+        ],
+    )?;
+    for (ordinal, selector) in manifest.contract.selectors.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal).map_err(|_| {
+            StoreError::Integrity("Evidence input selector ordinal 溢出".to_owned())
+        })?;
+        match selector {
+            InputSelectorV1::ExactPath {
+                path,
+                role,
+                presence_sensitive,
+            } => {
+                transaction.execute(
+                    "INSERT INTO evidence_input_selectors(
+                         evidence_id, ordinal, selector_kind, root_or_path, universe,
+                         matcher_json, role, presence_sensitive
+                     ) VALUES (?1, ?2, 'exact_path', ?3, NULL, NULL, ?4, ?5)",
+                    params![
+                        evidence_id,
+                        ordinal,
+                        path,
+                        input_role_name(*role),
+                        i64::from(*presence_sensitive),
+                    ],
+                )?;
+            }
+            InputSelectorV1::Tree {
+                root,
+                universe,
+                matcher,
+                role,
+            } => {
+                transaction.execute(
+                    "INSERT INTO evidence_input_selectors(
+                         evidence_id, ordinal, selector_kind, root_or_path, universe,
+                         matcher_json, role, presence_sensitive
+                     ) VALUES (?1, ?2, 'tree', ?3, ?4, ?5, ?6, NULL)",
+                    params![
+                        evidence_id,
+                        ordinal,
+                        root,
+                        input_universe_name(*universe),
+                        serde_json::to_string(matcher)?,
+                        input_role_name(*role),
+                    ],
+                )?;
+            }
+        }
+    }
+    for entry in &manifest.entries {
+        transaction.execute(
+            "INSERT INTO evidence_input_entries(
+                 evidence_id, path, state, role, content_sha256, size
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                evidence_id,
+                entry.path,
+                input_state_name(entry.state),
+                input_role_name(entry.role),
+                entry.content_sha256,
+                entry
+                    .size
+                    .map(i64::try_from)
+                    .transpose()
+                    .map_err(|_| StoreError::Integrity("Evidence input size 溢出".to_owned()))?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "从规范化表重建并复验不可变输入合同需要读取全部组成部分"
+)]
+fn load_evidence_input_manifest(
+    connection: &Connection,
+    project_key: &str,
+    plane: EvidencePlane,
+    provider_id: &str,
+    snapshot_fingerprint: &str,
+) -> Result<Option<EvidenceInputManifestV1>, StoreError> {
+    let evidence_id =
+        evidence_input_id_parts(project_key, plane, provider_id, snapshot_fingerprint);
+    let header = connection
+        .query_row(
+            "SELECT manifest_version, profile_id, dependency_contract_version,
+                    dependency_contract_hash, provider_contract_id,
+                    provider_contract_version, profile_contract_hash, source_fingerprint,
+                    coverage, manifest_hash, entry_count, selector_count
+             FROM evidence_input_manifests WHERE evidence_id = ?1",
+            [&evidence_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        manifest_version,
+        profile_id,
+        dependency_contract_version,
+        dependency_contract_hash,
+        provider_contract_id,
+        provider_contract_version,
+        profile_contract_hash,
+        source_fingerprint,
+        coverage,
+        manifest_hash,
+        entry_count,
+        selector_count,
+    )) = header
+    else {
+        return Ok(None);
+    };
+    let mut statement = connection.prepare(
+        "SELECT selector_kind, root_or_path, universe, matcher_json, role,
+                presence_sensitive
+         FROM evidence_input_selectors WHERE evidence_id = ?1 ORDER BY ordinal",
+    )?;
+    let selector_rows = statement
+        .query_map([&evidence_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut selectors = Vec::with_capacity(selector_rows.len());
+    for (kind, root_or_path, universe, matcher_json, role, presence_sensitive) in selector_rows {
+        let role = parse_input_role(&role)?;
+        let selector = match kind.as_str() {
+            "exact_path" => InputSelectorV1::ExactPath {
+                path: root_or_path,
+                role,
+                presence_sensitive: presence_sensitive == Some(1),
+            },
+            "tree" => InputSelectorV1::Tree {
+                root: root_or_path,
+                universe: parse_input_universe(universe.as_deref().unwrap_or_default())?,
+                matcher: serde_json::from_str(matcher_json.as_deref().unwrap_or_default())?,
+                role,
+            },
+            _ => {
+                return Err(StoreError::InvalidEvidence(format!(
+                    "未知 Evidence input selector kind={kind:?}"
+                )));
+            }
+        };
+        selectors.push(selector);
+    }
+    let mut statement = connection.prepare(
+        "SELECT path, state, role, content_sha256, size
+         FROM evidence_input_entries WHERE evidence_id = ?1 ORDER BY path",
+    )?;
+    let entry_rows = statement
+        .query_map([&evidence_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let entries = entry_rows
+        .into_iter()
+        .map(|(path, state, role, content_sha256, size)| {
+            Ok(InputManifestEntry {
+                path,
+                state: parse_input_state(&state)?,
+                role: parse_input_role(&role)?,
+                content_sha256,
+                size: size
+                    .map(u64::try_from)
+                    .transpose()
+                    .map_err(|_| StoreError::Integrity("Evidence input size 为负数".to_owned()))?,
+            })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    if usize::try_from(selector_count).ok() != Some(selectors.len())
+        || usize::try_from(entry_count).ok() != Some(entries.len())
+    {
+        return Err(StoreError::Integrity(format!(
+            "Evidence input manifest evidence_id={evidence_id} 计数与明细不一致"
+        )));
+    }
+    let manifest = EvidenceInputManifestV1 {
+        manifest_version: u32::try_from(manifest_version)
+            .map_err(|_| StoreError::Integrity("Evidence manifest version 为负数".to_owned()))?,
+        contract: InputDependencyContractV1 {
+            contract_version: u32::try_from(dependency_contract_version).map_err(|_| {
+                StoreError::Integrity("Evidence dependency contract version 为负数".to_owned())
+            })?,
+            project_key: project_key.to_owned(),
+            profile_id,
+            provider_contract_id,
+            provider_contract_version: u32::try_from(provider_contract_version).map_err(|_| {
+                StoreError::Integrity("Evidence provider contract version 为负数".to_owned())
+            })?,
+            profile_contract_hash,
+            dependency_contract_hash,
+            selectors,
+            coverage: parse_dependency_coverage(&coverage)?,
+        },
+        source_fingerprint_at_creation: source_fingerprint,
+        manifest_hash,
+        entries,
+    };
+    manifest
+        .validate()
+        .map_err(|error| StoreError::InvalidEvidence(error.to_string()))?;
+    Ok(Some(manifest))
+}
+
+const fn input_role_name(role: InputRole) -> &'static str {
+    match role {
+        InputRole::Source => "source",
+        InputRole::Control => "control",
+        InputRole::DependencyDeclaration => "dependency_declaration",
+        InputRole::GeneratedInput => "generated_input",
+    }
+}
+
+fn parse_input_role(value: &str) -> Result<InputRole, StoreError> {
+    match value {
+        "source" => Ok(InputRole::Source),
+        "control" => Ok(InputRole::Control),
+        "dependency_declaration" => Ok(InputRole::DependencyDeclaration),
+        "generated_input" => Ok(InputRole::GeneratedInput),
+        _ => Err(StoreError::InvalidEvidence(format!(
+            "未知 Evidence input role={value:?}"
+        ))),
+    }
+}
+
+const fn input_universe_name(universe: InputPathUniverse) -> &'static str {
+    match universe {
+        InputPathUniverse::RepositoryVisible => "repository_visible",
+        InputPathUniverse::ProjectFilesystem => "project_filesystem",
+    }
+}
+
+fn parse_input_universe(value: &str) -> Result<InputPathUniverse, StoreError> {
+    match value {
+        "repository_visible" => Ok(InputPathUniverse::RepositoryVisible),
+        "project_filesystem" => Ok(InputPathUniverse::ProjectFilesystem),
+        _ => Err(StoreError::InvalidEvidence(format!(
+            "未知 Evidence input universe={value:?}"
+        ))),
+    }
+}
+
+const fn input_state_name(state: InputPathState) -> &'static str {
+    match state {
+        InputPathState::PresentRegularFile => "present_regular_file",
+        InputPathState::Absent => "absent",
+    }
+}
+
+fn parse_input_state(value: &str) -> Result<InputPathState, StoreError> {
+    match value {
+        "present_regular_file" => Ok(InputPathState::PresentRegularFile),
+        "absent" => Ok(InputPathState::Absent),
+        _ => Err(StoreError::InvalidEvidence(format!(
+            "未知 Evidence input state={value:?}"
+        ))),
+    }
+}
+
+fn parse_dependency_coverage(value: &str) -> Result<DependencyCoverage, StoreError> {
+    match value {
+        "complete" => Ok(DependencyCoverage::Complete),
+        "conservative" => Ok(DependencyCoverage::Conservative),
+        "incomplete" => Ok(DependencyCoverage::Incomplete),
+        _ => Err(StoreError::InvalidEvidence(format!(
+            "未知 Evidence dependency coverage={value:?}"
+        ))),
+    }
+}
+
 fn stale_incompatible_source_heads(
     transaction: &Transaction<'_>,
     project_key: &str,
@@ -6745,8 +7794,10 @@ mod tests {
         InternalHookOutcome, SessionOpenReason, SessionOpened,
     };
     use brain_evidence::{
-        EvidenceAuthority, EvidenceCoverage, EvidenceFreshness, EvidencePlane, EvidenceProvider,
-        EvidenceReference, EvidenceSnapshot,
+        DependencyCoverage, EvidenceAuthority, EvidenceCoverage, EvidenceFreshness,
+        EvidenceInputManifestV1, EvidencePlane, EvidenceProvider, EvidenceReference,
+        EvidenceSnapshot, InputDependencyContractV1, InputManifestEntry, InputPathState,
+        InputPathUniverse, InputRole, InputSelectorV1, PathMatcherV1,
     };
 
     use brain_symbols::{
@@ -6757,9 +7808,10 @@ mod tests {
     use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 
     use super::{
-        AdapterRecordResult, BrainStore, DATABASE_SCHEMA_VERSION, LineageCandidateRecord,
-        SemanticSnapshotSource, StoreError, adapter_event_hash, create_verified_legacy_backup,
-        inspect_database_storage, is_raw_sha256, legacy_backup_path, semantic_source_manifest_hash,
+        AdapterRecordResult, BrainStore, DATABASE_SCHEMA_VERSION, EvidenceHeadIdentity,
+        EvidenceHeadTransition, EvidenceImpactPlan, LineageCandidateRecord, SemanticSnapshotSource,
+        StoreError, adapter_event_hash, create_verified_legacy_backup, inspect_database_storage,
+        is_raw_sha256, legacy_backup_path, semantic_source_manifest_hash,
     };
 
     const PROJECT_KEY: &str = "project_test";
@@ -6806,6 +7858,36 @@ mod tests {
             provider_id: snapshot.provider.id.clone(),
             snapshot_fingerprint: snapshot.snapshot_fingerprint.clone(),
         }
+    }
+
+    fn evidence_input_manifest(snapshot: &EvidenceSnapshot) -> EvidenceInputManifestV1 {
+        let contract = InputDependencyContractV1::new(
+            &snapshot.project_key,
+            "main",
+            "test-engine",
+            u32::from(snapshot.provider.contract_version),
+            "sha256_profile",
+            vec![InputSelectorV1::Tree {
+                root: "src".to_owned(),
+                universe: InputPathUniverse::RepositoryVisible,
+                matcher: PathMatcherV1::new(vec!["**/*.rs".to_owned()], Vec::new()).unwrap(),
+                role: InputRole::Source,
+            }],
+            DependencyCoverage::Complete,
+        )
+        .unwrap();
+        EvidenceInputManifestV1::new(
+            contract,
+            &snapshot.source_fingerprint,
+            vec![InputManifestEntry {
+                path: "src/lib.rs".to_owned(),
+                state: InputPathState::PresentRegularFile,
+                role: InputRole::Source,
+                content_sha256: Some("sha256_content".to_owned()),
+                size: Some(12),
+            }],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -7100,6 +8182,238 @@ mod tests {
         assert_eq!(observed_source.as_deref(), Some("sha256_source-b"));
         let identities: Vec<serde_json::Value> = serde_json::from_str(&identities_json).unwrap();
         assert_eq!(identities.len(), 2);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "单一事务 fixture 同时证明输入 manifest 持久化和精准 head 保留"
+    )]
+    fn input_aware_promotion_persists_manifest_and_does_not_project_wide_stale() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let scoped_a = plane_evidence_snapshot(
+            PROJECT_KEY,
+            EvidencePlane::Engine,
+            "engine-a",
+            "sha256_source-a",
+            Vec::new(),
+        );
+        let manifest_a = evidence_input_manifest(&scoped_a);
+        let applied_a = store
+            .apply_evidence_snapshot_for_current_source_with_inputs(
+                &scoped_a,
+                "sha256_source-a",
+                &manifest_a,
+            )
+            .unwrap();
+        assert_eq!(applied_a.incompatible_source_heads_staled, 0);
+
+        let scoped_b = plane_evidence_snapshot(
+            PROJECT_KEY,
+            EvidencePlane::Test,
+            "test-b",
+            "sha256_source-b",
+            Vec::new(),
+        );
+        let manifest_b = evidence_input_manifest(&scoped_b);
+        let applied_b = store
+            .apply_evidence_snapshot_for_current_source_with_inputs(
+                &scoped_b,
+                "sha256_source-b",
+                &manifest_b,
+            )
+            .unwrap();
+        assert_eq!(applied_b.incompatible_source_heads_staled, 0);
+        let heads = store.list_evidence_heads(PROJECT_KEY).unwrap();
+        assert_eq!(heads.len(), 2);
+        assert!(
+            heads
+                .iter()
+                .all(|head| head.freshness == EvidenceFreshness::Fresh)
+        );
+        assert_eq!(
+            heads
+                .iter()
+                .find(|head| head.provider_id == "engine-a")
+                .unwrap()
+                .input_manifest
+                .as_ref()
+                .unwrap(),
+            &manifest_a
+        );
+        assert_eq!(
+            store
+                .list_evidence_head_summaries(PROJECT_KEY)
+                .unwrap()
+                .iter()
+                .find(|head| head.provider_id == "test-b")
+                .unwrap()
+                .input_manifest
+                .as_ref()
+                .unwrap(),
+            &manifest_b
+        );
+
+        store
+            .apply_evidence_snapshot_for_current_source_with_inputs(
+                &scoped_a,
+                "sha256_source-a",
+                &manifest_a,
+            )
+            .unwrap();
+        let conflicting = EvidenceInputManifestV1::new(
+            manifest_a.contract.clone(),
+            "sha256_source-a",
+            vec![InputManifestEntry {
+                path: "src/lib.rs".to_owned(),
+                state: InputPathState::PresentRegularFile,
+                role: InputRole::Source,
+                content_sha256: Some("sha256_changed".to_owned()),
+                size: Some(12),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            store.apply_evidence_snapshot_for_current_source_with_inputs(
+                &scoped_a,
+                "sha256_source-a",
+                &conflicting,
+            ),
+            Err(StoreError::InvalidEvidence(_))
+        ));
+
+        let legacy = plane_evidence_snapshot(
+            PROJECT_KEY,
+            EvidencePlane::Runtime,
+            "legacy",
+            "sha256_source-b",
+            Vec::new(),
+        );
+        store
+            .apply_evidence_snapshot_for_current_source(&legacy, "sha256_source-b")
+            .unwrap();
+        assert!(
+            store
+                .list_evidence_heads(PROJECT_KEY)
+                .unwrap()
+                .iter()
+                .find(|head| head.provider_id == "legacy")
+                .unwrap()
+                .input_manifest
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "同一 fixture 必须覆盖影响计划的幂等、单调和碰撞三个不变量"
+    )]
+    fn exact_impact_plan_is_idempotent_monotonic_and_detects_collision() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let engine = plane_evidence_snapshot(
+            PROJECT_KEY,
+            EvidencePlane::Engine,
+            "engine",
+            "sha256_source-a",
+            Vec::new(),
+        );
+        let build = plane_evidence_snapshot(
+            PROJECT_KEY,
+            EvidencePlane::Build,
+            "build",
+            "sha256_source-a",
+            Vec::new(),
+        );
+        for snapshot in [&engine, &build] {
+            store
+                .apply_evidence_snapshot_for_current_source_with_inputs(
+                    snapshot,
+                    "sha256_source-a",
+                    &evidence_input_manifest(snapshot),
+                )
+                .unwrap();
+        }
+        let identity = |snapshot: &EvidenceSnapshot| EvidenceHeadIdentity {
+            plane: snapshot.plane,
+            provider_id: snapshot.provider.id.clone(),
+            snapshot_fingerprint: snapshot.snapshot_fingerprint.clone(),
+        };
+        let plan = EvidenceImpactPlan {
+            event_id: "impact-1".to_owned(),
+            hook_event_id: Some("hook-1".to_owned()),
+            operation_id: Some("operation-1".to_owned()),
+            observed_source_fingerprint: Some("sha256_source-b".to_owned()),
+            transitions: vec![EvidenceHeadTransition {
+                identity: identity(&engine),
+                freshness: EvidenceFreshness::Stale,
+                reason: "engine input changed".to_owned(),
+            }],
+            preserved: vec![identity(&build)],
+            changed_paths: vec!["engine/project.config".to_owned()],
+            unknown_reason: None,
+        };
+        let applied = store
+            .apply_evidence_impact_plan(PROJECT_KEY, &plan)
+            .unwrap();
+        assert_eq!(applied.heads_marked, 1);
+        assert_eq!(applied.heads_preserved, 1);
+        assert!(!applied.replayed);
+        let heads = store.list_evidence_heads(PROJECT_KEY).unwrap();
+        assert_eq!(
+            heads
+                .iter()
+                .find(|head| head.provider_id == "engine")
+                .unwrap()
+                .freshness,
+            EvidenceFreshness::Stale
+        );
+        assert_eq!(
+            heads
+                .iter()
+                .find(|head| head.provider_id == "build")
+                .unwrap()
+                .freshness,
+            EvidenceFreshness::Fresh
+        );
+
+        let replay = store
+            .apply_evidence_impact_plan(PROJECT_KEY, &plan)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.heads_marked, 1);
+        assert_eq!(replay.heads_preserved, 1);
+
+        let mut collision = plan.clone();
+        collision.preserved.clear();
+        assert!(matches!(
+            store.apply_evidence_impact_plan(PROJECT_KEY, &collision),
+            Err(StoreError::EvidenceIdempotencyConflict(event)) if event == "impact-1"
+        ));
+
+        let preserve_stale = EvidenceImpactPlan {
+            event_id: "impact-2".to_owned(),
+            hook_event_id: Some("hook-2".to_owned()),
+            operation_id: Some("operation-2".to_owned()),
+            observed_source_fingerprint: Some("sha256_source-a".to_owned()),
+            transitions: Vec::new(),
+            preserved: vec![identity(&engine)],
+            changed_paths: Vec::new(),
+            unknown_reason: None,
+        };
+        store
+            .apply_evidence_impact_plan(PROJECT_KEY, &preserve_stale)
+            .unwrap();
+        assert_eq!(
+            store
+                .list_evidence_heads(PROJECT_KEY)
+                .unwrap()
+                .iter()
+                .find(|head| head.provider_id == "engine")
+                .unwrap()
+                .freshness,
+            EvidenceFreshness::Stale
+        );
     }
 
     #[test]
@@ -9789,6 +11103,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(has_marker, 0);
+
+        drop(migrated);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v19_adapter_domain_migration_preserves_rows_and_accepts_current_adapters() {
+        let (root, database) = temporary_database("v19-adapter-domain-migration");
+        let store = BrainStore::open(&database).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE source_operation_baselines;
+                 CREATE TABLE source_operation_baselines (
+                     project_key TEXT NOT NULL,
+                     adapter_kind TEXT NOT NULL CHECK(adapter_kind IN ('codex')),
+                     session_key TEXT NOT NULL,
+                     operation_id TEXT NOT NULL,
+                     pre_event_id TEXT NOT NULL,
+                     source_fingerprint TEXT NOT NULL,
+                     source_state_json TEXT NOT NULL,
+                     source_state_hash TEXT NOT NULL,
+                     created_at_unix_seconds INTEGER NOT NULL,
+                     PRIMARY KEY(project_key, adapter_kind, session_key, operation_id),
+                     UNIQUE(project_key, pre_event_id)
+                 );
+                 INSERT INTO source_operation_baselines VALUES(
+                     'project_test', 'codex', 'session', 'operation', 'pre-event',
+                     'sha256_source', '[]', 'sha256_state', 1
+                 );
+                 UPDATE metadata SET value = '19' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        drop(store);
+
+        let migrated = BrainStore::open(&database).unwrap();
+        assert_eq!(
+            migrated.database_schema_version().unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
+        let preserved: i64 = migrated
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM source_operation_baselines
+                 WHERE adapter_kind = 'codex' AND pre_event_id = 'pre-event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
+        for (index, adapter) in ["pi", "opencode", "dsh"].into_iter().enumerate() {
+            migrated
+                .connection
+                .execute(
+                    "INSERT INTO source_operation_baselines VALUES(
+                         'project_test', ?1, 'session', ?2, ?3,
+                         'sha256_source', '[]', 'sha256_state', 1
+                     )",
+                    params![
+                        adapter,
+                        format!("operation-{index}"),
+                        format!("pre-{index}")
+                    ],
+                )
+                .unwrap();
+        }
 
         drop(migrated);
         fs::remove_dir_all(root).unwrap();

@@ -21,8 +21,9 @@ const INSTALL_SCHEMA_VERSION: u32 = 1;
 const DOCTOR_SCHEMA_VERSION: u32 = 2;
 const REGISTRY_SCHEMA_VERSION: u32 = 1;
 const CODEX_INTEGRATION_VERSION: u32 = 1;
-const CLAUDE_INTEGRATION_VERSION: u32 = 1;
-const PRIME_INTEGRATION_VERSION: u32 = 1;
+const PI_INTEGRATION_VERSION: u32 = 1;
+const OPENCODE_INTEGRATION_VERSION: u32 = 1;
+const DSH_INTEGRATION_VERSION: u32 = 1;
 const INSTALL_ROOT_ENV: &str = "PROJECT_BRAIN_INSTALL_ROOT";
 const LAUNCHED_ENV: &str = "PROJECT_BRAIN_LAUNCHED";
 const REQUIRED_CODEX_EVENTS: [&str; 5] = [
@@ -32,20 +33,28 @@ const REQUIRED_CODEX_EVENTS: [&str; 5] = [
     "PostToolUse",
     "Stop",
 ];
-const REQUIRED_CLAUDE_EVENTS: [&str; 5] = [
-    "SessionStart",
-    "UserPromptSubmit",
-    "PreToolUse",
-    "PostToolUse",
-    "Stop",
-];
-const REQUIRED_PRIME_EVENTS: [&str; 5] = [
+const REQUIRED_PI_EVENTS: [&str; 6] = [
     "session_start",
     "input",
     "before_agent_start",
     "tool_call",
     "tool_result",
+    "agent_end",
 ];
+const REQUIRED_OPENCODE_EVENTS: [&str; 5] = [
+    "chat.message",
+    "session.created",
+    "tool.execute.before",
+    "tool.execute.after",
+    "session.idle",
+];
+const REQUIRED_DSH_EVENTS: [&str; 4] = [
+    "agent/pre-step",
+    "tools/pre-execute",
+    "tools/post-execute",
+    "agent/turn-stopping",
+];
+const DSH_PLUGIN_PACKAGE: &str = "@project-brain/dsh-plugin";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InstallManifest {
@@ -77,17 +86,7 @@ struct CodexIntegrationManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ClaudeIntegrationManifest {
-    schema_version: u32,
-    integration_version: u32,
-    target_path: PathBuf,
-    managed_handler_hashes: BTreeMap<String, String>,
-    before_hash: String,
-    after_hash: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct PrimeIntegrationManifest {
+struct PiIntegrationManifest {
     schema_version: u32,
     integration_version: u32,
     api_contract: String,
@@ -96,6 +95,20 @@ struct PrimeIntegrationManifest {
     launcher_path: PathBuf,
     launcher_sha256: String,
     managed_events: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ManagedPluginManifest {
+    schema_version: u32,
+    integration_version: u32,
+    api_contract: String,
+    target_path: PathBuf,
+    target_sha256: String,
+    launcher_path: PathBuf,
+    launcher_sha256: String,
+    managed_events: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,6 +144,7 @@ pub struct HookInstallReport {
     pub schema_version: u32,
     pub target_path: PathBuf,
     pub changed: bool,
+    #[serde(rename = "project_brain_handler_count")]
     pub managed_handler_count: usize,
     pub trust_state: &'static str,
 }
@@ -158,33 +172,40 @@ pub struct DoctorReport {
 #[derive(Debug, Clone, Copy)]
 pub enum DoctorAdapter {
     Codex,
-    ClaudeCode,
-    PrimeAgent,
+    Pi,
+    Opencode,
+    Dsh,
 }
 
 impl DoctorAdapter {
     fn name(self) -> &'static str {
         match self {
             Self::Codex => "codex",
-            Self::ClaudeCode => "claude_code",
-            Self::PrimeAgent => "prime_agent",
+            Self::Pi => "pi",
+            Self::Opencode => "opencode",
+            Self::Dsh => "dsh",
         }
     }
 
     fn display_name(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
-            Self::ClaudeCode => "Claude Code",
-            Self::PrimeAgent => "Prime Agent",
+            Self::Pi => "PI",
+            Self::Opencode => "opencode",
+            Self::Dsh => "dsh",
         }
     }
 }
 
 const fn adapter_trust_state(adapter: DoctorAdapter, valid: bool) -> &'static str {
-    if matches!(adapter, DoctorAdapter::PrimeAgent) && valid {
-        "extension_contract_and_launcher_verified"
-    } else {
-        "not_programmatically_verifiable"
+    match (adapter, valid) {
+        (_, false) => "not_verified",
+        (DoctorAdapter::Codex, true) => {
+            "project_brain_integration_verified_codex_hook_trust_required"
+        }
+        (DoctorAdapter::Pi | DoctorAdapter::Opencode | DoctorAdapter::Dsh, true) => {
+            "project_brain_integration_and_launcher_verified"
+        }
     }
 }
 
@@ -366,6 +387,7 @@ pub fn bootstrap(
             Some(&install_root),
             DoctorAdapter::Codex,
             explicit_codex_home,
+            None,
             &canonical_root,
             project_key,
             provider_profiles,
@@ -536,135 +558,9 @@ pub fn uninstall_codex_hooks(
     })
 }
 
-pub fn install_claude_hooks(
+pub fn install_pi_extension(
     explicit_install_root: Option<&Path>,
-    explicit_claude_home: Option<&Path>,
-) -> Result<HookInstallReport, AppError> {
-    let install_root = resolve_install_root(explicit_install_root)?;
-    let _install = ensure_install_ready(&install_root)?;
-    let launcher = stable_launcher_path(&install_root, &env::current_exe()?)?;
-    if !launcher.is_file() {
-        return Err(AppError::Setup(format!(
-            "稳定 launcher 不存在：{}；请重新执行 project-brain install",
-            launcher.display()
-        )));
-    }
-    let claude_home = resolve_claude_home(explicit_claude_home)?;
-    let target = claude_home.join("settings.json");
-    let integration_path = install_root.join("state/integrations/claude-code.json");
-    fs::create_dir_all(&claude_home)?;
-    fs::create_dir_all(integration_path.parent().expect("integration has parent"))?;
-    let _lock = MutationLock::acquire(&install_root.join("state/integrations/claude-code.lock"))?;
-
-    let original = if target.is_file() {
-        fs::read(&target)?
-    } else {
-        b"{}\n".to_vec()
-    };
-    let mut document: Value = serde_json::from_slice(&original)?;
-    require_object(&document, "Claude settings.json 顶层必须是 JSON object")?;
-    let expected_handlers = managed_claude_handlers(&launcher);
-
-    if integration_path.is_file() {
-        let manifest: ClaudeIntegrationManifest = read_json(&integration_path)?;
-        validate_claude_integration_manifest(&manifest, &target)?;
-        let observed = observed_claude_managed_hashes(&document);
-        if observed == manifest.managed_handler_hashes
-            && manifest.managed_handler_hashes == handler_hashes(&expected_handlers)?
-        {
-            return Ok(HookInstallReport {
-                schema_version: CLAUDE_INTEGRATION_VERSION,
-                target_path: target,
-                changed: false,
-                managed_handler_count: expected_handlers.len(),
-                trust_state: "not_programmatically_verifiable",
-            });
-        }
-        return Err(AppError::IntegrationDrift(target));
-    }
-    if !observed_claude_managed_hashes(&document).is_empty() {
-        return Err(AppError::IntegrationDrift(target));
-    }
-
-    append_claude_managed_groups(&mut document, &expected_handlers)?;
-    let updated = pretty_json_bytes(&document)?;
-    let before_hash = digest_bytes(&original);
-    let after_hash = digest_bytes(&updated);
-    atomic_replace(&target, &updated, Some(&before_hash))?;
-    let manifest = ClaudeIntegrationManifest {
-        schema_version: INSTALL_SCHEMA_VERSION,
-        integration_version: CLAUDE_INTEGRATION_VERSION,
-        target_path: target.clone(),
-        managed_handler_hashes: handler_hashes(&expected_handlers)?,
-        before_hash,
-        after_hash,
-    };
-    if let Err(error) = atomic_replace(&integration_path, &pretty_json_bytes(&manifest)?, None) {
-        let _ = atomic_replace(&target, &original, Some(&manifest.after_hash));
-        return Err(error);
-    }
-
-    Ok(HookInstallReport {
-        schema_version: CLAUDE_INTEGRATION_VERSION,
-        target_path: target,
-        changed: true,
-        managed_handler_count: expected_handlers.len(),
-        trust_state: "not_programmatically_verifiable",
-    })
-}
-
-pub fn uninstall_claude_hooks(
-    explicit_install_root: Option<&Path>,
-    explicit_claude_home: Option<&Path>,
-    force: bool,
-) -> Result<HookInstallReport, AppError> {
-    let install_root = resolve_install_root(explicit_install_root)?;
-    let claude_home = resolve_claude_home(explicit_claude_home)?;
-    let target = claude_home.join("settings.json");
-    let integration_path = install_root.join("state/integrations/claude-code.json");
-    let _lock = MutationLock::acquire(&install_root.join("state/integrations/claude-code.lock"))?;
-    if !target.is_file() || !integration_path.is_file() {
-        return Ok(HookInstallReport {
-            schema_version: CLAUDE_INTEGRATION_VERSION,
-            target_path: target,
-            changed: false,
-            managed_handler_count: 0,
-            trust_state: "not_programmatically_verifiable",
-        });
-    }
-
-    let original = fs::read(&target)?;
-    let mut document: Value = serde_json::from_slice(&original)?;
-    let manifest: ClaudeIntegrationManifest = read_json(&integration_path)?;
-    validate_claude_integration_manifest(&manifest, &target)?;
-    let observed = observed_claude_managed_hashes(&document);
-    if !force && observed != manifest.managed_handler_hashes {
-        return Err(AppError::IntegrationDrift(target));
-    }
-    let removed = remove_claude_managed_handlers(
-        &mut document,
-        &manifest.managed_handler_hashes.values().cloned().collect(),
-        force,
-    );
-    if removed == 0 && !force {
-        return Err(AppError::IntegrationDrift(target));
-    }
-    let updated = pretty_json_bytes(&document)?;
-    atomic_replace(&target, &updated, Some(&digest_bytes(&original)))?;
-    fs::remove_file(&integration_path)?;
-
-    Ok(HookInstallReport {
-        schema_version: CLAUDE_INTEGRATION_VERSION,
-        target_path: target,
-        changed: true,
-        managed_handler_count: 0,
-        trust_state: "not_programmatically_verifiable",
-    })
-}
-
-pub fn install_prime_extension(
-    explicit_install_root: Option<&Path>,
-    explicit_prime_home: Option<&Path>,
+    explicit_pi_home: Option<&Path>,
 ) -> Result<HookInstallReport, AppError> {
     let install_root = resolve_install_root(explicit_install_root)?;
     let _install = ensure_install_ready(&install_root)?;
@@ -676,43 +572,40 @@ pub fn install_prime_extension(
         )));
     }
 
-    let prime_home = resolve_prime_home(explicit_prime_home)?;
-    let extension_root = prime_home.join("extensions");
+    let pi_home = resolve_pi_home(explicit_pi_home)?;
+    let extension_root = pi_home.join("extensions");
     let extension_directory = extension_root.join("project-brain");
     let target = extension_directory.join("index.ts");
-    let integration_path = install_root.join("state/integrations/prime-agent.json");
-    let expected = render_prime_extension(&launcher)?;
+    let integration_path = install_root.join("state/integrations/pi.json");
+    let expected = render_pi_extension(&launcher)?;
     let expected_hash = digest_bytes(&expected);
     let launcher_hash = digest_bytes(&fs::read(&launcher)?);
-    if !prime_launcher_fixture_valid(&launcher) {
+    if !pi_launcher_fixture_valid(&launcher) {
         return Err(AppError::Setup(format!(
-            "Prime Agent stable launcher capability roundtrip 失败：{}",
+            "PI stable launcher capability roundtrip 失败：{}",
             launcher.display()
         )));
     }
-    let expected_manifest = PrimeIntegrationManifest {
+    let expected_manifest = PiIntegrationManifest {
         schema_version: INSTALL_SCHEMA_VERSION,
-        integration_version: PRIME_INTEGRATION_VERSION,
-        api_contract: "prime-agent-extension-v1".to_owned(),
+        integration_version: PI_INTEGRATION_VERSION,
+        api_contract: "pi-extension-v1".to_owned(),
         target_path: target.clone(),
         target_sha256: expected_hash.clone(),
         launcher_path: launcher.clone(),
         launcher_sha256: launcher_hash,
-        managed_events: REQUIRED_PRIME_EVENTS
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
+        managed_events: REQUIRED_PI_EVENTS.iter().map(ToString::to_string).collect(),
     };
 
     fs::create_dir_all(&extension_root)?;
     fs::create_dir_all(integration_path.parent().expect("integration has parent"))?;
-    let _lock = MutationLock::acquire(&install_root.join("state/integrations/prime-agent.lock"))?;
+    let _lock = MutationLock::acquire(&install_root.join("state/integrations/pi.lock"))?;
 
     if integration_path.is_file() {
         let manifest_bytes = fs::read(&integration_path)?;
-        let manifest: PrimeIntegrationManifest = serde_json::from_slice(&manifest_bytes)?;
-        validate_prime_integration_manifest(&manifest, &target)?;
-        if !prime_extension_directory_exact(&extension_directory, &target)
+        let manifest: PiIntegrationManifest = serde_json::from_slice(&manifest_bytes)?;
+        validate_pi_integration_manifest(&manifest, &target)?;
+        if !pi_extension_directory_exact(&extension_directory, &target)
             || digest_bytes(&fs::read(&target)?) != manifest.target_sha256
             || manifest.target_sha256 != expected_hash
         {
@@ -720,10 +613,10 @@ pub fn install_prime_extension(
         }
         if manifest == expected_manifest {
             return Ok(HookInstallReport {
-                schema_version: PRIME_INTEGRATION_VERSION,
+                schema_version: PI_INTEGRATION_VERSION,
                 target_path: target,
                 changed: false,
-                managed_handler_count: REQUIRED_PRIME_EVENTS.len(),
+                managed_handler_count: REQUIRED_PI_EVENTS.len(),
                 trust_state: "extension_contract_and_launcher_verified",
             });
         }
@@ -733,10 +626,10 @@ pub fn install_prime_extension(
             Some(&digest_bytes(&manifest_bytes)),
         )?;
         return Ok(HookInstallReport {
-            schema_version: PRIME_INTEGRATION_VERSION,
+            schema_version: PI_INTEGRATION_VERSION,
             target_path: target,
             changed: true,
-            managed_handler_count: REQUIRED_PRIME_EVENTS.len(),
+            managed_handler_count: REQUIRED_PI_EVENTS.len(),
             trust_state: "extension_contract_and_launcher_verified",
         });
     }
@@ -762,31 +655,31 @@ pub fn install_prime_extension(
     }
 
     Ok(HookInstallReport {
-        schema_version: PRIME_INTEGRATION_VERSION,
+        schema_version: PI_INTEGRATION_VERSION,
         target_path: target,
         changed: true,
-        managed_handler_count: REQUIRED_PRIME_EVENTS.len(),
+        managed_handler_count: REQUIRED_PI_EVENTS.len(),
         trust_state: "extension_contract_and_launcher_verified",
     })
 }
 
-pub fn uninstall_prime_extension(
+pub fn uninstall_pi_extension(
     explicit_install_root: Option<&Path>,
-    explicit_prime_home: Option<&Path>,
+    explicit_pi_home: Option<&Path>,
     force: bool,
 ) -> Result<HookInstallReport, AppError> {
     let install_root = resolve_install_root(explicit_install_root)?;
-    let prime_home = resolve_prime_home(explicit_prime_home)?;
-    let extension_directory = prime_home.join("extensions/project-brain");
+    let pi_home = resolve_pi_home(explicit_pi_home)?;
+    let extension_directory = pi_home.join("extensions/project-brain");
     let target = extension_directory.join("index.ts");
-    let integration_path = install_root.join("state/integrations/prime-agent.json");
-    let _lock = MutationLock::acquire(&install_root.join("state/integrations/prime-agent.lock"))?;
+    let integration_path = install_root.join("state/integrations/pi.json");
+    let _lock = MutationLock::acquire(&install_root.join("state/integrations/pi.lock"))?;
     let target_exists = fs::symlink_metadata(&target).is_ok();
     let manifest_exists = integration_path.is_file();
 
     if !target_exists && !manifest_exists {
         return Ok(HookInstallReport {
-            schema_version: PRIME_INTEGRATION_VERSION,
+            schema_version: PI_INTEGRATION_VERSION,
             target_path: target,
             changed: false,
             managed_handler_count: 0,
@@ -801,10 +694,10 @@ pub fn uninstall_prime_extension(
     }
 
     if manifest_exists {
-        let manifest: PrimeIntegrationManifest = read_json(&integration_path)?;
-        validate_prime_integration_manifest(&manifest, &target)?;
+        let manifest: PiIntegrationManifest = read_json(&integration_path)?;
+        validate_pi_integration_manifest(&manifest, &target)?;
         if !force
-            && (!prime_extension_directory_exact(&extension_directory, &target)
+            && (!pi_extension_directory_exact(&extension_directory, &target)
                 || target_hash_exact(&target).as_deref() != Some(manifest.target_sha256.as_str()))
         {
             return Err(AppError::IntegrationDrift(target));
@@ -820,7 +713,7 @@ pub fn uninstall_prime_extension(
     let _ = fs::remove_dir(&extension_directory);
 
     Ok(HookInstallReport {
-        schema_version: PRIME_INTEGRATION_VERSION,
+        schema_version: PI_INTEGRATION_VERSION,
         target_path: target,
         changed: true,
         managed_handler_count: 0,
@@ -828,10 +721,466 @@ pub fn uninstall_prime_extension(
     })
 }
 
+pub fn install_opencode_plugin(
+    explicit_install_root: Option<&Path>,
+    explicit_opencode_home: Option<&Path>,
+) -> Result<HookInstallReport, AppError> {
+    let install_root = resolve_install_root(explicit_install_root)?;
+    let _install = ensure_install_ready(&install_root)?;
+    let launcher = stable_launcher_path(&install_root, &env::current_exe()?)?;
+    let opencode_home = resolve_opencode_home(explicit_opencode_home)?;
+    let target = opencode_home.join("plugins/project-brain.js");
+    let integration = install_root.join("state/integrations/opencode.json");
+    let expected = render_opencode_plugin(&launcher)?;
+    install_managed_plugin_file(
+        &install_root,
+        &target,
+        &integration,
+        "opencode.lock",
+        OPENCODE_INTEGRATION_VERSION,
+        "opencode-plugin-v1",
+        &REQUIRED_OPENCODE_EVENTS,
+        &launcher,
+        &expected,
+        None,
+    )
+}
+
+pub fn uninstall_opencode_plugin(
+    explicit_install_root: Option<&Path>,
+    explicit_opencode_home: Option<&Path>,
+    force: bool,
+) -> Result<HookInstallReport, AppError> {
+    let install_root = resolve_install_root(explicit_install_root)?;
+    let opencode_home = resolve_opencode_home(explicit_opencode_home)?;
+    let target = opencode_home.join("plugins/project-brain.js");
+    let integration = install_root.join("state/integrations/opencode.json");
+    uninstall_managed_plugin_file(
+        &install_root,
+        &target,
+        &integration,
+        "opencode.lock",
+        OPENCODE_INTEGRATION_VERSION,
+        "opencode-plugin-v1",
+        &REQUIRED_OPENCODE_EVENTS,
+        None,
+        force,
+    )
+}
+
+pub fn install_dsh_plugin(
+    explicit_install_root: Option<&Path>,
+    explicit_dsh_home: Option<&Path>,
+    profile: &str,
+) -> Result<HookInstallReport, AppError> {
+    validate_dsh_profile(profile)?;
+    let install_root = resolve_install_root(explicit_install_root)?;
+    let _install = ensure_install_ready(&install_root)?;
+    let launcher = stable_launcher_path(&install_root, &env::current_exe()?)?;
+    if !launcher_capability_fixture_valid(&launcher, "dsh") {
+        return Err(AppError::Setup(format!(
+            "dsh stable launcher capability roundtrip 失败：{}",
+            launcher.display()
+        )));
+    }
+    let dsh_home = resolve_dsh_home(explicit_dsh_home)?;
+    let bundle_root = install_root.join("integrations/dsh-plugin");
+    let expected_plugin = render_dsh_plugin(&launcher)?;
+    let expected_package = dsh_package_json()?;
+    let expected_patch = dsh_patch_yaml();
+    install_dsh_bundle_source(
+        &bundle_root,
+        &expected_plugin,
+        &expected_package,
+        expected_patch.as_bytes(),
+    )?;
+
+    run_dsh_plugin_command(
+        &dsh_home,
+        profile,
+        &["add".to_owned(), format!("file:{}", bundle_root.display())],
+    )?;
+    let target = dsh_plugin_target(&dsh_home, profile);
+    if target_hash_exact(&target).as_deref() != Some(digest_bytes(&expected_plugin).as_str()) {
+        return Err(AppError::Setup(format!(
+            "dsh profile 未安装预期 Project Brain plugin：{}",
+            target.display()
+        )));
+    }
+    let integration = install_root
+        .join("state/integrations")
+        .join(format!("dsh-{profile}.json"));
+    let manifest = ManagedPluginManifest {
+        schema_version: INSTALL_SCHEMA_VERSION,
+        integration_version: DSH_INTEGRATION_VERSION,
+        api_contract: "dsh-plugin-v1".to_owned(),
+        target_path: target.clone(),
+        target_sha256: digest_bytes(&expected_plugin),
+        launcher_path: launcher.clone(),
+        launcher_sha256: digest_bytes(&fs::read(&launcher)?),
+        managed_events: REQUIRED_DSH_EVENTS
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        profile: Some(profile.to_owned()),
+    };
+    fs::create_dir_all(integration.parent().expect("integration has parent"))?;
+    let _lock = MutationLock::acquire(
+        &install_root
+            .join("state/integrations")
+            .join(format!("dsh-{profile}.lock")),
+    )?;
+    let changed = if integration.is_file() {
+        let before = fs::read(&integration)?;
+        let recorded: ManagedPluginManifest = serde_json::from_slice(&before)?;
+        validate_managed_plugin_manifest(
+            &recorded,
+            &target,
+            DSH_INTEGRATION_VERSION,
+            "dsh-plugin-v1",
+            &REQUIRED_DSH_EVENTS,
+            Some(profile),
+        )?;
+        if recorded == manifest {
+            false
+        } else {
+            atomic_replace(
+                &integration,
+                &pretty_json_bytes(&manifest)?,
+                Some(&digest_bytes(&before)),
+            )?;
+            true
+        }
+    } else {
+        atomic_replace(&integration, &pretty_json_bytes(&manifest)?, None)?;
+        true
+    };
+    Ok(HookInstallReport {
+        schema_version: DSH_INTEGRATION_VERSION,
+        target_path: target,
+        changed,
+        managed_handler_count: REQUIRED_DSH_EVENTS.len(),
+        trust_state: "project_brain_integration_and_launcher_verified",
+    })
+}
+
+pub fn uninstall_dsh_plugin(
+    explicit_install_root: Option<&Path>,
+    explicit_dsh_home: Option<&Path>,
+    profile: &str,
+    force: bool,
+) -> Result<HookInstallReport, AppError> {
+    validate_dsh_profile(profile)?;
+    let install_root = resolve_install_root(explicit_install_root)?;
+    let dsh_home = resolve_dsh_home(explicit_dsh_home)?;
+    let target = dsh_plugin_target(&dsh_home, profile);
+    let integration = install_root
+        .join("state/integrations")
+        .join(format!("dsh-{profile}.json"));
+    let target_exists = fs::symlink_metadata(&target).is_ok();
+    let manifest_exists = integration.is_file();
+    if !target_exists && !manifest_exists {
+        return Ok(HookInstallReport {
+            schema_version: DSH_INTEGRATION_VERSION,
+            target_path: target,
+            changed: false,
+            managed_handler_count: 0,
+            trust_state: "project_brain_integration_and_launcher_verified",
+        });
+    }
+    if target_exists && !manifest_exists {
+        return Err(AppError::IntegrationDrift(target));
+    }
+    if !force {
+        let manifest: ManagedPluginManifest = read_json(&integration)?;
+        validate_managed_plugin_manifest(
+            &manifest,
+            &target,
+            DSH_INTEGRATION_VERSION,
+            "dsh-plugin-v1",
+            &REQUIRED_DSH_EVENTS,
+            Some(profile),
+        )?;
+        if target_hash_exact(&target).as_deref() != Some(manifest.target_sha256.as_str()) {
+            return Err(AppError::IntegrationDrift(target));
+        }
+    }
+    run_dsh_plugin_command(
+        &dsh_home,
+        profile,
+        &["remove".to_owned(), DSH_PLUGIN_PACKAGE.to_owned()],
+    )?;
+    if fs::symlink_metadata(&target).is_ok() {
+        return Err(AppError::Setup(format!(
+            "dsh plugin remove 后目标仍存在：{}",
+            target.display()
+        )));
+    }
+    if manifest_exists {
+        fs::remove_file(&integration)?;
+    }
+    Ok(HookInstallReport {
+        schema_version: DSH_INTEGRATION_VERSION,
+        target_path: target,
+        changed: true,
+        managed_handler_count: 0,
+        trust_state: "project_brain_integration_and_launcher_verified",
+    })
+}
+
+fn validate_dsh_profile(profile: &str) -> Result<(), AppError> {
+    if profile.is_empty()
+        || profile == "."
+        || profile == ".."
+        || profile.contains(['/', '\\'])
+        || !profile
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(AppError::Setup(format!("非法 dsh profile 名称：{profile}")));
+    }
+    Ok(())
+}
+
+fn dsh_plugin_target(dsh_home: &Path, profile: &str) -> PathBuf {
+    dsh_home
+        .join("profiles")
+        .join(profile)
+        .join("node_modules/@project-brain/dsh-plugin/lib/index.js")
+}
+
+fn install_dsh_bundle_source(
+    root: &Path,
+    plugin: &[u8],
+    package: &[u8],
+    patch: &[u8],
+) -> Result<(), AppError> {
+    let files = [
+        (root.join("lib/index.js"), plugin),
+        (root.join("package.json"), package),
+        (root.join("cordis.patch.yml"), patch),
+    ];
+    for (path, expected) in files {
+        fs::create_dir_all(path.parent().expect("dsh bundle file has parent"))?;
+        if path.is_file() {
+            let before = fs::read(&path)?;
+            if before == expected {
+                continue;
+            }
+            atomic_replace(&path, expected, Some(&digest_bytes(&before)))?;
+        } else {
+            atomic_replace(&path, expected, None)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_dsh_plugin_command(
+    dsh_home: &Path,
+    profile: &str,
+    arguments: &[String],
+) -> Result<(), AppError> {
+    let executable = env::var_os("PROJECT_BRAIN_DSH_EXECUTABLE")
+        .map_or_else(|| PathBuf::from("dsh"), PathBuf::from);
+    let output = Command::new(&executable)
+        .env("DSH_HOME", dsh_home)
+        .arg("plugin")
+        .arg("--profile")
+        .arg(profile)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(AppError::Setup(format!(
+        "dsh plugin 命令失败（{}）：{}",
+        output.status,
+        stderr.trim()
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_managed_plugin_file(
+    install_root: &Path,
+    target: &Path,
+    integration: &Path,
+    lock_name: &str,
+    integration_version: u32,
+    api_contract: &str,
+    managed_events: &[&str],
+    launcher: &Path,
+    expected: &[u8],
+    profile: Option<&str>,
+) -> Result<HookInstallReport, AppError> {
+    if !launcher.is_file() {
+        return Err(AppError::Setup(format!(
+            "稳定 launcher 不存在：{}；请重新执行 project-brain install",
+            launcher.display()
+        )));
+    }
+    let expected_hash = digest_bytes(expected);
+    let manifest = ManagedPluginManifest {
+        schema_version: INSTALL_SCHEMA_VERSION,
+        integration_version,
+        api_contract: api_contract.to_owned(),
+        target_path: target.to_owned(),
+        target_sha256: expected_hash.clone(),
+        launcher_path: launcher.to_owned(),
+        launcher_sha256: digest_bytes(&fs::read(launcher)?),
+        managed_events: managed_events.iter().map(ToString::to_string).collect(),
+        profile: profile.map(ToOwned::to_owned),
+    };
+    fs::create_dir_all(target.parent().expect("managed plugin target has parent"))?;
+    fs::create_dir_all(integration.parent().expect("integration has parent"))?;
+    let _lock = MutationLock::acquire(&install_root.join("state/integrations").join(lock_name))?;
+
+    if integration.is_file() {
+        let before = fs::read(integration)?;
+        let recorded: ManagedPluginManifest = serde_json::from_slice(&before)?;
+        validate_managed_plugin_manifest(
+            &recorded,
+            target,
+            integration_version,
+            api_contract,
+            managed_events,
+            profile,
+        )?;
+        if target_hash_exact(target).as_deref() != Some(recorded.target_sha256.as_str()) {
+            return Err(AppError::IntegrationDrift(target.to_owned()));
+        }
+        if recorded == manifest && recorded.target_sha256 == expected_hash {
+            return Ok(HookInstallReport {
+                schema_version: integration_version,
+                target_path: target.to_owned(),
+                changed: false,
+                managed_handler_count: managed_events.len(),
+                trust_state: "project_brain_integration_and_launcher_verified",
+            });
+        }
+        atomic_replace(target, expected, Some(&recorded.target_sha256))?;
+        atomic_replace(
+            integration,
+            &pretty_json_bytes(&manifest)?,
+            Some(&digest_bytes(&before)),
+        )?;
+    } else {
+        if fs::symlink_metadata(target).is_ok() {
+            return Err(AppError::IntegrationDrift(target.to_owned()));
+        }
+        atomic_replace(target, expected, None)?;
+        if let Err(error) = atomic_replace(integration, &pretty_json_bytes(&manifest)?, None) {
+            if target_hash_exact(target).as_deref() == Some(expected_hash.as_str()) {
+                let _ = fs::remove_file(target);
+            }
+            return Err(error);
+        }
+    }
+
+    Ok(HookInstallReport {
+        schema_version: integration_version,
+        target_path: target.to_owned(),
+        changed: true,
+        managed_handler_count: managed_events.len(),
+        trust_state: "project_brain_integration_and_launcher_verified",
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn uninstall_managed_plugin_file(
+    install_root: &Path,
+    target: &Path,
+    integration: &Path,
+    lock_name: &str,
+    integration_version: u32,
+    api_contract: &str,
+    managed_events: &[&str],
+    profile: Option<&str>,
+    force: bool,
+) -> Result<HookInstallReport, AppError> {
+    let _lock = MutationLock::acquire(&install_root.join("state/integrations").join(lock_name))?;
+    let target_exists = fs::symlink_metadata(target).is_ok();
+    let manifest_exists = integration.is_file();
+    if !target_exists && !manifest_exists {
+        return Ok(HookInstallReport {
+            schema_version: integration_version,
+            target_path: target.to_owned(),
+            changed: false,
+            managed_handler_count: 0,
+            trust_state: "project_brain_integration_and_launcher_verified",
+        });
+    }
+    if target_exists && !manifest_exists {
+        return Err(AppError::IntegrationDrift(target.to_owned()));
+    }
+    if !force && !target_exists {
+        return Err(AppError::IntegrationDrift(target.to_owned()));
+    }
+    if manifest_exists {
+        let manifest: ManagedPluginManifest = read_json(integration)?;
+        validate_managed_plugin_manifest(
+            &manifest,
+            target,
+            integration_version,
+            api_contract,
+            managed_events,
+            profile,
+        )?;
+        if !force && target_hash_exact(target).as_deref() != Some(manifest.target_sha256.as_str()) {
+            return Err(AppError::IntegrationDrift(target.to_owned()));
+        }
+    }
+    if target_exists {
+        fs::remove_file(target)?;
+    }
+    if manifest_exists {
+        fs::remove_file(integration)?;
+    }
+    Ok(HookInstallReport {
+        schema_version: integration_version,
+        target_path: target.to_owned(),
+        changed: true,
+        managed_handler_count: 0,
+        trust_state: "project_brain_integration_and_launcher_verified",
+    })
+}
+
+fn validate_managed_plugin_manifest(
+    manifest: &ManagedPluginManifest,
+    target: &Path,
+    integration_version: u32,
+    api_contract: &str,
+    managed_events: &[&str],
+    profile: Option<&str>,
+) -> Result<(), AppError> {
+    let expected_events = managed_events
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if manifest.schema_version != INSTALL_SCHEMA_VERSION
+        || manifest.integration_version != integration_version
+        || manifest.api_contract != api_contract
+        || manifest.target_path != target
+        || manifest.managed_events != expected_events
+        || manifest.profile.as_deref() != profile
+    {
+        return Err(AppError::IntegrationDrift(target.to_owned()));
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "Doctor 必须在一份报告中汇总安装、项目、Provider、适配器和 Qualification"
+)]
 pub fn doctor(
     explicit_install_root: Option<&Path>,
     adapter: DoctorAdapter,
     explicit_agent_home: Option<&Path>,
+    dsh_profile: Option<&str>,
     project_root: &Path,
     project_key: &str,
     provider_profiles: &[SemanticProviderProfile],
@@ -899,15 +1248,24 @@ pub fn doctor(
             &install_root,
             resolve_codex_home(explicit_agent_home).ok().as_deref(),
         ),
-        DoctorAdapter::ClaudeCode => claude_integration_valid(
+        DoctorAdapter::Pi => pi_integration_valid(
             &install_root,
-            resolve_claude_home(explicit_agent_home).ok().as_deref(),
-        ),
-        DoctorAdapter::PrimeAgent => prime_integration_valid(
-            &install_root,
-            resolve_prime_home(explicit_agent_home).ok().as_deref(),
+            resolve_pi_home(explicit_agent_home).ok().as_deref(),
             &canonical_root,
         ),
+        DoctorAdapter::Opencode => opencode_integration_valid(
+            &install_root,
+            resolve_opencode_home(explicit_agent_home).ok().as_deref(),
+            &canonical_root,
+        ),
+        DoctorAdapter::Dsh => dsh_profile.is_some_and(|profile| {
+            dsh_integration_valid(
+                &install_root,
+                resolve_dsh_home(explicit_agent_home).ok().as_deref(),
+                profile,
+                &canonical_root,
+            )
+        }),
     };
     if !adapter_hooks_valid {
         issues.push(format!(
@@ -981,31 +1339,17 @@ fn validate_integration_manifest(
     Ok(())
 }
 
-fn validate_claude_integration_manifest(
-    manifest: &ClaudeIntegrationManifest,
+fn validate_pi_integration_manifest(
+    manifest: &PiIntegrationManifest,
     target: &Path,
 ) -> Result<(), AppError> {
-    if manifest.schema_version != INSTALL_SCHEMA_VERSION
-        || manifest.integration_version != CLAUDE_INTEGRATION_VERSION
-        || manifest.target_path != target
-        || manifest.managed_handler_hashes.len() != REQUIRED_CLAUDE_EVENTS.len()
-    {
-        return Err(AppError::IntegrationDrift(target.to_owned()));
-    }
-    Ok(())
-}
-
-fn validate_prime_integration_manifest(
-    manifest: &PrimeIntegrationManifest,
-    target: &Path,
-) -> Result<(), AppError> {
-    let expected_events = REQUIRED_PRIME_EVENTS
+    let expected_events = REQUIRED_PI_EVENTS
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     if manifest.schema_version != INSTALL_SCHEMA_VERSION
-        || manifest.integration_version != PRIME_INTEGRATION_VERSION
-        || manifest.api_contract != "prime-agent-extension-v1"
+        || manifest.integration_version != PI_INTEGRATION_VERSION
+        || manifest.api_contract != "pi-extension-v1"
         || manifest.target_path != target
         || manifest.target_sha256.len() != 64
         || manifest.launcher_sha256.len() != 64
@@ -1128,28 +1472,42 @@ fn resolve_codex_home(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
         .ok_or_else(|| AppError::Setup("无法确定 Codex home；请传入 --codex-home".to_owned()))
 }
 
-fn resolve_claude_home(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
+fn resolve_pi_home(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
     if let Some(path) = explicit {
         return absolute_path(path);
     }
-    if let Some(path) = env::var_os("CLAUDE_CONFIG_DIR") {
+    if let Some(path) = env::var_os("PI_CODING_AGENT_DIR") {
         return absolute_path(Path::new(&path));
     }
     user_home()
-        .map(|home| home.join(".claude"))
-        .ok_or_else(|| AppError::Setup("无法确定 Claude home；请传入 --claude-home".to_owned()))
+        .map(|home| home.join(".pi/agent"))
+        .ok_or_else(|| AppError::Setup("无法确定 PI home；请传入 --pi-home".to_owned()))
 }
 
-fn resolve_prime_home(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
+fn resolve_opencode_home(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
     if let Some(path) = explicit {
-        return absolute_path(path);
+        return Ok(path.to_owned());
     }
-    if let Some(path) = env::var_os("PRIME_AGENT_CODING_AGENT_DIR") {
-        return absolute_path(Path::new(&path));
+    if let Some(path) = env::var_os("OPENCODE_CONFIG_DIR") {
+        return Ok(PathBuf::from(path));
     }
     user_home()
-        .map(|home| home.join(".prime/agent"))
-        .ok_or_else(|| AppError::Setup("无法确定 Prime Agent home；请传入 --prime-home".to_owned()))
+        .map(|home| home.join(".config/opencode"))
+        .ok_or_else(|| {
+            AppError::Setup("无法确定 opencode 配置根；请传入 --opencode-home".to_owned())
+        })
+}
+
+fn resolve_dsh_home(explicit: Option<&Path>) -> Result<PathBuf, AppError> {
+    if let Some(path) = explicit {
+        return Ok(path.to_owned());
+    }
+    if let Some(path) = env::var_os("DSH_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    user_home()
+        .map(|home| home.join(".dsh"))
+        .ok_or_else(|| AppError::Setup("无法确定 dsh home；请传入 --dsh-home".to_owned()))
 }
 
 fn user_home() -> Option<PathBuf> {
@@ -1292,32 +1650,13 @@ fn managed_handlers(launcher: &Path) -> BTreeMap<String, Value> {
         .collect()
 }
 
-fn managed_claude_handlers(launcher: &Path) -> BTreeMap<String, Value> {
-    REQUIRED_CLAUDE_EVENTS
-        .into_iter()
-        .map(|event| {
-            let event_arg = event_arg(event);
-            (
-                event.to_owned(),
-                json!({
-                    "type": "command",
-                    "command": launcher,
-                    "args": ["dispatch", "claude-code", event_arg],
-                    "timeout": 10,
-                    "statusMessage": "Project Brain deterministic governance"
-                }),
-            )
-        })
-        .collect()
-}
-
-fn render_prime_extension(launcher: &Path) -> Result<Vec<u8>, AppError> {
+fn render_pi_extension(launcher: &Path) -> Result<Vec<u8>, AppError> {
     let launcher_json = serde_json::to_string(&launcher.to_string_lossy().into_owned())?;
-    let source = PRIME_EXTENSION_TEMPLATE.replace("__PROJECT_BRAIN_LAUNCHER__", &launcher_json);
+    let source = PI_EXTENSION_TEMPLATE.replace("__PROJECT_BRAIN_LAUNCHER__", &launcher_json);
     Ok(source.into_bytes())
 }
 
-const PRIME_EXTENSION_TEMPLATE: &str = r#"// Managed by Project Brain. Manual edits are treated as integration drift.
+const PI_EXTENSION_TEMPLATE: &str = r#"// Managed by Project Brain. Manual edits are treated as integration drift.
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 
@@ -1326,9 +1665,11 @@ const MAX_BYTES = 1024 * 1024;
 const TIMEOUT_MS = 10000;
 const instanceId = randomUUID();
 let pendingContext = [];
+let turnSequence = 0;
+let continuationActive = false;
 
 function sessionId(ctx) {
-  return ctx.sessionManager.getSessionFile() ?? `prime-ephemeral-${instanceId}`;
+  return ctx.sessionManager.getSessionFile() ?? `pi-ephemeral-${instanceId}`;
 }
 
 function textItems(value, key) {
@@ -1344,7 +1685,7 @@ function invokeBrain(eventName, payload, cwd) {
       return;
     }
 
-    const child = spawn(LAUNCHER, ["dispatch", "prime-agent", eventName], {
+    const child = spawn(LAUNCHER, ["dispatch", "pi", eventName], {
       cwd,
       shell: false,
       windowsHide: true,
@@ -1425,14 +1766,24 @@ export default function projectBrainExtension(pi) {
   });
 
   pi.on("input", async (event, ctx) => {
+    turnSequence += 1;
     try {
       const output = await invokeBrain("user-prompt-submit", {
         session_id: sessionId(ctx),
         cwd: ctx.cwd,
+        turn_id: `pi-turn-${turnSequence}`,
         source: event.source,
         prompt: event.text,
       }, ctx.cwd);
       pendingContext.push(...textItems(output, "context"));
+      if (output?.block === true) {
+        pi.sendMessage({
+          customType: "project-brain-intent-block",
+          content: output.reason ?? "Blocked by Project Brain",
+          display: true,
+        }, { deliverAs: "nextTurn", triggerTurn: false });
+        return { action: "handled" };
+      }
     } catch (error) {
       pendingContext.push(`Project Brain intent check degraded: ${String(error)}`);
     }
@@ -1493,6 +1844,500 @@ export default function projectBrainExtension(pi) {
       ],
     };
   });
+
+  // Pi 没有正式的 Stop veto。这里使用官方 follow-up API 在 agent_end 后模拟最多一次续轮；
+  // capability 必须报告 emulated，而不是 supported。
+  pi.on("agent_end", async (_event, ctx) => {
+    let output;
+    try {
+      output = await invokeBrain("stop", {
+        session_id: sessionId(ctx),
+        cwd: ctx.cwd,
+        turn_id: `pi-turn-${turnSequence}`,
+        stop_hook_active: continuationActive,
+      }, ctx.cwd);
+    } catch (error) {
+      if (continuationActive) {
+        continuationActive = false;
+        pendingContext.push(`Project Brain stop check remained unavailable after one retry: ${String(error)}`);
+        return;
+      }
+      continuationActive = true;
+      pi.sendMessage({
+        customType: "project-brain-stop-retry",
+        content: `Project Brain stop check failed; retrying once before allowing stop: ${String(error)}`,
+        display: true,
+      }, {
+        deliverAs: "followUp",
+        triggerTurn: true,
+      });
+      return;
+    }
+    const continuation = output?.continuation;
+    if (continuation?.requested !== true) {
+      continuationActive = false;
+      return;
+    }
+    continuationActive = true;
+    pi.sendMessage({
+      customType: "project-brain-continuation",
+      content: continuation.reason ?? "Project Brain requires more work before stopping.",
+      display: true,
+    }, {
+      deliverAs: "followUp",
+      triggerTurn: true,
+    });
+  });
+
+}
+"#;
+
+fn render_opencode_plugin(launcher: &Path) -> Result<Vec<u8>, AppError> {
+    let launcher_json = serde_json::to_string(&launcher.to_string_lossy().into_owned())?;
+    Ok(OPENCODE_PLUGIN_TEMPLATE
+        .replace("__PROJECT_BRAIN_LAUNCHER__", &launcher_json)
+        .into_bytes())
+}
+
+const OPENCODE_PLUGIN_TEMPLATE: &str = r#"// Managed by Project Brain. Manual edits are treated as integration drift.
+import { spawn } from "node:child_process";
+
+const LAUNCHER = __PROJECT_BRAIN_LAUNCHER__;
+const MAX_BYTES = 1024 * 1024;
+const TIMEOUT_MS = 10000;
+
+function invokeBrain(eventName, payload, cwd) {
+  return new Promise((resolve, reject) => {
+    const request = Buffer.from(JSON.stringify(payload), "utf8");
+    if (request.length > MAX_BYTES) return reject(new Error("Project Brain request exceeds 1 MiB"));
+    const child = spawn(LAUNCHER, ["dispatch", "opencode", eventName], {
+      cwd,
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const stdout = [];
+    const stderr = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill();
+      fail(new Error("Project Brain launcher timed out"));
+    }, TIMEOUT_MS);
+    function fail(error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    }
+    child.on("error", fail);
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > MAX_BYTES) {
+        child.kill();
+        return fail(new Error("Project Brain stdout exceeds 1 MiB"));
+      }
+      stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes <= MAX_BYTES) stderr.push(chunk);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`Project Brain exited ${code}: ${Buffer.concat(stderr).toString("utf8").trim()}`));
+        return;
+      }
+      const text = Buffer.concat(stdout).toString("utf8").trim();
+      if (!text) return resolve(null);
+      try { resolve(JSON.parse(text)); }
+      catch { reject(new Error("Project Brain returned invalid JSON")); }
+    });
+    child.stdin.on("error", fail);
+    child.stdin.end(request);
+  });
+}
+
+function texts(value, key) {
+  return Array.isArray(value?.[key])
+    ? value[key].filter((item) => typeof item === "string" && item.length > 0)
+    : [];
+}
+
+function promptText(parts) {
+  return parts
+    .filter((part) => part?.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n");
+}
+
+export const ProjectBrain = async ({ client, directory, worktree }) => {
+  const cwd = worktree || directory;
+  const sessions = new Map();
+  function state(sessionID) {
+    let current = sessions.get(sessionID);
+    if (!current) {
+      current = { sequence: 0, start: null };
+      sessions.set(sessionID, current);
+    }
+    return current;
+  }
+  async function ensureStarted(sessionID) {
+    const current = state(sessionID);
+    if (!current.start) {
+      current.start = invokeBrain("session-start", {
+        session_id: sessionID,
+        cwd,
+        source: "startup",
+      }, cwd).catch((error) => ({ context: [`Project Brain session check degraded: ${String(error)}`] }));
+    }
+    return current.start;
+  }
+  async function report(level, message) {
+    try {
+      await client.app.log({ body: { service: "project-brain", level, message } });
+    } catch {}
+  }
+  return {
+    "chat.message": async (input, output) => {
+      const current = state(input.sessionID);
+      current.sequence += 1;
+      const session = await ensureStarted(input.sessionID);
+      const intent = await invokeBrain("user-prompt-submit", {
+        session_id: input.sessionID,
+        cwd,
+        turn_id: input.messageID || `opencode-turn-${current.sequence}`,
+        prompt: promptText(output.parts),
+      }, cwd).catch((error) => ({ context: [`Project Brain intent check degraded: ${String(error)}`] }));
+      const context = [...texts(session, "context"), ...texts(intent, "context")];
+      if (context.length > 0) {
+        const content = `Project Brain context:\n${context.join("\n\n")}`;
+        const textPart = output.parts.find((part) => part?.type === "text" && typeof part.text === "string");
+        if (textPart) {
+          textPart.text = `${content}\n\n${textPart.text}`;
+        } else if (output.parts.length > 0) {
+          output.parts.push({ ...output.parts[0], type: "text", text: content, synthetic: true });
+        }
+      }
+    },
+    "tool.execute.before": async (input, output) => {
+      await ensureStarted(input.sessionID);
+      let decision;
+      try {
+        decision = await invokeBrain("pre-tool-use", {
+          session_id: input.sessionID,
+          cwd,
+          tool_name: input.tool,
+          tool_use_id: input.callID,
+          tool_input: output.args,
+        }, cwd);
+      } catch (error) {
+        throw new Error(`Project Brain governance failed closed: ${String(error)}`);
+      }
+      if (decision?.block === true) {
+        throw new Error(decision.reason || "Blocked by Project Brain");
+      }
+    },
+    "tool.execute.after": async (input, output) => {
+      try {
+        const result = await invokeBrain("post-tool-use", {
+          session_id: input.sessionID,
+          cwd,
+          tool_name: input.tool,
+          tool_use_id: input.callID,
+          tool_input: input.args,
+          tool_response: { success: true },
+        }, cwd);
+        const feedback = texts(result, "feedback");
+        if (feedback.length > 0) output.output += `\n\nProject Brain feedback:\n${feedback.join("\n")}`;
+      } catch (error) {
+        output.output += `\n\nProject Brain post-tool audit degraded: ${String(error)}`;
+      }
+    },
+    event: async ({ event }) => {
+      const info = event?.properties?.info;
+      const sessionID = info?.id || event?.properties?.sessionID;
+      if (typeof sessionID !== "string" || sessionID.length === 0) return;
+      if (event.type === "session.created") {
+        await ensureStarted(sessionID);
+        return;
+      }
+      if (event.type !== "session.idle") return;
+      try {
+        const current = state(sessionID);
+        await invokeBrain("stop", {
+          session_id: sessionID,
+          cwd,
+          turn_id: `opencode-turn-${current.sequence}`,
+          stop_hook_active: false,
+        }, cwd);
+      } catch (error) {
+        await report("warn", `Project Brain stop audit degraded: ${String(error)}`);
+      }
+    },
+  };
+};
+"#;
+
+fn dsh_package_json() -> Result<Vec<u8>, AppError> {
+    pretty_json_bytes(&json!({
+        "name": DSH_PLUGIN_PACKAGE,
+        "version": env!("CARGO_PKG_VERSION"),
+        "private": true,
+        "type": "module",
+        "main": "lib/index.js",
+        "files": ["lib/index.js", "cordis.patch.yml"],
+        "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+    }))
+}
+
+fn dsh_patch_yaml() -> String {
+    format!("- insert:\n    - id: project-brain\n      name: '{DSH_PLUGIN_PACKAGE}'\n")
+}
+
+fn render_dsh_plugin(launcher: &Path) -> Result<Vec<u8>, AppError> {
+    let launcher_json = serde_json::to_string(&launcher.to_string_lossy().into_owned())?;
+    Ok(DSH_PLUGIN_TEMPLATE
+        .replace("__PROJECT_BRAIN_LAUNCHER__", &launcher_json)
+        .into_bytes())
+}
+
+const DSH_PLUGIN_TEMPLATE: &str = r#"// Managed by Project Brain. Manual edits are treated as integration drift.
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+
+export const name = "project-brain";
+export const inject = ["agents", "tools"];
+
+const LAUNCHER = __PROJECT_BRAIN_LAUNCHER__;
+const MAX_BYTES = 1024 * 1024;
+const TIMEOUT_MS = 10000;
+
+function invokeBrain(eventName, payload, cwd) {
+  return new Promise((resolve, reject) => {
+    const request = Buffer.from(JSON.stringify(payload), "utf8");
+    if (request.length > MAX_BYTES) return reject(new Error("Project Brain request exceeds 1 MiB"));
+    const child = spawn(LAUNCHER, ["dispatch", "dsh", eventName], {
+      cwd,
+      shell: false,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const stdout = [];
+    const stderr = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill();
+      fail(new Error("Project Brain launcher timed out"));
+    }, TIMEOUT_MS);
+    function fail(error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    }
+    child.on("error", fail);
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > MAX_BYTES) {
+        child.kill();
+        return fail(new Error("Project Brain stdout exceeds 1 MiB"));
+      }
+      stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes <= MAX_BYTES) stderr.push(chunk);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`Project Brain exited ${code}: ${Buffer.concat(stderr).toString("utf8").trim()}`));
+        return;
+      }
+      const text = Buffer.concat(stdout).toString("utf8").trim();
+      if (!text) return resolve(null);
+      try { resolve(JSON.parse(text)); }
+      catch { reject(new Error("Project Brain returned invalid JSON")); }
+    });
+    child.stdin.on("error", fail);
+    child.stdin.end(request);
+  });
+}
+
+function deepFreeze(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
+}
+
+function contextMessage(text, summary = "Project Brain context") {
+  return deepFreeze({
+    id: `project-brain-${randomUUID()}`,
+    role: "user",
+    content: [{ type: "text", text }],
+    source: { kind: "plugin", plugin: name, form: "notice", summary },
+  });
+}
+
+function texts(value, key) {
+  return Array.isArray(value?.[key])
+    ? value[key].filter((item) => typeof item === "string" && item.length > 0)
+    : [];
+}
+
+function messageText(messages) {
+  return messages
+    .filter((message) => message?.source?.kind === "user")
+    .flatMap((message) => message.content || [])
+    .filter((block) => block?.type === "text" && typeof block.text === "string")
+    .map((block) => block.text)
+    .join("\n");
+}
+
+function cwdFor(agent) {
+  return agent?.session?.header?.cwd || process.cwd();
+}
+
+export function apply(ctx) {
+  const states = new WeakMap();
+  function state(agent) {
+    let current = states.get(agent);
+    if (!current) {
+      current = { source: "startup", started: false, continuation: false };
+      states.set(agent, current);
+    }
+    return current;
+  }
+
+  ctx.on("agent/session-start", ({ agent, source }) => {
+    state(agent).source = source;
+  });
+
+  ctx.on("agent/pre-step", async ({ agent, messages, turn, step }, next) => {
+    const current = state(agent);
+    const cwd = cwdFor(agent);
+    const context = [];
+    if (!current.started) {
+      current.started = true;
+      const session = await invokeBrain("session-start", {
+        session_id: String(agent.id),
+        cwd,
+        source: current.source,
+      }, cwd).catch((error) => ({ context: [`Project Brain session check degraded: ${String(error)}`] }));
+      context.push(...texts(session, "context"));
+    }
+    const prompt = messageText(messages);
+    if (prompt.length > 0) {
+      const intent = await invokeBrain("user-prompt-submit", {
+        session_id: String(agent.id),
+        cwd,
+        turn_id: `dsh-turn-${turn}`,
+        prompt,
+      }, cwd).catch((error) => ({ context: [`Project Brain intent check degraded: ${String(error)}`] }));
+      context.push(...texts(intent, "context"));
+    }
+    const decision = await next();
+    if (decision.kind === "reject" || context.length === 0) return decision;
+    return {
+      kind: "enter",
+      messages: [...decision.messages, contextMessage(context.join("\n\n"))],
+    };
+  });
+
+  ctx.on("tools/pre-execute", async (exec, next) => {
+    const agent = exec.agent;
+    if (!agent) return next();
+    const cwd = cwdFor(agent);
+    let decision;
+    try {
+      decision = await invokeBrain("pre-tool-use", {
+        session_id: String(agent.id),
+        cwd,
+        tool_name: exec.name,
+        tool_use_id: String(exec.callId),
+        tool_input: exec.arguments,
+      }, cwd);
+    } catch (error) {
+      return { kind: "deny", reason: `Project Brain governance failed closed: ${String(error)}` };
+    }
+    if (decision?.block === true) {
+      return { kind: "deny", reason: decision.reason || "Blocked by Project Brain" };
+    }
+    return next();
+  });
+
+  ctx.on("tools/post-execute", async (exec, result, next) => {
+    const downstream = await next();
+    const agent = exec.agent;
+    if (!agent) return downstream;
+    const cwd = cwdFor(agent);
+    let feedback;
+    try {
+      const output = await invokeBrain("post-tool-use", {
+        session_id: String(agent.id),
+        cwd,
+        tool_name: exec.name,
+        tool_use_id: String(exec.callId),
+        tool_input: exec.arguments,
+        tool_response: { success: !result.isError },
+      }, cwd);
+      feedback = texts(output, "feedback");
+    } catch (error) {
+      feedback = [`Project Brain post-tool audit degraded: ${String(error)}`];
+    }
+    if (feedback.length === 0) return downstream;
+    return {
+      ...downstream,
+      additionalContexts: [
+        ...(downstream.additionalContexts || []),
+        contextMessage(feedback.join("\n"), "Project Brain tool feedback"),
+      ],
+    };
+  });
+
+  ctx.on("agent/turn-stopping", async ({ agent, turn }) => {
+    const current = state(agent);
+    const cwd = cwdFor(agent);
+    let output;
+    try {
+      output = await invokeBrain("stop", {
+        session_id: String(agent.id),
+        cwd,
+        turn_id: `dsh-turn-${turn}`,
+        stop_hook_active: current.continuation,
+      }, cwd);
+    } catch (error) {
+      if (current.continuation) {
+        current.continuation = false;
+        return;
+      }
+      current.continuation = true;
+      agent.steer(contextMessage(
+        `Project Brain stop check failed; retrying once before allowing stop: ${String(error)}`,
+        "Project Brain stop check retry",
+      ));
+      return;
+    }
+    const continuation = output?.continuation;
+    if (continuation?.requested !== true) {
+      current.continuation = false;
+      return;
+    }
+    current.continuation = true;
+    agent.steer(contextMessage(
+      continuation.reason || "Project Brain requires more work before stopping.",
+      "Project Brain requires continuation",
+    ));
+  });
 }
 "#;
 
@@ -1526,46 +2371,7 @@ fn append_managed_groups(
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut()
             .ok_or_else(|| AppError::Setup(format!("Codex hooks.{event} 必须是 array")))?;
-        let matcher = match event.as_str() {
-            "SessionStart" => Some("startup|resume|compact"),
-            "PreToolUse" | "PostToolUse" => Some("Bash|apply_patch|Edit|Write"),
-            _ => None,
-        };
         let mut group = Map::new();
-        if let Some(matcher) = matcher {
-            group.insert("matcher".to_owned(), json!(matcher));
-        }
-        group.insert("hooks".to_owned(), Value::Array(vec![handler.clone()]));
-        groups.push(Value::Object(group));
-    }
-    Ok(())
-}
-
-fn append_claude_managed_groups(
-    document: &mut Value,
-    handlers: &BTreeMap<String, Value>,
-) -> Result<(), AppError> {
-    let object = document
-        .as_object_mut()
-        .ok_or_else(|| AppError::Setup("Claude settings.json 顶层必须是 JSON object".to_owned()))?;
-    let hooks = object
-        .entry("hooks")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .ok_or_else(|| AppError::Setup("Claude settings.json 的 hooks 必须是 object".to_owned()))?;
-
-    for (event, handler) in handlers {
-        let groups = hooks
-            .entry(event)
-            .or_insert_with(|| Value::Array(Vec::new()))
-            .as_array_mut()
-            .ok_or_else(|| {
-                AppError::Setup(format!("Claude settings.json hooks.{event} 必须是 array"))
-            })?;
-        let mut group = Map::new();
-        if matches!(event.as_str(), "PreToolUse" | "PostToolUse") {
-            group.insert("matcher".to_owned(), json!("Bash|Edit|Write|NotebookEdit"));
-        }
         group.insert("hooks".to_owned(), Value::Array(vec![handler.clone()]));
         groups.push(Value::Object(group));
     }
@@ -1587,32 +2393,6 @@ fn observed_managed_hashes(document: &Value) -> BTreeMap<String, String> {
             };
             for handler in handlers {
                 if is_managed_signature(handler) {
-                    let hash = hash_value(handler).unwrap_or_default();
-                    if observed.insert(event.clone(), hash).is_some() {
-                        observed.insert(format!("{event}#duplicate"), String::new());
-                    }
-                }
-            }
-        }
-    }
-    observed
-}
-
-fn observed_claude_managed_hashes(document: &Value) -> BTreeMap<String, String> {
-    let mut observed = BTreeMap::new();
-    let Some(hooks) = document.get("hooks").and_then(Value::as_object) else {
-        return observed;
-    };
-    for (event, groups) in hooks {
-        let Some(groups) = groups.as_array() else {
-            continue;
-        };
-        for group in groups {
-            let Some(handlers) = group.get("hooks").and_then(Value::as_array) else {
-                continue;
-            };
-            for handler in handlers {
-                if is_claude_managed_signature(handler) {
                     let hash = hash_value(handler).unwrap_or_default();
                     if observed.insert(event.clone(), hash).is_some() {
                         observed.insert(format!("{event}#duplicate"), String::new());
@@ -1665,38 +2445,6 @@ fn remove_managed_handlers(
     removed
 }
 
-fn remove_claude_managed_handlers(
-    document: &mut Value,
-    expected_hashes: &BTreeSet<String>,
-    force: bool,
-) -> usize {
-    let Some(hooks) = document.get_mut("hooks").and_then(Value::as_object_mut) else {
-        return 0;
-    };
-    let mut removed = 0;
-    for groups in hooks.values_mut() {
-        let Some(groups) = groups.as_array_mut() else {
-            continue;
-        };
-        groups.retain_mut(|group| {
-            let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
-                return true;
-            };
-            let before = handlers.len();
-            handlers.retain(|handler| {
-                if !is_claude_managed_signature(handler) {
-                    return true;
-                }
-                let hash = hash_value(handler).unwrap_or_default();
-                !(force || expected_hashes.contains(&hash))
-            });
-            removed += before - handlers.len();
-            !(before > 0 && handlers.is_empty())
-        });
-    }
-    removed
-}
-
 fn is_managed_signature(handler: &Value) -> bool {
     handler
         .get("command")
@@ -1706,30 +2454,6 @@ fn is_managed_signature(handler: &Value) -> bool {
             .get("commandWindows")
             .and_then(Value::as_str)
             .is_some_and(|command| command.contains(" dispatch codex "))
-}
-
-fn is_claude_managed_signature(handler: &Value) -> bool {
-    let marker_matches = handler.get("statusMessage").and_then(Value::as_str)
-        == Some("Project Brain deterministic governance");
-    let args_match = handler
-        .get("args")
-        .and_then(Value::as_array)
-        .is_some_and(|args| {
-            args.len() == 3
-                && args[0] == "dispatch"
-                && args[1] == "claude-code"
-                && args[2].as_str().is_some_and(|event| {
-                    matches!(
-                        event,
-                        "session-start"
-                            | "user-prompt-submit"
-                            | "pre-tool-use"
-                            | "post-tool-use"
-                            | "stop"
-                    )
-                })
-        });
-    marker_matches && args_match
 }
 
 fn codex_integration_valid(install_root: &Path, codex_home: Option<&Path>) -> bool {
@@ -1748,41 +2472,21 @@ fn codex_integration_valid(install_root: &Path, codex_home: Option<&Path>) -> bo
         && observed_managed_hashes(&document) == manifest.managed_handler_hashes
 }
 
-fn claude_integration_valid(install_root: &Path, claude_home: Option<&Path>) -> bool {
-    let Some(claude_home) = claude_home else {
+fn pi_integration_valid(install_root: &Path, pi_home: Option<&Path>, project_root: &Path) -> bool {
+    let Some(pi_home) = pi_home else {
         return false;
     };
-    let target = claude_home.join("settings.json");
-    let integration = install_root.join("state/integrations/claude-code.json");
-    let Ok(document) = read_json::<Value>(&target) else {
-        return false;
-    };
-    let Ok(manifest) = read_json::<ClaudeIntegrationManifest>(&integration) else {
-        return false;
-    };
-    validate_claude_integration_manifest(&manifest, &target).is_ok()
-        && observed_claude_managed_hashes(&document) == manifest.managed_handler_hashes
-}
-
-fn prime_integration_valid(
-    install_root: &Path,
-    prime_home: Option<&Path>,
-    project_root: &Path,
-) -> bool {
-    let Some(prime_home) = prime_home else {
-        return false;
-    };
-    let extension_root = prime_home.join("extensions");
+    let extension_root = pi_home.join("extensions");
     let extension_directory = extension_root.join("project-brain");
     let target = extension_directory.join("index.ts");
-    let integration = install_root.join("state/integrations/prime-agent.json");
-    let Ok(manifest) = read_json::<PrimeIntegrationManifest>(&integration) else {
+    let integration = install_root.join("state/integrations/pi.json");
+    let Ok(manifest) = read_json::<PiIntegrationManifest>(&integration) else {
         return false;
     };
-    if validate_prime_integration_manifest(&manifest, &target).is_err()
-        || !prime_extension_directory_exact(&extension_directory, &target)
+    if validate_pi_integration_manifest(&manifest, &target).is_err()
+        || !pi_extension_directory_exact(&extension_directory, &target)
         || target_hash_exact(&target).as_deref() != Some(manifest.target_sha256.as_str())
-        || prime_extension_conflict_exists(&extension_root)
+        || pi_extension_conflict_exists(&extension_root)
     {
         return false;
     }
@@ -1800,7 +2504,7 @@ fn prime_integration_valid(
     if digest_bytes(&launcher_bytes) != manifest.launcher_sha256 {
         return false;
     }
-    let Ok(expected) = render_prime_extension(&manifest.launcher_path) else {
+    let Ok(expected) = render_pi_extension(&manifest.launcher_path) else {
         return false;
     };
     if digest_bytes(&expected) != manifest.target_sha256 {
@@ -1810,10 +2514,114 @@ fn prime_integration_valid(
         .ok()
         .zip(canonical_directory_boundary(project_root).ok())
         .is_some_and(|(extension, project)| !extension.starts_with(project));
-    target_outside_project && prime_launcher_fixture_valid(&manifest.launcher_path)
+    target_outside_project && pi_launcher_fixture_valid(&manifest.launcher_path)
 }
 
-fn prime_extension_directory_exact(extension_directory: &Path, target: &Path) -> bool {
+fn opencode_integration_valid(
+    install_root: &Path,
+    opencode_home: Option<&Path>,
+    project_root: &Path,
+) -> bool {
+    let Some(opencode_home) = opencode_home else {
+        return false;
+    };
+    let target = opencode_home.join("plugins/project-brain.js");
+    let integration = install_root.join("state/integrations/opencode.json");
+    let Ok(manifest) = read_json::<ManagedPluginManifest>(&integration) else {
+        return false;
+    };
+    if validate_managed_plugin_manifest(
+        &manifest,
+        &target,
+        OPENCODE_INTEGRATION_VERSION,
+        "opencode-plugin-v1",
+        &REQUIRED_OPENCODE_EVENTS,
+        None,
+    )
+    .is_err()
+        || target_hash_exact(&target).as_deref() != Some(manifest.target_sha256.as_str())
+        || target_hash_exact(&manifest.launcher_path).as_deref()
+            != Some(manifest.launcher_sha256.as_str())
+    {
+        return false;
+    }
+    let Ok(expected) = render_opencode_plugin(&manifest.launcher_path) else {
+        return false;
+    };
+    let target_outside_project = target
+        .canonicalize()
+        .ok()
+        .zip(project_root.canonicalize().ok())
+        .is_some_and(|(target, project)| !target.starts_with(project));
+    target_outside_project
+        && digest_bytes(&expected) == manifest.target_sha256
+        && launcher_capability_fixture_valid(&manifest.launcher_path, "opencode")
+}
+
+fn dsh_integration_valid(
+    install_root: &Path,
+    dsh_home: Option<&Path>,
+    profile: &str,
+    project_root: &Path,
+) -> bool {
+    let Some(dsh_home) = dsh_home else {
+        return false;
+    };
+    let target = dsh_home
+        .join("profiles")
+        .join(profile)
+        .join("node_modules/@project-brain/dsh-plugin/lib/index.js");
+    let integration = install_root
+        .join("state/integrations")
+        .join(format!("dsh-{profile}.json"));
+    let Ok(manifest) = read_json::<ManagedPluginManifest>(&integration) else {
+        return false;
+    };
+    if validate_managed_plugin_manifest(
+        &manifest,
+        &target,
+        DSH_INTEGRATION_VERSION,
+        "dsh-plugin-v1",
+        &REQUIRED_DSH_EVENTS,
+        Some(profile),
+    )
+    .is_err()
+        || target_hash_exact(&target).as_deref() != Some(manifest.target_sha256.as_str())
+        || target_hash_exact(&manifest.launcher_path).as_deref()
+            != Some(manifest.launcher_sha256.as_str())
+    {
+        return false;
+    }
+    let target_outside_project = target
+        .canonicalize()
+        .ok()
+        .zip(project_root.canonicalize().ok())
+        .is_some_and(|(target, project)| !target.starts_with(project));
+    target_outside_project
+        && dsh_profile_declares_plugin(dsh_home, profile)
+        && launcher_capability_fixture_valid(&manifest.launcher_path, "dsh")
+}
+
+fn dsh_profile_declares_plugin(dsh_home: &Path, profile: &str) -> bool {
+    let manifest = dsh_home.join("profiles").join(profile).join("package.json");
+    let Ok(value) = read_json::<Value>(&manifest) else {
+        return false;
+    };
+    value
+        .pointer("/dsh/profile/bundles")
+        .and_then(Value::as_array)
+        .is_some_and(|bundles| {
+            bundles
+                .iter()
+                .any(|item| item.as_str() == Some(DSH_PLUGIN_PACKAGE))
+        })
+        && value
+            .get("dependencies")
+            .and_then(Value::as_object)
+            .is_some_and(|dependencies| dependencies.contains_key(DSH_PLUGIN_PACKAGE))
+}
+
+fn pi_extension_directory_exact(extension_directory: &Path, target: &Path) -> bool {
     let Ok(metadata) = fs::symlink_metadata(target) else {
         return false;
     };
@@ -1827,7 +2635,7 @@ fn prime_extension_directory_exact(extension_directory: &Path, target: &Path) ->
     entries.len() == 1 && entries[0].path() == target
 }
 
-fn prime_extension_conflict_exists(extension_root: &Path) -> bool {
+fn pi_extension_conflict_exists(extension_root: &Path) -> bool {
     [
         "project-brain.ts",
         "project-brain.js",
@@ -1838,9 +2646,13 @@ fn prime_extension_conflict_exists(extension_root: &Path) -> bool {
     .any(|name| extension_root.join(name).exists())
 }
 
-fn prime_launcher_fixture_valid(launcher: &Path) -> bool {
+fn pi_launcher_fixture_valid(launcher: &Path) -> bool {
+    launcher_capability_fixture_valid(launcher, "pi")
+}
+
+fn launcher_capability_fixture_valid(launcher: &Path, agent: &str) -> bool {
     let Ok(output) = Command::new(launcher)
-        .args(["capabilities", "prime-agent"])
+        .args(["capabilities", agent])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1853,7 +2665,13 @@ fn prime_launcher_fixture_valid(launcher: &Path) -> bool {
     }
     serde_json::from_slice::<Value>(&output.stdout).is_ok_and(|value| {
         value.get("deny_tool").and_then(Value::as_str) == Some("supported")
-            && value.get("continue_after_stop").and_then(Value::as_str) == Some("unsupported")
+            && value.get("continue_after_stop").and_then(Value::as_str)
+                == Some(match agent {
+                    "pi" => "emulated",
+                    "opencode" => "unsupported",
+                    "codex" | "dsh" => "supported",
+                    _ => return false,
+                })
     })
 }
 

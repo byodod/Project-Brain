@@ -1,334 +1,206 @@
-# 架构说明
+# Project Brain Architecture
 
-## 运行时边界
+## 1. 目标
 
-Project Brain 把仓库记忆视为“改变未来行为的规则”，而不是聊天片段检索。当前数据流为：
+Project Brain 是独立于 Coding Agent 的确定性治理运行时。它在 Agent 生命周期边界自动恢复项目上下文、检查工具动作、记录实际结果并裁决是否允许停止。
 
-```text
-Agent Hook JSON
-      │
-      ▼
-Agent Adapter
-      │ InternalHookEvent v1
-      ▼
-Protocol Processor
-      │
-      ├── project_key isolation
-      ├── event idempotency
-      └── capability-aware semantics
-      │
-      ▼
-Deterministic Rule Engine / Reconcile
-      │
-      ├── NoVeto / Deny / inject
-      ├── post feedback
-      └── AllowStop / ContinueWork
-      │
-      ├── Agent-specific Hook JSON
-      └── project-scoped SQLite adapter audit
-```
+最终内建 Agent 范围固定为：Codex、Pi、OpenCode、dsh。框架、语言工具链和项目类型不进入 Hook adapter。
 
-Git 变更进入另一条同样确定性的分析路径：
+## 2. 分层与依赖方向
 
 ```text
-Git zero-context diff
-      │
-      ├── 当前/未跟踪源码
-      └── 基线旧源码（纯删除）
-              │
-              ▼
-       Tree-sitter parser
-              │
-              ├── changed_symbols
-              └── removed_symbols
-```
-
-完整仓库语义基础走 Provider-neutral 快照路径：
-
-```text
-Tracked + unignored files
-          │
-          ▼
-  Symbol Provider
-  ├── Tree-sitter Rust: syntax_fallback
-  └── SCIP: semantic
-      ├── rust-analyzer / rust
-      ├── scip-dotnet / C# + Visual Basic
-      ├── scip-python / explicit missing-language mapping
-      └── configured custom producer/language
-          │ project-scoped SymbolSnapshot
-          ▼
-  SQLite derived graph
-  ├── active nodes
-  ├── removed history
-  └── lexical/semantic edges
-```
-
-`brain-symbols` 只定义 Provider、节点、边、快照和身份质量；它不依赖 Tree-sitter、
-Git 或 SQLite。`brain-analyzer` 与 `brain-scip` 是 Provider，`brain-store` 只消费完整快照。
-
-引擎、构建、测试与运行时事实走独立的 `brain-evidence` 协议。它把 Source、Semantic、Engine、Build、
-Test、Runtime 作为不同 Evidence Plane，并用 ArtifactGraph 表达场景、资源、脚本绑定、构建产物和运行
-场景。每个下游快照记录实际消费的 upstream fingerprint；源码或任一上游变化都会使证据 stale。
-SymbolGraph 与 ArtifactGraph 不共享身份，后续只能通过显式 evidence edge 连接。
-
-Godot Provider v1 分为两个进程边界：先由固定 SHA-256 的 Godot 4 editor 执行 `--import`，再运行
-Project Brain 自带且位于机器临时目录的 GDScript probe。Probe 在加载前后分别采集 project、UID、
-main scene、autoload、resource dependency 与文件哈希；Rust 侧要求两份 engine-resolved state 除
-`loaded` 结果外完全一致，并再次读取文件核对哈希。HOME、APPDATA 与 XDG 路径指向本次临时目录，
-避免读取或写入用户 editor 配置。`.godot/` 不进入 ArtifactGraph，也不参与 source fingerprint。
-
-Build Provider 不复用 Semantic Runner，也不把“编译”并入 Engine。`.NET` 与 `cargo` 属于
-`RepositoryBuildCode`：即使 argv 由 Project Brain 固定，MSBuild task、build.rs 和 proc macro 仍可
-执行仓库代码，因此必须同时取得机器 executable 信任与仓库构建代码信任。Python v1 属于
-`CompilerOnly`，固定 isolated interpreter bootstrap，只调用 `compile()`。所有输出都进入机器私有
-scratch；`.NET` 的版本探测和构建进程以项目根为工作目录，以便 `global.json` 参与 SDK 解析，Rust 与
-Python 仍以 scratch 为工作目录。完整观测到非零退出仍是 complete error evidence，基础设施缺失则
-降级为 partial unavailable。Godot C# Build Snapshot 显式引用本次实际消费的 Engine fingerprint。
-
-.NET Test Provider 不使用仓库当前输出，也不调用 `dotnet test` 重新进入 MSBuild。Build CAS manifest
-绑定 `build_target`；Test 核对 fresh Build head、Source、target、toolchain 与 bundle 后，将精确字节
-物化到 scratch，并固定调用 `dotnet vstest`。TRX 汇总形成独立 Test Snapshot。NoTests、timeout 与
-provider failure 保留各自状态；普通 TRX failure 在无法区分 assertion/exception 时保持 advisory。
-
-Rust Test Provider 要求当前 `cargo-build.<profile>` head 的 Source、cargo executable 与规范
-`build_target` artifact 精确匹配，然后在机器 scratch 固定执行 offline/frozen 的 workspace all-targets
-`cargo test`。build.rs、proc macro 与测试代码是独立显式信任面。稳定版 libtest 多 harness 摘要被有界
-聚合，但文本 failure 不能证明是断言，因此保持 advisory；无测试、超时、截断和缺摘要分别保留真实
-状态，不因命令出现 error 自动阻断。
-
-Godot Scenario Test Provider 同样只消费精确 Build CAS，并额外要求该 Build 精确引用一个与当前 Godot
-executable 哈希相同的 fresh Engine head。Provider 物理复制 Source、固定 import、再运行仓库内明确
-`.tscn`；场景只能通过受限 JSON v1 结果声明断言。合法失败断言具有 deterministic_violation 权限，
-而 import/runtime diagnostic、缺结果、崩溃、超时和输出截断保持 advisory 或 partial。Source stage、
-CAS、权威 worktree 与 executable 都有运行前后重校验；argv 不开放 script/build/export 表面。
-
-SCIP 路径以 `project_key + semantic provider profile ID + producer + contract_version` 建立
-Provider 命名空间，并把规范化 language ID 写入 provider key。语言映射逐 Document 执行，
-因此单一 scip-dotnet index 可同时容纳 C# 与 Visual Basic。Producer 自身版本只作为 provenance
-输出，不冒充 Project Brain 的解释契约版本。能力矩阵绑定 producer + language，并使用
-supported/partial/unsupported/unknown 四态，不从某个索引“恰好出现了什么”反推保证。
-
-自动执行 producer 时，仓库 profile 仍只保存声明式 producer 契约；`providers.json` 按
-`project_key + profile_id` 保存机器绝对路径、registration revision、version probe 与 executable/
-entrypoint SHA-256。scip-python 额外校验 package.json 的官方包身份、bin 入口，并固定整个包目录的
-有界文件清单哈希，避免只固定薄入口而遗漏 `dist/` 传递 bundle。Runner 仅对三种已知 adapter 构造
-固定 argv，拒绝仓库内 executable、相对路径、Windows shell shim 和任意 repo args。Windows 内部
-可继续使用 verbatim canonical path，但传给不接受 `\\?\` 的 producer argv/JS 入口会转换为等价本机路径。
-所有 Semantic、Engine、Build、Test、Runtime 外部执行在受控 spawn 时即进入统一进程树容器；
-Windows 使用 Job Object，Unix 使用可用的 cgroup/process-group。根进程退出或超时后，Runner 先
-清空并确认完整进程树，再收尾输出、验证产物。该合同只约束进程生命周期，不是网络/文件系统沙箱。
-外部进程运行期间不持有 SQLite 写事务；只有输出、provenance、
-profile/root 与工作区前后指纹全部通过后，才进入 semantic snapshot 事务。
-
-`brain-core` 不依赖文件系统、Git、SQLite 或任何 Agent SDK。相同输入、配置和 schema_version 必须产生相同决策。
-
-## 权威来源
-
-```text
-.project-brain/config.json
+Agent native lifecycle
         │
-        ├── project_key  项目稳定身份、应进入版本控制
-        ├── rules        权威、应进入版本控制
-        └── lifecycle    权威、保留 superseded/retired 轨迹
-
-.project-brain/brain.db
+        ▼
+project-brain adapter + installer
         │
-        ├── audit_events 本地派生记录、不进入版本控制
-        ├── adapter_audit_events 按项目/适配器隔离的事件、结果、延迟与失败
-        ├── symbol graph 按 project_key 隔离、可从工作区完整重建的派生索引
-        ├── semantic source manifest 快照实际覆盖的完整 Document 证据
-        └── evidence snapshot/head/attestation/staleness 分层证据账本
-
-<ProjectBrainData>/state/providers.json
+        ▼
+Internal Hook Protocol v1
         │
-        ├── executable/entrypoint path + SHA-256  机器本地信任，不提交
-        ├── scip-python package manifest SHA-256  固定传递 bundle
-        ├── registration revision + probe version
-        └── provider-audit.jsonl  有界本地执行/失败 provenance
-
-<ProjectBrainData>/state/qualification.sqlite
-        │
-        ├── binary + contract + schema + OS/arch target identity
-        ├── append-only run / immutable case results
-        └── Qualified / Failed / Inconclusive machine proof
+        ├── brain-core      规则、能力、纯决策
+        ├── brain-store     项目级审计与证据状态
+        ├── brain-symbols   Provider-neutral 符号协议
+        ├── brain-evidence  Evidence/输入依赖协议
+        └── external providers through process protocols
 ```
 
-SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照以事务应用；快照中消失的节点
-进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
-符号 ID、快照 revision、节点/边主键、查询和墓碑更新都包含 `project_key`。数据库 schema v4
-首次建立这组项目隔离约束；对应迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与
-adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v18，并在这些约束上
-增加独立的语义血缘账本、append-only 来源证明、不可伪造的源码 Document manifest，以及
-Evidence Plane 当前 head 与带 `stale/unknown` 结果的失效事件。v18 还为每个 adapter event 保存
-规范事件 JSON 的 SHA-256；同一 `(project_key, adapter_kind, event_id)` 只有载荷哈希相同才可重放，
-不同载荷即使并发到达也必须报幂等冲突。当前 schema 连接走只读快速初始化路径，adapter 热写入对
-SQLite busy/locked 做有界重试，避免多 Agent 启动时重复 DDL 与写者饥饿。
-数据库迁移拒绝缺失或非整数的已有 `schema_version`，不会把损坏元数据静默当作 v1。
-Adapter 审计依赖 SQLite 唯一约束和 busy timeout，使并发连接对同一项目事件收敛到首次 outcome；
-失败记录可在重开数据库后由成功重试升级，后续重复成功不能覆盖首次成功。
+硬性边界：
 
-Semantic lineage 使用独立 ledger，不改变符号图：
+- `brain-core` 不依赖文件系统、Git、SQLite、Agent SDK 或 Provider SDK；
+- `brain-symbols` 不依赖 Git、Tree-sitter、SCIP 或 SQLite；
+- `brain-evidence` 不包含具体框架、引擎、编译器或测试运行器类型；
+- Adapter 只负责 vendor event 与内部事件/结果映射；
+- SQLite、安装器、Git、进程执行只存在于宿主层。
+
+## 3. 决策内核
+
+内核输入是规范化 `ActionDescriptor`、有效规则、符号解析与可信 Evidence。输出为：
 
 ```text
-immutable semantic snapshots + observations
-                 │ adjacent removed/inserted only
-                 ▼
-         proposed candidate
-           │ evidence append-only
-           │ explicit user request
-           ▼
-confirmed / rejected / superseded / invalidated
-           │ decision append-only
-           └── never rewrites SymbolNode / tombstone / snapshot
+allow < allow_with_context < escalate < block
 ```
 
-SQLite schema v18 保存 semantic snapshots、append-only source attestations、source manifests、
-symbol observations、group/member/generation run、candidate/evidence/decision，以及显式旧账压缩的
-run/group 审计、删除前备份证明、人工 pair materialization request 与 append-only Provider qualification
-events。压缩默认只读；apply 必须携带人工确认、幂等 request ID 和已批准 dry-run manifest。它先持有
-immediate 写事务阻止并发写者，再由另一只读连接使用 SQLite Online Backup API 把完整删除前状态保存到
-项目外的机器级目录。逻辑清单、quick check 和外键复验成功之前，不产生任何压缩 DML；新审计绑定
-backup ID、相对路径、制品 SHA-256 和删除前逻辑清单。该路径不 checkpoint、不复制裸 `.db`，也没有
-跳过备份开关。schema v17 触发器在存储边界拒绝缺少完整备份证明或前后逻辑清单不相等的
-operation v2+ run。
-物理压缩是后续独立维护协议，不能替代候选资格证明。`database stats` 只读打开当前 schema；
-`database compact` 默认预演，apply 则在协作式独占锁下完成 WAL checkpoint、`VACUUM INTO`、源/候选
-全库逻辑清单等价验证、默认备份与同文件系统原子替换。操作日志位于被替换数据库之外；任何未完成或
-失败状态都会阻止普通 Hook/CLI，使用相同 request ID 才能恢复。锁只覆盖 Project Brain 进程，不声称
-隔离绕过协议的外部 SQLite 写入器。报告同时区分进程崩溃下的“同步临时文件 + 原子替换”与平台相关的
-突然断电目录项持久性，不宣称无法由标准库证明的 write-through 保证。
-同一 semantic snapshot 可由不同机器绑定重复产生。V11 的 attestation 唯一身份包含 trust、
-registration、executable 与 artifact 证明；图内容未变化时仍可追加新的来源证明，并由最新 sequence
-参与 hard-gate 新鲜度判断，不能让旧绑定证明遮蔽当前已资格化绑定。
-
-Production Qualification 是控制面自身的部署证明，不是第七个 Evidence Plane。它在机器私有 fixture
-中运行固定七项套件，覆盖三种 adapter 合同、project_key 隔离、精确重放/碰撞拒绝、32 会话并发
-交错、正式 Provider 固定路径的内容漂移、Stop loop 上界和 10,000 事件长会话。运行前后会核对当前
-二进制与项目 Source 上下文；目标或源码在运行中变化时只能得到 `Inconclusive`。终态报告按自身哈希
-复验，run 只能从 `running` 原子收口一次，case 不可更新/删除。该机器账本永不进入项目 `brain.db`，
-不会参与 Hook 决策；只有用户显式使用 `doctor --require-qualified` 时，缺少精确 target 的 Qualified
-证明才成为 doctor issue。
-Candidate endpoint 唯一键负责算法重跑幂等，算法版本只产生新的 evidence observation；人工状态
-永远不会被 generator 恢复或覆盖。Partial unique indexes 约束同 snapshot pair 中 predecessor 与
-successor 一对一，竞争确认不会自动选择赢家。`request_id + request_hash` 提供 at-least-once 命令
-提交的幂等与碰撞检测，状态更新使用 revision CAS。
-
-Source manifest 与新快照在同一 SQLite 事务内写入，并保存路径/language/内容摘要、数量和 manifest
-摘要。旧库迁移绝不从“仍有 symbol 的文件”推断完整文档集合；只有真实重跑完整 Provider 输入才可
-补录。索引报告与显式 doctor 将 manifest 和 Git 当前文件集合比较，区分 complete、partial、stale、
-not_indexed 与 unverifiable，避免“Provider 成功退出”等价于“全仓源码已覆盖”的错误推论。
-新 Provider 输出只有覆盖率为 complete 才允许进入 snapshot transaction；partial/unverifiable 只留下
-机器级运行审计。`provider verify-stability` 以 workspace index 为快速路径，固定源码与 executable
-身份后重复比较 Document manifest 和完整 semantic snapshot 指纹，且永不提交观测结果。多次失败
-workspace run 的 union 不构成一致的语义世界，因此协议明确禁止。
-稳定性验证的最终结论持久化到项目数据库。最新结论为 `nondeterministic` / `stable_incomplete` 时，
-普通 `provider index` 即使偶然得到 complete 输出也不得提交；只有相同机器绑定的显式重复验证达到
-`stable_complete` 才恢复提交资格。资格存在后，Provider registration revision 或 executable hash
-变化会使它过期并要求重新验证。
-
-Engine/Build/Runtime 等跨语言证据使用独立 ledger：不可变 `evidence_snapshots` 只按 fingerprint 保存
-一次完整 JSON，重复真实运行只追加小型 `evidence_attestations`；`evidence_heads` 保存每个项目、plane、
-provider 当前指向及 persisted fresh/stale/unknown 状态。明确的文件 Create/Modify/Delete 完成事件以
-project + event ID 幂等写入 `evidence_staleness_events`，并把现有 Source、Semantic、Engine、Build、
-Test、Runtime heads 原子标为 stale；不透明操作按当前 Git Source 指纹只降级真正不兼容的 heads。
-
-Persisted freshness 本身没有 authority。Session/Intent/PreTool/Stop、Finding gate、当前状态查询与
-upstream 选择都通过现场 Source 指纹计算 effective freshness；不一致/不可验证立即失去 hard authority，
-但源码重新相同不会自动恢复信任。Provider 结果在提升 head 前再次验证当前 Source，并在同一事务中
-stale 其它不同 Source 指纹的 fresh heads，再按显式 upstream 引用向下游传播。这个结构避免重复保存
-大型 ArtifactGraph，也不把过期 finding 提升为硬阻断。
-
-## 阻断权限
-
-阻断必须同时满足：
+`block` 的配置合法性由加载阶段强制：
 
 ```text
 effect = block
 strength = hard
-authority ∈ { explicit_user, repository_rule, accepted_decision }
+authority ∈ {explicit_user, repository_rule, accepted_decision}
 ```
 
-配置加载阶段即拒绝其他组合，避免把概率判断意外提升为强制规则。
+低权限来源可以提示风险，但不能转换为硬阻断。Evidence finding 即使声称确定性违规，也必须同时满足 Provider authority ceiling、freshness、coverage 与显式规则映射。
 
-Symbol scope 还要求 direct semantic 或逐跳 confirmed lineage、非 local 且唯一的 definition、
-trusted Provider attestation、当前机器 registration/executable hash 匹配及新鲜源码。确定性工具影响
-或 clean HEAD baseline Git hunk 才能把这些事实提升为硬证据；其他情况只注入 advisory。
+## 4. 项目身份
 
-## Stop 闭环
+`project_key` 是所有持久状态的第一隔离键。cwd、仓库路径、session ID 或 Agent 名都不能替代它。
 
-Codex `Stop` 读取 `stop_reconcile` 配置，对当前 Git 文件集合执行 Change Envelope 对账。
-`block` 或 `escalate` 会转换为 Codex 的 Stop block 响应，使 Agent 继续处理；当
-`stop_hook_active=true` 时直接放行，防止 hook 自触发循环。
-Envelope 在读取前会规范化并限制在项目根目录内；所有 Git diff 调用显式禁用
-external diff，避免分析动作执行仓库配置中的外部程序。
+以下对象全部绑定 `project_key`：
 
-符号 Stop 对账独立使用 clean `HEAD` semantic baseline 与真实 diff hunk；纯插入保留旧文件插入
-锚点。Provider、attestation、lineage 或数据库基础设施不可用时只记录 warning 并 fail-open，不能
-伪装成规则违规。
+- Hook 事件、幂等键、操作因果链；
+- Source baseline 与路径 delta；
+- SymbolGraph、snapshot、lineage；
+- Evidence head、input manifest、staleness；
+- 机器 Provider 绑定和项目注册。
 
-## Adapter 能力不对称
+项目注册表保存规范路径与项目键。Dispatcher 对未注册项目保持 NO-OP，避免用户级 Hook 干扰无关仓库。
 
-公共协议统一治理语义，不统一 vendor JSON。Codex/Claude Code 可以拒绝工具并要求 Stop 后继续；
-Prime Agent 是独立 runtime；其 Extension `tool_call` 可同步 block，但当前正式文档中的
-`agent_end` 只表示一次 prompt 结束，且未提供稳定 `agent_settled` 契约，因此 Stop continuation
-必须报告 unsupported。Prime direct adapter 使用独立身份、幂等域、审计域与自有输出 JSON，
-不复用 Codex/Claude vendor JSON。Codex 与 Claude Code adapter 都包含用户级安装器；Prime 的
-Extension 安装器把机器托管的 `index.ts` 放入全局 `~/.prime/agent/extensions/project-brain/`，
-以绝对路径、无 shell 子进程桥接稳定 launcher。安装 manifest 同时绑定 Extension、launcher、事件集
-与 API contract hash；漂移默认拒绝。Prime Extension 不订阅 `agent_end`，不会用消息注入伪造续轮。
+## 5. 四适配器架构
 
-## 下一阶段
+四个 Agent 使用同一内部事件，但保留独立 adapter identity、版本、幂等命名空间、安装 manifest 与原生输出。
 
-1. Production Qualification v1 已把 adapter 合同、项目隔离、精确重放、并发交错、Provider 漂移、
-   Stop 防循环与 10,000 事件长会话固化为机器可判定证明；下一步扩展真实项目矩阵，而不降低固定套件。
-2. 已接入机器级 SCIP Runner、complete-only commit 与重复运行稳定性证明；真实 rust-analyzer
-   workspace 结果已证明非确定，且 package root 会重新提升到 workspace root，因此不启用假的
-   package-shard fallback。.NET/Python 继续用符合
-   producer 行为的合成 fixture 固定 C#/VB、空 Python language、未指定 kind 与 implementation 契约。
-3. Semantic lineage 裁决与 symbol-scoped rules 已实现；下一步扩展 symbol set、split/merge 和调用图
-   影响面，但仍不允许自动确认或 LLM hard block。
-4. Claude Code 已覆盖安装后 exec-form handler 的真实子进程 fixture；Prime Agent 已完成原子
-   Extension 安装、漂移保护、launcher roundtrip doctor，以及 Node 22 可用时无需 LLM/API key 的
-   TypeScript 加载与 hard-block fixture。按 adapter 选择的 doctor 已覆盖三种 runtime。
-5. Source、Semantic、Engine、Build、Test、Runtime 分层 Evidence Plane、独立 ArtifactGraph、SQLite
-   快照/attestation/head/staleness ledger 与 Hook 新鲜度提示已经完成；Godot Engine 以及
-   .NET/Rust/Python Build Evidence Provider v1 已通过真实项目验证；Godot C# 最终产物还会提升到
-   机器级内容寻址存储，以不可变 RuntimeArtifactBundle 绑定精确文件字节与主程序集。下一阶段从该
-   bundle 建立的隔离 Godot headless Runtime Provider 已通过真实项目的连续确定性运行；.NET、Rust、
-   Python 与 Godot Scenario Test 已使用独立 Test Plane，finding 到规则的阻断仍必须显式映射。下一阶段
-   增加其他语言合同、网络/文件系统级 OS 隔离与更多真实项目重复运行证明。
-6. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
-   直接 hard block。
+### Codex
 
-相关决策见 [ADR-0001](adr/0001-provider-neutral-symbol-identity.md)、
-[ADR-0002](adr/0002-internal-hook-protocol.md)、
-[ADR-0003](adr/0003-project-identity-and-adapter-audit.md) 与
-[ADR-0004](adr/0004-project-scoped-symbol-graph.md)、
-[ADR-0005](adr/0005-project-language-and-scip-profiles.md) 与
-[ADR-0006](adr/0006-semantic-lineage-ledger.md)、
-[ADR-0007](adr/0007-machine-bootstrap-and-codex-dispatcher.md) 与
-[ADR-0008](adr/0008-machine-provider-runner.md) 与
-[ADR-0009](adr/0009-symbol-scoped-hard-gates.md)、
-[ADR-0010](adr/0010-semantic-source-coverage.md)、
-[ADR-0011](adr/0011-complete-only-and-provider-stability.md) 与
-[ADR-0012](adr/0012-group-first-lineage-and-signature-evidence.md)，以及
-[ADR-0019](adr/0019-evidence-planes-and-artifact-graph.md) 与
-[ADR-0020](adr/0020-godot-engine-evidence-provider.md) 与
-[ADR-0021](adr/0021-evidence-ledger-and-hook-staleness.md)、
-[ADR-0022](adr/0022-evidence-upstream-freshness-propagation.md) 与
-[ADR-0023](adr/0023-fixed-build-evidence-providers.md) 与
-[ADR-0024](adr/0024-content-addressed-runtime-bundles.md) 与
-[ADR-0025](adr/0025-test-evidence-and-explicit-finding-effects.md) 与
-[ADR-0026](adr/0026-exact-dotnet-test-bundle.md) 与
-[ADR-0027](adr/0027-godot-structured-scenario-test.md) 与
-[ADR-0028](adr/0028-rust-test-fixed-contract.md) 与
-[ADR-0029](adr/0029-python-manifest-test-contract.md) 与
-[ADR-0030](adr/0030-dotnet-project-root-sdk-resolution.md) 与
-[ADR-0031](adr/0031-crash-safe-database-compaction.md) 与
-[ADR-0032](adr/0032-post-tool-source-fingerprint-reconciliation.md)、
-[ADR-0033](adr/0033-approved-legacy-lineage-compaction-plan.md) 与
-[ADR-0034](adr/0034-mandatory-online-backup-before-lineage-deletion.md) 与
-[ADR-0035](adr/0035-external-process-tree-containment.md)、
-[ADR-0036](adr/0036-prime-agent-extension-provisioning.md) 与
-[ADR-0037](adr/0037-production-qualification-control-plane.md)。
+用户级 `hooks.json` 中由 Project Brain 自身拥有并逐项哈希的 groups 覆盖 SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、Stop。它们不是 Codex 企业 managed hooks，仍受 Codex hook trust 控制。Project Brain 不设置工具 matcher，因此所有工具都经过工具前/工具后入口；用户已有 groups 原样保留。
+
+### Pi
+
+用户级 Extension 订阅 session、input、agent start、tool call/result 与 agent end。工具前 `block=true` 映射为 Pi veto。Pi 的 `agent_end` 不是正式的停止前 veto 边界；Project Brain 使用官方 follow-up API 模拟最多一次续轮，因此 `continue_after_stop=emulated`，不冒充 Codex/dsh 的 supported。
+
+### OpenCode
+
+用户级 Plugin 订阅 chat、tool before/after、session created/idle。工具前阻断通过抛出错误完成。`session.idle` 可用于 Stop 审计，但 OpenCode 没有已确认的强制续轮合同，因此能力必须报告 unsupported。
+
+### dsh
+
+Project Brain 生成机器托管 bundle source，再通过官方 profile plugin 命令安装。插件订阅 agent pre-step、tools pre/post 与 turn-stopping；工具前返回 deny，停止时使用 agent steer。每个 profile 独立验证 package dependency、bundle 列表和目标哈希。
+
+## 6. 安装与漂移
+
+安装遵循同一不变量：
+
+1. 先验证机器稳定 launcher 与 capability roundtrip；
+2. 只写 Project Brain 独占文件或 Project Brain 自有的精确哈希 group；
+3. 保存 target、launcher、事件合同与 SHA-256；
+4. 重复安装相同内容为 NO-OP；
+5. 不同内容必须显式 replace；
+6. 卸载遇到漂移默认拒绝；
+7. `--force` 仍只删除 Project Brain 目标，不触碰用户其它扩展。
+
+用户级脚本不直接打开项目数据库；它们只调用稳定 launcher。升级替换版本化 payload，Hook 路径不随版本变化。
+
+## 7. Hook 因果链
+
+工具操作使用：
+
+```text
+PreToolUse
+  ├── event_id
+  ├── session_key
+  └── operation_id
+          │
+          ▼
+PostToolUse
+```
+
+有 vendor 稳定 ID 时直接使用并标记 `vendor_stable`；没有时从规范字段派生并如实标记 `derived_stable` 或 `per_delivery`。不同 adapter 永不跨域去重。
+
+PreToolUse 在执行前保存 Source baseline。PostToolUse 对照实际工作区计算精确路径 delta；纯删除、rename、untracked 与无法验证状态都有显式结果。意图描述不能替代实际 diff。
+
+## 8. Evidence 与精准 freshness
+
+Evidence 分为 Source、Semantic、Engine、Build、Test、Runtime 六个中立 plane。名称表达证据层级，不表达具体框架。
+
+新 head 携带 `InputDependencyContractV1` 与 `EvidenceInputManifestV1`：
+
+- exact path 支持 presence-sensitive 缺失状态；
+- tree selector 指定 repository-visible 或 project-filesystem universe；
+- 有限 glob 禁止路径逃逸、shell expansion 和歧义语法；
+- manifest 固定每个输入的路径、状态、角色、内容哈希和大小；
+- complete/conservative 可参与 hard authority，incomplete 不可。
+
+路径 delta 只 stale 相交的 head，并沿显式 upstream 传播。出现未知工具语义、基线缺失、Source 在验证中变化或文件系统不可信时，结果为 `verification_unknown`；系统保守降权而不伪造项目违规。
+
+查询和 hard consumer 会实时重算输入 manifest。持久化 `fresh` 不是永久授权。
+
+## 9. 外部 Provider
+
+### Semantic Provider
+
+SCIP Provider 采用机器绑定 runner：固定 executable/entrypoint 哈希、环境白名单、路径边界、输出上限、执行锁和 complete-only commit。内置 Tree-sitter Rust 只标记 `syntax_fallback`。
+
+### Evidence Provider
+
+Provider Process Protocol v1 是通用插件边界：
+
+```text
+machine binding + descriptor + authority ceiling
+                     │
+                     ▼
+resolve input contract twice around stable Source
+                     │
+                     ▼
+copy declared files to private staging
+                     │
+                     ▼
+fixed executable run < request.json
+                     │
+                     ▼
+validate response, hashes, identity, TOCTOU
+                     │
+                     ▼
+core constructs and commits EvidenceSnapshot
+```
+
+Provider 私有 payload 只作为内容寻址 artifact 保存。核心不解析它，也不允许它声明 hard-block 权限。
+
+独立进程优于动态库：Rust ABI、panic、allocator 和版本漂移不会进入控制面进程。WASI 可作为未来更强隔离后端，但不是 v1 必需条件。
+
+## 10. 外部执行
+
+所有受治理子进程经过统一 execution layer，具备：
+
+- direct spawn，不经过 shell；
+- 有界 stdout/stderr 与 SHA-256；
+- timeout；
+- Unix process group / Windows Job Object 进程树生命周期；
+- scratch 与项目路径边界；
+- 完成后再验证产物和 Source TOCTOU。
+
+这提供进程树 containment，不等于网络隔离、文件系统虚拟化或恶意代码沙箱。仓库控制的 build/test code 和本地 Provider executable 必须显式信任。
+
+## 11. 存储
+
+SQLite schema 采用单调前向迁移。关键数据：
+
+- append-only adapter audit；
+- operation baseline 与 Source delta；
+- provider-neutral SymbolGraph；
+- lineage ledger 与人工裁决；
+- Evidence snapshots、heads、attestations、input manifests 与 impact events；
+- qualification runs。
+
+快照更新事务化，消失符号变为 removed 而非物理删除。危险历史清理由显式 request、revision CAS、不可覆盖备份和重放验证保护。
+
+## 12. Production Qualification
+
+Qualification 以当前二进制哈希、数据库 schema、协议合同与目标平台形成 target hash。Q1-Q7 验证 adapter、隔离、幂等、规则权限、Provider 失败关闭、数据库恢复和安装路径。证明保存在机器级状态，不污染项目数据库。
+
+## 13. Non-goals
+
+- Agent 自主决定何时读取长期记忆；
+- 通用聊天记录 RAG；
+- 自动授予 LLM/Provider 阻断权限；
+- 自动下载或发现外部 Provider；
+- 强行对齐四 Agent 不同的生命周期能力；
+- 核心内建具体框架、引擎或 IDE 语义；
+- 自动确认 symbol lineage split/merge 或跨 Provider 等价。

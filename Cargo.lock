@@ -128,12 +128,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "brain-godot"
+name = "brain-provider-protocol"
 version = "0.1.0"
 dependencies = [
  "brain-evidence",
  "serde",
- "sha2",
+ "serde_json",
  "thiserror 2.0.20",
 ]
 
@@ -559,7 +559,7 @@ dependencies = [
  "brain-analyzer",
  "brain-core",
  "brain-evidence",
- "brain-godot",
+ "brain-provider-protocol",
  "brain-scip",
  "brain-store",
  "brain-symbols",

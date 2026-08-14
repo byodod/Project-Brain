@@ -8,16 +8,31 @@
 
 - Production Qualification v1：机器级不可变账本、`run/status/show`、七项固定控制面资格用例，以及
   `doctor --require-qualified` 精确 target 门禁；资格证明不进入项目 Evidence Plane 或 hard gate。
+- 最终四适配器范围：Codex 原生 Hook、Pi Extension、OpenCode Plugin 和 dsh profile bundle；包含
+  原子安装、漂移保护、精确卸载、能力声明与真实 launcher 生命周期往返 fixture。
+- Provider Process Protocol v1 与通用 `evidence provider bind/run/list/unbind`，外部 Provider 只能提交
+  待验证候选，不能自行授予 hard authority。
+- `InputDependencyContractV1`、`EvidenceInputManifestV1` 和 path/profile-aware 精确失效；完整输入未变化时
+  可保留对应 Evidence head，未知或不完整输入保守降级。
 
 ### Changed
 
-- SQLite schema v18 为 adapter audit 加入规范事件载荷哈希；同一事件 ID 的不同载荷在串行、并发和
-  failure→success 路径均拒绝碰撞，当前 schema 打开避免重复 DDL，并对 adapter 热写入采用有界 busy 重试。
+- SQLite schema v20 在 v18 规范事件载荷哈希与 v19 输入清单基础上，迁移旧 adapter CHECK 约束，确保
+  `project_key` 继续隔离 Codex、Pi、OpenCode、dsh 的事件、幂等键、证据和审计。
+- dsh 的 Stop 审计或 continuation 最多重试一次；Pi continuation 明确标为 emulated 且最多一次，OpenCode 明确为 unsupported。
+
+### Removed
+
+- 移除 Claude Code、Prime Agent 适配器及对应安装器；当前产品范围只包含最终四种编程 Agent。
+- 移除 `brain-godot`、Godot CLI/Runtime/Scenario 分支和其它引擎专用核心逻辑；引擎能力以后只能通过
+  通用外部 Evidence Provider 协议接入。
 
 ### Security
 
 - Qualification run 只允许 `running` 一次性收口到终态，case 结果不可更新/删除，报告哈希在 replay、
   status 与 show 时复验；`Failed`、`Inconclusive`、中断运行和目标漂移均不能冒充 `Qualified`。
+- 四适配器的工具前置门控全部 fail-closed；只有 hard 且具备受信 authority 的仓库规则能够阻断，
+  Hook/Plugin 自身不授予 vendor permission，也不把未知事件猜成可阻断操作。
 
 ## [0.1.0] - 2026-08-14
 

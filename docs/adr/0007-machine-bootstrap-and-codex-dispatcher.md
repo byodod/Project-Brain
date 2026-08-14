@@ -5,7 +5,7 @@
 
 ## 背景
 
-真实 Windows / Orca / Godot C# 项目验证暴露了两个生产问题：`project-brain` 未必在
+真实 Windows 与跨平台大型项目验证暴露了两个生产问题：`project-brain` 未必在
 `PATH` 中；把开发机绝对 exe 路径写入仓库 `.codex/hooks.json` 会污染可移植配置并导致每台
 机器的 Hook 定义不同。Codex 同时加载用户级与项目级 Hook，非托管命令 Hook 又按精确定义
 哈希要求审核，因此稳定的机器级命令路径比项目内绝对路径更合适。

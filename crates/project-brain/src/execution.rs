@@ -16,6 +16,7 @@ use tokio::io::AsyncWrite;
 use crate::error::AppError;
 
 pub(crate) const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_STDIN_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) struct ProcessResult {
     pub status: ExitStatus,
@@ -105,6 +106,34 @@ pub(crate) fn run_contained(
     environment: &[(OsString, OsString)],
     observe_timeout: bool,
 ) -> Result<ProcessResult, AppError> {
+    run_contained_with_input(
+        executable,
+        launcher_script,
+        arguments,
+        cwd,
+        timeout,
+        environment,
+        observe_timeout,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_contained_with_input(
+    executable: &Path,
+    launcher_script: Option<&Path>,
+    arguments: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    environment: &[(OsString, OsString)],
+    observe_timeout: bool,
+    stdin_bytes: Option<&[u8]>,
+) -> Result<ProcessResult, AppError> {
+    if stdin_bytes.is_some_and(|input| input.len() > MAX_STDIN_BYTES) {
+        return Err(AppError::Provider(format!(
+            "拒绝向外部进程写入超过 {MAX_STDIN_BYTES} 字节的标准输入"
+        )));
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -117,6 +146,7 @@ pub(crate) fn run_contained(
         timeout,
         environment,
         observe_timeout,
+        stdin_bytes,
     ))
 }
 
@@ -129,6 +159,7 @@ async fn run_contained_async(
     timeout: Duration,
     environment: &[(OsString, OsString)],
     observe_timeout: bool,
+    stdin_bytes: Option<&[u8]>,
 ) -> Result<ProcessResult, AppError> {
     let stdout_capture = CaptureWriter::new();
     let stderr_capture = CaptureWriter::new();
@@ -138,7 +169,7 @@ async fn run_contained_async(
     }
     argv.extend(arguments.iter().map(OsString::from));
 
-    let command = Command::new(executable.as_os_str())
+    let mut command = Command::new(executable.as_os_str())
         .args(&argv)
         .current_dir(cwd)
         .env_clear()
@@ -152,6 +183,9 @@ async fn run_contained_async(
         .output_buffer(OutputBufferPolicy::bounded(0).with_max_bytes(MAX_CAPTURE_BYTES))
         .stdout_raw_tee(stdout_capture.clone())
         .stderr_raw_tee(stderr_capture.clone());
+    if stdin_bytes.is_some() {
+        command = command.keep_stdin_open();
+    }
 
     let group =
         ProcessGroup::with_options(ProcessGroupOptions::default().shutdown_timeout(Duration::ZERO))
@@ -168,6 +202,19 @@ async fn run_contained_async(
             executable.display()
         ))
     })?;
+    if let Some(input) = stdin_bytes {
+        let mut stdin = process
+            .take_stdin()
+            .ok_or_else(|| AppError::Provider("外部进程未提供已请求的标准输入管道".to_owned()))?;
+        stdin
+            .write(input)
+            .await
+            .map_err(|error| AppError::Provider(format!("无法写入外部进程标准输入：{error}")))?;
+        stdin
+            .finish()
+            .await
+            .map_err(|error| AppError::Provider(format!("无法关闭外部进程标准输入：{error}")))?;
+    }
     let events = process
         .events()
         .map_err(|error| AppError::Provider(format!("无法观察外部进程退出边界：{error}")))?;

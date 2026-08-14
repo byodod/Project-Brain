@@ -8,7 +8,7 @@ Accepted
 
 ## 背景
 
-Godot Provider 已能产生确定性 Engine Evidence Snapshot，但只打印 JSON 无法让后续 Agent 生命周期
+Evidence Provider 已能产生确定性 Snapshot，但只打印 JSON 无法让后续 Agent 生命周期
 判断其是否仍对应当前源码。若每次运行都重复保存完整 ArtifactGraph，又会重演 semantic observation
 历史造成的数据库膨胀。Provider 自己直接 block 还会绕过仓库规则的权限模型。
 
@@ -20,7 +20,7 @@ Godot Provider 已能产生确定性 Engine Evidence Snapshot，但只打印 JSO
    attestation。应用快照、追加证明和把 head 恢复 fresh 在同一事务完成。
 3. staleness event 使用 project + event ID 幂等；同 ID 同内容重放，同 ID 不同内容拒绝。它只修改
    当前 head，不改写历史 Snapshot。
-4. Codex、Claude Code 与 Prime Agent 复用同一内部 `PostToolUse` 逻辑。明确的 Create/Modify/Delete
+4. Codex、PI、opencode 与 dsh 复用同一内部 `PostToolUse` 逻辑。明确的 Create/Modify/Delete
    工具结束后，即使 vendor 报告失败或未知也按可能部分写入处理，把 Engine head 标为 stale。
 5. stale 状态会在 Session、Intent、PreTool 和 Stop 中作为上下文或 warning 出现，但不会自行 block。
    重新运行受信任 Provider 才能恢复 fresh。

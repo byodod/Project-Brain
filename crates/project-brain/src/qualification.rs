@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{app::HookEvent, claude, codex, error::AppError, git, prime, provider, setup};
+use crate::{app::HookEvent, codex, dsh, error::AppError, git, opencode, pi, provider, setup};
 
 const QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 const QUALIFICATION_SUITE_ID: &str = "control-plane";
@@ -715,16 +715,23 @@ fn case_adapter_contract(root: &Path) -> Result<Value, String> {
         &input,
     )
     .map_err(display_error)?;
-    let claude_output = claude::handle_with_provider_trust(
+    let pi_output = pi::handle_with_provider_trust(
         &case_root,
         &config,
         &store,
         &provider_trust,
         HookEvent::PreToolUse,
         &input,
-    )
-    .map_err(display_error)?;
-    let prime_output = prime::handle_with_provider_trust(
+    );
+    let opencode_output = opencode::handle_with_provider_trust(
+        &case_root,
+        &config,
+        &store,
+        &provider_trust,
+        HookEvent::PreToolUse,
+        &input,
+    );
+    let dsh_output = dsh::handle_with_provider_trust(
         &case_root,
         &config,
         &store,
@@ -736,13 +743,11 @@ fn case_adapter_contract(root: &Path) -> Result<Value, String> {
         .0
         .pointer("/hookSpecificOutput/permissionDecision")
         == Some(&json!("allow"))
-        || claude_output
-            .0
-            .pointer("/hookSpecificOutput/permissionDecision")
-            == Some(&json!("allow"))
-        || prime_output.0.get("block") != Some(&json!(false))
+        || pi_output.0.get("block") != Some(&json!(false))
+        || opencode_output.0.get("block") != Some(&json!(false))
+        || dsh_output.0.get("block") != Some(&json!(false))
     {
-        return Err("adapter no-veto 被错误表达成授权或 Prime 没有返回 block=false".to_owned());
+        return Err("adapter no-veto 被错误表达成授权或缺少 block=false".to_owned());
     }
     if serde_json::from_value::<codex::CodexHookInput>(json!({ "session_id": 7 })).is_ok() {
         return Err("adapter 接受了已知字段的错误类型".to_owned());
@@ -781,16 +786,19 @@ fn case_adapter_contract(root: &Path) -> Result<Value, String> {
     }
     let capabilities = json!({
         "codex": codex::capabilities(),
-        "claude_code": claude::capabilities(),
-        "prime_agent": prime::capabilities(),
+        "pi": pi::capabilities(),
+        "opencode": opencode::capabilities(),
+        "dsh": dsh::capabilities(),
     });
-    if capabilities["prime_agent"]["continue_after_stop"] != "unsupported"
+    if capabilities["opencode"]["continue_after_stop"] != "unsupported"
+        || capabilities["pi"]["continue_after_stop"] != "emulated"
+        || capabilities["dsh"]["continue_after_stop"] != "supported"
         || capabilities["codex"]["deny_intent"] != "unsupported"
     {
         return Err("adapter capability contract 与显式降级边界不一致".to_owned());
     }
     Ok(json!({
-        "adapter_count": 3,
+        "adapter_count": 4,
         "audited_event_count": records.len(),
         "per_delivery_event_count": per_delivery_events.len(),
         "capabilities_hash": hash_json(&capabilities).map_err(display_error)?,
@@ -1105,7 +1113,7 @@ fn case_stop_loop_boundedness(root: &Path) -> Result<Value, String> {
             return Err("vendor loop active 时 Stop 没有确定性放行，存在自递归风险".to_owned());
         }
     }
-    let prime_output = prime::handle_with_provider_trust(
+    let pi_output = pi::handle_with_provider_trust(
         &case_root,
         &config,
         &store,
@@ -1113,14 +1121,26 @@ fn case_stop_loop_boundedness(root: &Path) -> Result<Value, String> {
         HookEvent::Stop,
         &first,
     );
-    if prime_output.0.pointer("/continuation/supported") != Some(&json!(false)) {
-        return Err("Prime Agent 被错误声明为支持 Stop continuation".to_owned());
+    if pi_output.0.pointer("/continuation/supported") != Some(&json!(true)) {
+        return Err("PI 未声明已验证的 Stop continuation".to_owned());
+    }
+    let opencode_output = opencode::handle_with_provider_trust(
+        &case_root,
+        &config,
+        &store,
+        &provider_trust,
+        HookEvent::Stop,
+        &first,
+    );
+    if opencode_output.0.pointer("/continuation/supported") != Some(&json!(false)) {
+        return Err("opencode 被错误声明为支持 Stop continuation".to_owned());
     }
     Ok(json!({
         "initial_continue_request_count": 1,
         "vendor_loop_active_allow_count": 20,
         "maximum_project_brain_owned_reentry": 1,
-        "prime_continuation_supported": false,
+            "pi_continuation_mode": "emulated",
+        "opencode_continuation_supported": false,
     }))
 }
 
@@ -1231,8 +1251,9 @@ fn current_target() -> Result<QualificationTarget, AppError> {
         "database_schema_version": DATABASE_SCHEMA_VERSION,
         "adapters": {
             "codex": codex::capabilities(),
-            "claude_code": claude::capabilities(),
-            "prime_agent": prime::capabilities(),
+            "pi": pi::capabilities(),
+            "opencode": opencode::capabilities(),
+            "dsh": dsh::capabilities(),
         }
     }))?;
     let mut target = QualificationTarget {

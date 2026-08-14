@@ -5,13 +5,13 @@ use std::{
 };
 
 use brain_evidence::{
-    ArtifactNode, EvidenceAuthority, EvidenceCoverage, EvidenceFinding, EvidencePlane,
-    EvidenceProvider, EvidenceReference, EvidenceSnapshot, FindingAuthority, FindingSeverity,
-    content_fingerprint,
+    ArtifactNode, EvidenceAuthority, EvidenceCoverage, EvidenceFinding, EvidenceInputManifestV1,
+    EvidencePlane, EvidenceProvider, EvidenceReference, EvidenceSnapshot, FindingAuthority,
+    FindingSeverity, content_fingerprint,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{artifact_store, error::AppError, git, provider};
+use crate::{artifact_store, error::AppError, evidence_inputs, git, provider};
 
 const BUILD_RUN_SCHEMA_VERSION: u32 = 1;
 const BUILD_CONTRACT_VERSION: u16 = 2;
@@ -62,6 +62,7 @@ pub struct BuildRunReport {
     runtime_artifact_bundle: Option<artifact_store::RuntimeArtifactBundleReceipt>,
     status: &'static str,
     evidence: EvidenceSnapshot,
+    input_manifest: EvidenceInputManifestV1,
 }
 
 impl BuildRunReport {
@@ -71,6 +72,10 @@ impl BuildRunReport {
 
     pub fn succeeded(&self) -> bool {
         self.status == "succeeded"
+    }
+
+    pub fn input_manifest(&self) -> &EvidenceInputManifestV1 {
+        &self.input_manifest
     }
 }
 
@@ -141,7 +146,7 @@ pub fn run_dotnet(request: &BuildRequest<'_>) -> Result<BuildRunReport, AppError
     let bin_debug = bin.join("Debug");
     let obj = artifacts.join("obj");
     let obj_debug = obj.join("Debug");
-    prepare_dotnet_restore_state(&root, &target, &obj, !request.upstream.is_empty())?;
+    prepare_dotnet_restore_state(&root, &target, &obj)?;
     let target_display = project_relative_path(&root, &target)?;
     let argv = vec![
         "build".to_owned(),
@@ -153,10 +158,6 @@ pub fn run_dotnet(request: &BuildRequest<'_>) -> Result<BuildRunReport, AppError
         "--disable-build-servers".to_owned(),
         "--artifacts-path".to_owned(),
         provider::provider_cli_path(&artifacts),
-        format!(
-            "--property:GodotProjectDir={}",
-            provider::provider_cli_path(&root)
-        ),
         format!("--property:BaseOutputPath={}", dotnet_directory_path(&bin)),
         format!(
             "--property:OutputPath={}",
@@ -201,16 +202,11 @@ fn prepare_dotnet_restore_state(
     root: &Path,
     target: &Path,
     destination: &Path,
-    godot_layout: bool,
 ) -> Result<(), AppError> {
-    let source = if godot_layout {
-        root.join(".godot").join("mono").join("temp").join("obj")
-    } else {
-        target
-            .parent()
-            .ok_or_else(|| AppError::Provider(".NET project 没有父目录".to_owned()))?
-            .join("obj")
-    };
+    let source = target
+        .parent()
+        .ok_or_else(|| AppError::Provider(".NET project 没有父目录".to_owned()))?
+        .join("obj");
     if !source.is_dir() {
         return Ok(());
     }
@@ -533,6 +529,27 @@ fn run_build(
     };
     let contract_bytes = serde_json::to_vec(&contract)?;
     let provider_id = format!("{adapter}.{}", request.profile_id);
+    let input_contract = if adapter == "python-compile" {
+        evidence_inputs::python_compile_contract(
+            request.project_key,
+            request.profile_id,
+            target_display,
+            u32::from(BUILD_CONTRACT_VERSION),
+        )?
+    } else {
+        evidence_inputs::conservative_repository_contract(
+            request.project_key,
+            request.profile_id,
+            adapter,
+            u32::from(BUILD_CONTRACT_VERSION),
+        )?
+    };
+    let input_manifest = evidence_inputs::resolve_stable(root, &input_contract)?;
+    if input_manifest.source_fingerprint_at_creation != source_after {
+        return Err(AppError::Provider(
+            "Build Evidence input manifest 与 Build 完成 Source fingerprint 不一致".to_owned(),
+        ));
+    }
     let mut artifacts = vec![
         ArtifactNode::from_provider_key(
             request.project_key,
@@ -625,6 +642,7 @@ fn run_build(
         runtime_artifact_bundle,
         status,
         evidence,
+        input_manifest,
     })
 }
 
@@ -962,7 +980,7 @@ mod tests {
 
     #[test]
     fn build_profile_identity_is_bounded_and_shell_free() {
-        assert!(validate_profile_id("godot-debug").is_ok());
+        assert!(validate_profile_id("dotnet-debug").is_ok());
         assert!(validate_profile_id("bad/profile").is_err());
         assert!(validate_profile_id("x;echo").is_err());
     }
@@ -1012,8 +1030,7 @@ mod tests {
         fs::write(source.join("game.csproj.nuget.g.props"), b"props").unwrap();
         fs::write(source.join("generated.dll"), b"not restore state").unwrap();
 
-        prepare_dotnet_restore_state(&root, &root.join("game.csproj"), &destination, false)
-            .unwrap();
+        prepare_dotnet_restore_state(&root, &root.join("game.csproj"), &destination).unwrap();
 
         assert!(destination.join("project.assets.json").is_file());
         assert!(destination.join("game.csproj.nuget.g.props").is_file());

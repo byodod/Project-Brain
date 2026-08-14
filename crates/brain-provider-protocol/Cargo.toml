@@ -1,5 +1,5 @@
 [package]
-name = "brain-godot"
+name = "brain-provider-protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ authors.workspace = true
 [dependencies]
 brain-evidence = { path = "../brain-evidence" }
 serde.workspace = true
-sha2.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [lints]

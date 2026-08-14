@@ -2,23 +2,25 @@ mod analyze;
 mod app;
 mod artifact_store;
 mod build;
-mod claude;
 mod codex;
 mod database;
+mod dsh;
 mod error;
 mod evidence;
+mod evidence_inputs;
+mod evidence_provider;
 mod execution;
 mod git;
-mod godot;
 mod index;
-mod prime;
+mod opencode;
+mod pi;
 mod protocol;
 mod provider;
 mod qualification;
 mod reconcile;
-mod runtime;
 mod scip_index;
 mod setup;
+mod source_stage;
 mod test;
 
 use std::{path::PathBuf, process::ExitCode};
@@ -43,13 +45,21 @@ struct Cli {
     #[arg(long, global = true)]
     codex_home: Option<PathBuf>,
 
-    /// Claude Code 配置根；省略时使用 `CLAUDE_CONFIG_DIR` 或 `~/.claude`
+    /// PI 配置根；省略时使用 `PI_CODING_AGENT_DIR` 或 `~/.pi/agent`
     #[arg(long, global = true)]
-    claude_home: Option<PathBuf>,
+    pi_home: Option<PathBuf>,
 
-    /// Prime Agent 配置根；省略时使用 `PRIME_AGENT_CODING_AGENT_DIR` 或 `~/.prime/agent`
+    /// opencode 配置根；省略时使用 `OPENCODE_CONFIG_DIR` 或 `~/.config/opencode`
     #[arg(long, global = true)]
-    prime_home: Option<PathBuf>,
+    opencode_home: Option<PathBuf>,
+
+    /// dsh 配置根；省略时使用 `DSH_HOME` 或 `~/.dsh`
+    #[arg(long, global = true)]
+    dsh_home: Option<PathBuf>,
+
+    /// dsh profile 名称；安装、卸载和 doctor dsh 时必须显式指定
+    #[arg(long, global = true)]
+    dsh_profile: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -268,16 +278,16 @@ enum EvidenceCommand {
     /// 查看当前项目已持久化 Evidence heads 及 fresh/stale 状态
     Status,
 
-    /// 使用锁定的 Godot 4 editor 实际导入并加载项目资源
-    Godot {
-        /// Godot 4 editor/console binary 的机器绝对路径
-        #[arg(long)]
-        executable: PathBuf,
-        /// 确认信任此机器本地 executable；Hook 不会自动提供此参数
-        #[arg(long)]
-        trust_local_executable: bool,
-        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
-        timeout_seconds: u64,
+    /// 查看 Evidence head 的输入依赖合同与不可变解析清单
+    Inputs {
+        #[command(subcommand)]
+        command: EvidenceInputsCommand,
+    },
+
+    /// 管理并运行进程隔离、机器绑定的通用 Evidence Provider
+    Provider {
+        #[command(subcommand)]
+        command: EvidenceProviderCommand,
     },
 
     /// 使用固定工具链合同生成 Build Evidence；不会运行测试、应用或导出
@@ -291,22 +301,55 @@ enum EvidenceCommand {
         #[command(subcommand)]
         command: TestEvidenceCommand,
     },
+}
 
-    /// 从已验证 Build bundle 的精确字节运行隔离 Godot headless Runtime；绝不构建或导出
-    Runtime {
-        /// Build Evidence 中的 content-addressed `RuntimeArtifactBundle` fingerprint
+#[derive(Debug, Subcommand)]
+enum EvidenceProviderCommand {
+    /// 将项目 profile 绑定到固定 SHA-256 的机器本地 Provider executable
+    Bind {
         #[arg(long)]
-        bundle: String,
-        /// Godot 4 editor/console binary 的机器绝对路径
+        profile: String,
         #[arg(long)]
         executable: PathBuf,
+        #[arg(long, value_enum, default_value_t = EvidenceAuthorityArg::Heuristic)]
+        authority_ceiling: EvidenceAuthorityArg,
+        #[arg(long)]
+        replace: bool,
         #[arg(long)]
         trust_local_executable: bool,
-        /// headless 主场景最多处理的迭代帧数
-        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(1..=3600))]
-        quit_after: u32,
-        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=120))]
         timeout_seconds: u64,
+    },
+    /// 删除当前项目的一个机器级 Evidence Provider 绑定
+    Unbind {
+        #[arg(long)]
+        profile: String,
+    },
+    /// 查看当前项目的 Evidence Provider 绑定与漂移状态
+    List,
+    /// 解析输入合同、隔离 staging、运行 Provider 并事务化保存 Evidence
+    Run {
+        #[arg(long)]
+        profile: String,
+        #[arg(long, value_enum)]
+        plane: EvidencePlaneArg,
+        #[arg(long)]
+        contract: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum EvidenceInputsCommand {
+    /// 按 plane 与 provider ID 查看当前 head 的完整输入清单
+    Show {
+        #[arg(long, value_enum)]
+        plane: EvidencePlaneArg,
+        #[arg(long)]
+        provider: String,
     },
 }
 
@@ -322,9 +365,6 @@ enum BuildEvidenceCommand {
         /// 项目内单个 .csproj 路径；v1 不接受多项目 .sln
         #[arg(long)]
         target: PathBuf,
-        /// Godot C# 等项目要求引用当前 fresh Engine Evidence
-        #[arg(long)]
-        require_engine: bool,
         #[arg(long)]
         trust_local_executable: bool,
         #[arg(long)]
@@ -432,33 +472,6 @@ enum TestEvidenceCommand {
         trust_local_executable: bool,
         #[arg(long)]
         trust_repository_test_code: bool,
-        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
-        timeout_seconds: u64,
-    },
-
-    /// 固定运行仓库内 Godot .tscn，并读取受限结构化断言结果；不会构建、还原或导出
-    Godot {
-        #[arg(long)]
-        profile: String,
-        /// 必须对应当前 `dotnet-build.<profile>` Evidence head
-        #[arg(long)]
-        build_profile: String,
-        /// Godot 4 editor/console binary 的机器绝对路径
-        #[arg(long)]
-        executable: PathBuf,
-        /// 与 Build bundle 绑定的项目内 .csproj
-        #[arg(long)]
-        target: PathBuf,
-        /// 项目内单个 .tscn 场景；场景必须写出固定的结构化结果文件
-        #[arg(long)]
-        scenario: PathBuf,
-        #[arg(long)]
-        trust_local_executable: bool,
-        #[arg(long)]
-        trust_repository_test_code: bool,
-        /// headless 测试场景最多处理的迭代帧数
-        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u32).range(1..=36000))]
-        quit_after: u32,
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
     },
@@ -659,6 +672,44 @@ enum LineageStateArg {
     Invalidated,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EvidencePlaneArg {
+    Source,
+    Semantic,
+    Engine,
+    Build,
+    Test,
+    Runtime,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EvidenceAuthorityArg {
+    Deterministic,
+    Heuristic,
+}
+
+impl From<EvidenceAuthorityArg> for brain_evidence::EvidenceAuthority {
+    fn from(value: EvidenceAuthorityArg) -> Self {
+        match value {
+            EvidenceAuthorityArg::Deterministic => Self::Deterministic,
+            EvidenceAuthorityArg::Heuristic => Self::Heuristic,
+        }
+    }
+}
+
+impl From<EvidencePlaneArg> for brain_evidence::EvidencePlane {
+    fn from(value: EvidencePlaneArg) -> Self {
+        match value {
+            EvidencePlaneArg::Source => Self::Source,
+            EvidencePlaneArg::Semantic => Self::Semantic,
+            EvidencePlaneArg::Engine => Self::Engine,
+            EvidencePlaneArg::Build => Self::Build,
+            EvidencePlaneArg::Test => Self::Test,
+            EvidencePlaneArg::Runtime => Self::Runtime,
+        }
+    }
+}
+
 impl From<LineageStateArg> for brain_symbols::LineageState {
     fn from(value: LineageStateArg) -> Self {
         match value {
@@ -699,18 +750,31 @@ fn main() -> ExitCode {
         Command::InstallHooks { agent } => {
             let agent_home = match agent {
                 AgentKind::Codex => cli.codex_home.as_deref(),
-                AgentKind::ClaudeCode => cli.claude_home.as_deref(),
-                AgentKind::PrimeAgent => cli.prime_home.as_deref(),
+                AgentKind::Pi => cli.pi_home.as_deref(),
+                AgentKind::Opencode => cli.opencode_home.as_deref(),
+                AgentKind::Dsh => cli.dsh_home.as_deref(),
             };
-            App::install_hooks(cli.install_root.as_deref(), agent_home, agent)
+            App::install_hooks(
+                cli.install_root.as_deref(),
+                agent_home,
+                cli.dsh_profile.as_deref(),
+                agent,
+            )
         }
         Command::UninstallHooks { agent, force } => {
             let agent_home = match agent {
                 AgentKind::Codex => cli.codex_home.as_deref(),
-                AgentKind::ClaudeCode => cli.claude_home.as_deref(),
-                AgentKind::PrimeAgent => cli.prime_home.as_deref(),
+                AgentKind::Pi => cli.pi_home.as_deref(),
+                AgentKind::Opencode => cli.opencode_home.as_deref(),
+                AgentKind::Dsh => cli.dsh_home.as_deref(),
             };
-            App::uninstall_hooks(cli.install_root.as_deref(), agent_home, agent, force)
+            App::uninstall_hooks(
+                cli.install_root.as_deref(),
+                agent_home,
+                cli.dsh_profile.as_deref(),
+                agent,
+                force,
+            )
         }
         Command::Dispatch { agent, event } => {
             App::dispatch_hook(cli.install_root.as_deref(), agent, event)
@@ -721,14 +785,16 @@ fn main() -> ExitCode {
         } => {
             let agent_home = match agent {
                 AgentKind::Codex => cli.codex_home.as_deref(),
-                AgentKind::ClaudeCode => cli.claude_home.as_deref(),
-                AgentKind::PrimeAgent => cli.prime_home.as_deref(),
+                AgentKind::Pi => cli.pi_home.as_deref(),
+                AgentKind::Opencode => cli.opencode_home.as_deref(),
+                AgentKind::Dsh => cli.dsh_home.as_deref(),
             };
             App::open(cli.project_root).and_then(|app| {
                 app.doctor(
                     cli.install_root.as_deref(),
                     agent,
                     agent_home,
+                    cli.dsh_profile.as_deref(),
                     require_qualified,
                 )
             })
@@ -800,17 +866,54 @@ fn main() -> ExitCode {
         Command::Evidence { command } => {
             App::open(cli.project_root).and_then(|app| match command {
                 EvidenceCommand::Status => app.evidence_status(),
-                EvidenceCommand::Godot {
-                    executable,
-                    trust_local_executable,
-                    timeout_seconds,
-                } => app.evidence_godot(&executable, trust_local_executable, timeout_seconds),
+                EvidenceCommand::Inputs { command } => match command {
+                    EvidenceInputsCommand::Show { plane, provider } => {
+                        app.evidence_inputs_show(plane.into(), &provider)
+                    }
+                },
+                EvidenceCommand::Provider { command } => match command {
+                    EvidenceProviderCommand::Bind {
+                        profile,
+                        executable,
+                        authority_ceiling,
+                        replace,
+                        trust_local_executable,
+                        timeout_seconds,
+                    } => app.evidence_provider_bind(
+                        cli.install_root.as_deref(),
+                        &profile,
+                        &executable,
+                        authority_ceiling.into(),
+                        replace,
+                        trust_local_executable,
+                        timeout_seconds,
+                    ),
+                    EvidenceProviderCommand::Unbind { profile } => {
+                        app.evidence_provider_unbind(cli.install_root.as_deref(), &profile)
+                    }
+                    EvidenceProviderCommand::List => {
+                        app.evidence_provider_list(cli.install_root.as_deref())
+                    }
+                    EvidenceProviderCommand::Run {
+                        profile,
+                        plane,
+                        contract,
+                        config,
+                        timeout_seconds,
+                    } => app.evidence_provider_run(
+                        cli.install_root.as_deref(),
+                        &profile,
+                        plane.into(),
+                        &contract,
+                        config.as_deref(),
+                        timeout_seconds,
+                    ),
+                },
                 EvidenceCommand::Build { command } => match command {
                     BuildEvidenceCommand::Dotnet {
                         profile,
                         executable,
                         target,
-                        require_engine,
                         trust_local_executable,
                         trust_repository_build_code,
                         timeout_seconds,
@@ -819,7 +922,6 @@ fn main() -> ExitCode {
                         &executable,
                         &profile,
                         &target,
-                        require_engine,
                         trust_local_executable,
                         trust_repository_build_code,
                         timeout_seconds,
@@ -912,43 +1014,7 @@ fn main() -> ExitCode {
                         trust_repository_test_code,
                         timeout_seconds,
                     ),
-                    TestEvidenceCommand::Godot {
-                        profile,
-                        build_profile,
-                        executable,
-                        target,
-                        scenario,
-                        trust_local_executable,
-                        trust_repository_test_code,
-                        quit_after,
-                        timeout_seconds,
-                    } => app.evidence_test_godot(
-                        cli.install_root.as_deref(),
-                        &executable,
-                        &profile,
-                        &build_profile,
-                        &target,
-                        &scenario,
-                        trust_local_executable,
-                        trust_repository_test_code,
-                        quit_after,
-                        timeout_seconds,
-                    ),
                 },
-                EvidenceCommand::Runtime {
-                    bundle,
-                    executable,
-                    trust_local_executable,
-                    quit_after,
-                    timeout_seconds,
-                } => app.evidence_runtime_godot(
-                    cli.install_root.as_deref(),
-                    &bundle,
-                    &executable,
-                    trust_local_executable,
-                    quit_after,
-                    timeout_seconds,
-                ),
             })
         }
         Command::Lineage { command } => {

@@ -1,35 +1,31 @@
-# ADR-0002：Agent adapter 统一到事件专属的内部 Hook 协议
+# ADR-0002：内部 Hook 协议与能力模型
 
-- 状态：Accepted
-- 日期：2026-08-13
+## 状态
+
+Accepted；四适配器最终范围由 ADR-0038 固定。
 
 ## 背景
 
-Codex、Claude Code 与 Prime Agent 的生命周期和控制能力不对称。vendor JSON 中相同的
-`block` 字样可能分别表示拒绝工具、阻止输入或要求 Agent 继续工作，不能成为核心语义。
+Codex、PI、opencode、dsh 的生命周期事件、身份字段和控制能力不对称。直接让规则内核理解 vendor JSON 会把同一治理语义复制四次，并诱发能力伪装。
 
 ## 决策
 
-Project Brain v1 公共边界仅包含 `SessionOpened`、`IntentDeclared`、`ToolAboutToRun`、
-`ToolFinished` 与 `TaskStopping`。Outcome 也按事件区分：gate 使用 `NoVeto | Deny`，
-工具执行后只产生 feedback，停止阶段使用 `AllowStop | ContinueWork`。
-
-`NoVeto` 永远不表示替用户批准 vendor permission。Adapter 只转换协议和能力，不重新解释规则。
-Codex/Claude Code/Prime Agent 的能力通过显式 capability model 表达；不支持的能力必须报告
-`unsupported`。
-
-V3a 的 `IntentDeclared` 只做规范化和审计，不把 prompt 强塞进文件动作规则引擎。Codex adapter
-因此报告 `deny_intent=unsupported`，直到独立意图规则具备确定性 authority/scope 契约。
+1. 采用 `InternalHookEvent v1` 与 `InternalHookOutcome v1`；
+2. Adapter 只负责原生协议与内部协议映射；
+3. adapter identity、version、event/session/operation 命名空间完全隔离；
+4. 能力使用 `supported|unsupported` 明确表达；
+5. 无原生 continuation 契约的 Agent 不通过普通消息模拟 Stop 续轮；
+6. 未知协议版本、缺失身份或同 event ID 不同 payload 全部拒绝。
 
 ## 结果
 
-- 核心不依赖任何 vendor 的 block JSON。
-- Pre 与 Post 通过 operation ID 相关，而不是全局先后状态机。
-- 本阶段只迁移 Codex；Claude Code 与 Prime Agent 等协议经真实使用验证后再加入。
-- rust-analyzer/SCIP、稳定 lineage、symbol-scoped rules 与 LLM 不属于本决策的实现范围。
+- 规则内核只实现一次；
+- 同一事件可跨 Agent 重放比较，但不会跨域去重；
+- 新能力必须先有真实原生契约和 fixture，不能为矩阵对称而加入。
 
-## 依据
+## 验证
 
-- Codex Hooks：<https://developers.openai.com/codex/hooks>（访问：2026-08-13）
-- Claude Code Hooks：<https://code.claude.com/docs/en/hooks>（访问：2026-08-13）
-- Prime Agent：<https://github.com/PrimeIntellect-ai/prime-agent>（访问：2026-08-13）
+- 每个 adapter 的 pre-tool block 黑盒 fixture；
+- capability matrix 精确断言；
+- 相同 event 幂等、碰撞拒绝与 adapter 域隔离测试；
+- 不支持 continuation 的 adapter 明确返回 unsupported。

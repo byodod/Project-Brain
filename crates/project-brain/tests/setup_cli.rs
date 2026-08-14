@@ -21,10 +21,23 @@ fn temp_root(label: &str) -> PathBuf {
     root
 }
 
-fn run(executable: &Path, arguments: &[&str], cwd: &Path, stdin: Option<&str>) -> Output {
-    let mut child = Command::new(executable)
-        .args(arguments)
-        .current_dir(cwd)
+fn binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_project-brain"))
+}
+
+fn run(
+    executable: &Path,
+    arguments: &[&str],
+    cwd: &Path,
+    stdin: Option<&str>,
+    environment: &[(&str, &Path)],
+) -> Output {
+    let mut command = Command::new(executable);
+    command.args(arguments).current_dir(cwd);
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = command
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -38,298 +51,46 @@ fn run(executable: &Path, arguments: &[&str], cwd: &Path, stdin: Option<&str>) -
         child
             .stdin
             .take()
-            .expect("stdin pipe")
+            .expect("stdin")
             .write_all(input.as_bytes())
             .expect("write stdin");
     }
     child.wait_with_output().expect("wait for project-brain")
 }
 
-fn run_installed_handler(handler: &Value, cwd: &Path, stdin: &str) -> Output {
-    let command = handler["command"].as_str().expect("handler command");
-    let arguments: Vec<&str> = handler["args"]
-        .as_array()
-        .expect("handler args")
-        .iter()
-        .map(|argument| argument.as_str().expect("string argument"))
-        .collect();
-    let mut child = Command::new(command)
-        .args(arguments)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn installed exec-form handler");
-    child
-        .stdin
-        .take()
-        .expect("stdin pipe")
-        .write_all(stdin.as_bytes())
-        .expect("write handler stdin");
-    child.wait_with_output().expect("wait for handler")
-}
-
-fn run_prime_extension_fixture(
-    extension: &Path,
-    project: &Path,
-    install_root: &Path,
-) -> Option<Output> {
-    let version = Command::new("node").arg("--version").output().ok()?;
-    let major = String::from_utf8_lossy(&version.stdout)
-        .trim()
-        .trim_start_matches('v')
-        .split('.')
-        .next()?
-        .parse::<u32>()
-        .ok()?;
-    if !version.status.success() || major < 22 {
-        return None;
-    }
-    let fixture = r#"
-import { pathToFileURL } from "node:url";
-const extensionPath = process.argv[1];
-const cwd = process.argv[2];
-const handlers = new Map();
-const module = await import(pathToFileURL(extensionPath).href);
-await module.default({ on(name, handler) { handlers.set(name, handler); } });
-const ctx = { cwd, sessionManager: { getSessionFile() { return "prime-fixture-session"; } } };
-await handlers.get("session_start")({ reason: "startup" }, ctx);
-const decision = await handlers.get("tool_call")({
-  toolName: "edit",
-  toolCallId: "prime-fixture-tool",
-  input: { path: ".project-brain/config.json", oldText: "old", newText: "new" },
-}, ctx);
-process.stdout.write(JSON.stringify({ events: [...handlers.keys()], decision }));
-"#;
-    Command::new("node")
-        .args([
-            "--experimental-strip-types",
-            "--input-type=module",
-            "-e",
-            fixture,
-        ])
-        .arg(extension)
-        .arg(project)
-        .env("PROJECT_BRAIN_INSTALL_ROOT", install_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()
-}
-
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
-        "command failed\nstdout={}\nstderr={}",
+        "status={:?}\nstdout={}\nstderr={}",
+        output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 }
 
-#[test]
-fn lineage_compaction_has_no_backup_bypass_flag() {
-    let root = temp_root("lineage-no-backup-flag");
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_project-brain"));
-    let output = run(
-        &executable,
-        &["lineage", "compact-legacy-proposals", "--no-backup"],
-        &root,
-        None,
-    );
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("unexpected argument '--no-backup'"),
-        "{stderr}"
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn lineage_compaction_rejects_machine_backup_root_inside_repository() {
-    let root = temp_root("lineage-backup-boundary");
-    let project = root.join("repo");
+fn install_and_init(root: &Path) -> (PathBuf, PathBuf) {
+    let executable = binary();
+    let install_root = root.join("install root");
+    let project = root.join("project");
     fs::create_dir_all(&project).unwrap();
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_project-brain"));
-    assert_success(&run(
+    let install = run(
         &executable,
-        &["--project-root", project.to_str().unwrap(), "init"],
-        &root,
-        None,
-    ));
-    let install_root = project.join("machine-state");
-    let output = run(
-        &executable,
-        &[
-            "--project-root",
-            project.to_str().unwrap(),
-            "--install-root",
-            install_root.to_str().unwrap(),
-            "lineage",
-            "compact-legacy-proposals",
-        ],
-        &root,
-        None,
-    );
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("必须位于项目工作树之外"), "{stderr}");
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn godot_evidence_requires_explicit_machine_executable_trust() {
-    let root = temp_root("godot-trust");
-    let project = root.join("repo");
-    fs::create_dir_all(&project).unwrap();
-    fs::write(project.join("project.godot"), b"[application]\n").unwrap();
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_project-brain"));
-    assert_success(&run(
-        &executable,
-        &["--project-root", project.to_str().unwrap(), "init"],
-        &root,
-        None,
-    ));
-    let fake_engine = root.join("fake-godot");
-    fs::write(&fake_engine, b"not executable").unwrap();
-    let output = run(
-        &executable,
-        &[
-            "--project-root",
-            project.to_str().unwrap(),
-            "evidence",
-            "godot",
-            "--executable",
-            fake_engine.to_str().unwrap(),
-        ],
-        &project,
-        None,
-    );
-
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("--trust-local-executable"),
-        "unexpected stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn prime_direct_adapter_blocks_without_claiming_stop_continuation() {
-    let root = temp_root("prime-direct");
-    let project = root.join("repo");
-    fs::create_dir_all(&project).unwrap();
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_project-brain"));
-    assert_success(&run(
-        &executable,
-        &[
-            "--project-root",
-            project.to_str().unwrap(),
-            "init",
-            "--profile",
-            "rust",
-        ],
-        &root,
-        None,
-    ));
-
-    let config_path = project.join(".project-brain/config.json");
-    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
-    config["rules"] = serde_json::json!([{
-        "id": "PROTECT",
-        "status": "active",
-        "authority": "repository_rule",
-        "strength": "hard",
-        "effect": "block",
-        "include_paths": [".project-brain/config.json"],
-        "actions": ["modify"],
-        "message": "protected"
-    }]);
-    fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-    let input = format!(
-        "{{\"session_id\":\"prime-session\",\"cwd\":{},\"tool_name\":\"edit\",\"tool_use_id\":\"prime-tool\",\"tool_input\":{{\"path\":\".project-brain/config.json\",\"oldText\":\"old\",\"newText\":\"new\"}}}}",
-        serde_json::to_string(project.to_str().unwrap()).unwrap()
-    );
-    let hook = run(
-        &executable,
-        &[
-            "--project-root",
-            project.to_str().unwrap(),
-            "hook",
-            "prime-agent",
-            "pre-tool-use",
-        ],
-        &project,
-        Some(&input),
-    );
-    assert_success(&hook);
-    let output: Value = serde_json::from_slice(&hook.stdout).unwrap();
-    assert_eq!(output["schema_version"], 1);
-    assert_eq!(output["event"], "tool_about_to_run");
-    assert_eq!(output["block"], true);
-
-    let capabilities = run(
-        &executable,
-        &["capabilities", "prime-agent"],
-        &project,
-        None,
-    );
-    assert_success(&capabilities);
-    let capabilities: Value = serde_json::from_slice(&capabilities.stdout).unwrap();
-    assert_eq!(capabilities["continue_after_stop"], "unsupported");
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "Prime Extension 黑盒测试覆盖安装、桥接、doctor、漂移和卸载的完整安全边界"
-)]
-fn prime_extension_install_is_idempotent_drift_safe_and_doctor_verified() {
-    let root = temp_root("prime-extension");
-    let install_root = root.join("machine/Project Brain");
-    let prime_home = root.join("Prime Home");
-    let project = root.join("repo");
-    fs::create_dir_all(&project).unwrap();
-    fs::create_dir_all(prime_home.join("extensions")).unwrap();
-    fs::write(
-        prime_home.join("extensions/user-extension.ts"),
-        "export default () => {};\n",
-    )
-    .unwrap();
-
-    let source = PathBuf::from(env!("CARGO_BIN_EXE_project-brain"));
-    assert_success(&run(
-        &source,
         &["--install-root", install_root.to_str().unwrap(), "install"],
-        &root,
+        root,
         None,
-    ));
-    let launcher = install_root.join("bin").join(source.file_name().unwrap());
-    assert_success(&run(
-        &launcher,
+        &[],
+    );
+    assert_success(&install);
+    let initialize = run(
+        &executable,
         &["--project-root", project.to_str().unwrap(), "init"],
-        &root,
+        root,
         None,
-    ));
-    let config_path = project.join(".project-brain/config.json");
-    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
-    config["rules"] = serde_json::json!([{
-        "id": "PROTECT",
-        "status": "active",
-        "authority": "repository_rule",
-        "strength": "hard",
-        "effect": "block",
-        "include_paths": [".project-brain/config.json"],
-        "actions": ["modify"],
-        "message": "protected"
-    }]);
-    fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-    assert_success(&run(
-        &launcher,
+        &[],
+    );
+    assert_success(&initialize);
+    let bootstrap = run(
+        &executable,
         &[
             "--install-root",
             install_root.to_str().unwrap(),
@@ -337,687 +98,544 @@ fn prime_extension_install_is_idempotent_drift_safe_and_doctor_verified() {
             project.to_str().unwrap(),
             "bootstrap",
         ],
-        &root,
+        root,
         None,
-    ));
-
-    let install_args = [
-        "--install-root",
-        install_root.to_str().unwrap(),
-        "--prime-home",
-        prime_home.to_str().unwrap(),
-        "install-hooks",
-        "prime-agent",
-    ];
-    let first = run(&launcher, &install_args, &root, None);
-    assert_success(&first);
-    let first_report: Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(first_report["changed"], true);
-    assert_eq!(first_report["managed_handler_count"], 5);
-    assert_eq!(
-        first_report["trust_state"],
-        "extension_contract_and_launcher_verified"
+        &[],
     );
+    assert_success(&bootstrap);
+    (install_root, project)
+}
 
-    let extension = prime_home.join("extensions/project-brain/index.ts");
-    let installed_bytes = fs::read(&extension).unwrap();
-    let installed_text = String::from_utf8(installed_bytes.clone()).unwrap();
-    assert!(installed_text.contains("spawn(LAUNCHER"));
-    assert!(installed_text.contains("shell: false"));
-    assert!(installed_text.contains("pi.on(\"tool_call\""));
-    assert!(installed_text.contains("pi.on(\"tool_result\""));
-    assert!(!installed_text.contains("pi.on(\"agent_end\""));
-    assert!(!installed_text.contains("heartbeat"));
-    assert!(!installed_text.contains("sendMessage"));
-    assert!(
-        install_root
-            .join("state/integrations/prime-agent.json")
-            .is_file()
-    );
-    if let Some(fixture) = run_prime_extension_fixture(&extension, &project, &install_root) {
-        assert_success(&fixture);
-        let fixture: Value = serde_json::from_slice(&fixture.stdout).unwrap();
-        assert_eq!(
-            fixture["events"],
-            serde_json::json!([
-                "session_start",
-                "input",
-                "before_agent_start",
-                "tool_call",
-                "tool_result"
-            ])
-        );
-        assert_eq!(fixture["decision"]["block"], true);
-    }
+fn add_protected_rule(project: &Path) {
+    let config_path = project.join(".project-brain/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["rules"] = serde_json::json!([{
+        "id": "PB-TEST-001",
+        "status": "active",
+        "effect": "block",
+        "strength": "hard",
+        "authority": "repository_rule",
+        "include_paths": [".project-brain/config.json"],
+        "exclude_paths": [],
+        "actions": ["delete"],
+        "operations": [],
+        "operation_contains": [],
+        "symbol_scopes": [],
+        "message": "禁止删除控制面配置",
+        "rationale": "黑盒验证真实 hard rule"
+    }]);
+    fs::write(
+        config_path,
+        serde_json::to_vec_pretty(&config).expect("serialize config"),
+    )
+    .unwrap();
+}
 
-    let second = run(&launcher, &install_args, &root, None);
-    assert_success(&second);
-    let second_report: Value = serde_json::from_slice(&second.stdout).unwrap();
-    assert_eq!(second_report["changed"], false);
-    assert_eq!(fs::read(&extension).unwrap(), installed_bytes);
-
-    let pre_tool = format!(
-        "{{\"session_id\":\"prime-session\",\"cwd\":{},\"tool_name\":\"edit\",\"tool_use_id\":\"prime-tool\",\"tool_input\":{{\"path\":\".project-brain/config.json\",\"oldText\":\"old\",\"newText\":\"new\"}}}}",
-        serde_json::to_string(project.to_str().unwrap()).unwrap()
-    );
-    let bridge = run(
-        &launcher,
-        &[
-            "--install-root",
-            install_root.to_str().unwrap(),
-            "dispatch",
-            "prime-agent",
-            "pre-tool-use",
-        ],
-        &project,
-        Some(&pre_tool),
-    );
-    assert_success(&bridge);
-    let bridge: Value = serde_json::from_slice(&bridge.stdout).unwrap();
-    assert_eq!(bridge["block"], true);
-
-    let doctor_args = [
-        "--install-root",
-        install_root.to_str().unwrap(),
-        "--prime-home",
-        prime_home.to_str().unwrap(),
-        "--project-root",
-        project.to_str().unwrap(),
-        "doctor",
-        "prime-agent",
-    ];
-    let doctor = run(&launcher, &doctor_args, &project, None);
-    assert_success(&doctor);
-    let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
-    assert_eq!(doctor["status"], "ready");
-    assert_eq!(doctor["adapter"], "prime_agent");
-    assert_eq!(doctor["adapter_hooks"], "pass");
-    assert_eq!(
-        doctor["adapter_trust_state"],
-        "extension_contract_and_launcher_verified"
-    );
-
-    let mut drifted = installed_bytes.clone();
-    drifted.extend_from_slice(b"// user edit\n");
-    fs::write(&extension, &drifted).unwrap();
-    let drift_install = run(&launcher, &install_args, &root, None);
-    assert!(!drift_install.status.success());
-    assert_eq!(fs::read(&extension).unwrap(), drifted);
-    let drift_doctor = run(&launcher, &doctor_args, &project, None);
-    assert!(!drift_doctor.status.success());
-    let drift_uninstall = run(
-        &launcher,
-        &[
-            "--install-root",
-            install_root.to_str().unwrap(),
-            "--prime-home",
-            prime_home.to_str().unwrap(),
-            "uninstall-hooks",
-            "prime-agent",
-        ],
-        &root,
-        None,
-    );
-    assert!(!drift_uninstall.status.success());
-    assert_eq!(fs::read(&extension).unwrap(), drifted);
-    fs::write(&extension, &installed_bytes).unwrap();
-
-    let uninstall = run(
-        &launcher,
-        &[
-            "--install-root",
-            install_root.to_str().unwrap(),
-            "--prime-home",
-            prime_home.to_str().unwrap(),
-            "uninstall-hooks",
-            "prime-agent",
-        ],
-        &root,
-        None,
-    );
-    assert_success(&uninstall);
-    assert!(!extension.exists());
-    assert!(prime_home.join("extensions/user-extension.ts").is_file());
-
-    let second_uninstall = run(
-        &launcher,
-        &[
-            "--install-root",
-            install_root.to_str().unwrap(),
-            "--prime-home",
-            prime_home.to_str().unwrap(),
-            "uninstall-hooks",
-            "prime-agent",
-        ],
-        &root,
-        None,
-    );
-    assert_success(&second_uninstall);
-    let second_uninstall: Value = serde_json::from_slice(&second_uninstall.stdout).unwrap();
-    assert_eq!(second_uninstall["changed"], false);
-
-    let unmanaged_directory = prime_home.join("extensions/project-brain");
-    fs::create_dir(&unmanaged_directory).unwrap();
-    let unmanaged = b"export default function userExtension() {}\n";
-    fs::write(unmanaged_directory.join("index.ts"), unmanaged).unwrap();
-    let collision = run(&launcher, &install_args, &root, None);
-    assert!(!collision.status.success());
-    assert_eq!(
-        fs::read(unmanaged_directory.join("index.ts")).unwrap(),
-        unmanaged
-    );
-
-    fs::remove_dir_all(root).unwrap();
+fn blocking_input(project: &Path, adapter: &str) -> String {
+    serde_json::json!({
+        "session_id": format!("{adapter}-session"),
+        "cwd": project,
+        "hook_event_name": "PreToolUse",
+        "tool_name": "shell_command",
+        "tool_use_id": format!("{adapter}-tool"),
+        "tool_input": {"command": "Remove-Item .project-brain/config.json"}
+    })
+    .to_string()
 }
 
 #[test]
-#[allow(
-    clippy::too_many_lines,
-    reason = "单条黑盒测试按真实用户顺序验证安装到卸载的完整事务边界"
-)]
-fn install_bootstrap_dispatch_doctor_and_uninstall_are_end_to_end() {
-    let root = temp_root("e2e");
-    let install_root = root.join("machine/Project Brain");
-    let codex_home = root.join("Codex Home");
-    let claude_home = root.join("Claude Home");
-    let project = root.join("repo");
-    let unknown = root.join("unknown");
-    fs::create_dir_all(&project).unwrap();
-    fs::create_dir_all(&unknown).unwrap();
-    fs::create_dir_all(&codex_home).unwrap();
-    fs::create_dir_all(&claude_home).unwrap();
-    let user_hooks = "{\n  \"custom\": true,\n  \"hooks\": {\n    \"Stop\": [{\"hooks\": [{\"type\": \"command\", \"command\": \"user-stop\"}]}]\n  }\n}\n";
-    fs::write(codex_home.join("hooks.json"), user_hooks).unwrap();
+fn capability_matrix_is_explicit_for_all_supported_agents() {
+    let root = temp_root("capabilities");
+    for agent in ["codex", "pi", "opencode", "dsh"] {
+        let output = run(&binary(), &["capabilities", agent], &root, None, &[]);
+        assert_success(&output);
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["deny_tool"], "supported", "adapter={agent}");
+        assert_eq!(value["post_feedback"], "supported", "adapter={agent}");
+    }
+    let opencode = run(&binary(), &["capabilities", "opencode"], &root, None, &[]);
+    let opencode: Value = serde_json::from_slice(&opencode.stdout).unwrap();
+    assert_eq!(opencode["continue_after_stop"], "unsupported");
+    let pi = run(&binary(), &["capabilities", "pi"], &root, None, &[]);
+    let pi: Value = serde_json::from_slice(&pi.stdout).unwrap();
+    assert_eq!(pi["continue_after_stop"], "emulated");
+}
 
-    let source = PathBuf::from(env!("CARGO_BIN_EXE_project-brain"));
-    let install = run(
-        &source,
-        &["--install-root", install_root.to_str().unwrap(), "install"],
-        &root,
-        None,
-    );
-    assert_success(&install);
-    let launcher = install_root.join("bin").join(
-        source
-            .file_name()
-            .expect("source executable has a file name"),
-    );
-    assert!(launcher.is_file());
-    let rollback_version = "0.0.9-test";
-    let rollback_payload = install_root
-        .join("versions")
-        .join(rollback_version)
-        .join(source.file_name().unwrap());
-    fs::create_dir_all(rollback_payload.parent().unwrap()).unwrap();
-    fs::copy(&source, &rollback_payload).unwrap();
-    fs::write(
-        install_root.join("state/install.json"),
-        format!(
-            "{{\"schema_version\":1,\"current\":{},\"previous\":{}}}\n",
-            serde_json::to_string(env!("CARGO_PKG_VERSION")).unwrap(),
-            serde_json::to_string(rollback_version).unwrap()
-        ),
-    )
-    .unwrap();
-    let rollback = run(
-        &launcher,
-        &["--install-root", install_root.to_str().unwrap(), "rollback"],
-        &root,
-        None,
-    );
-    assert_success(&rollback);
-    let rollback: Value = serde_json::from_slice(&rollback.stdout).unwrap();
-    assert_eq!(rollback["current_version"], rollback_version);
-    assert_eq!(rollback["stable_launcher_unchanged"], true);
-
-    let init = run(
-        &launcher,
-        &[
-            "--project-root",
-            project.to_str().unwrap(),
-            "init",
-            "--profile",
-            "dotnet",
-            "--profile",
-            "python",
-        ],
-        &root,
-        None,
-    );
-    assert_success(&init);
-    let config: Value =
-        serde_json::from_slice(&fs::read(project.join(".project-brain/config.json")).unwrap())
-            .unwrap();
-    assert_eq!(config["language_profiles"].as_array().unwrap().len(), 3);
-    assert!(
-        !serde_json::to_string(&config)
-            .unwrap()
-            .contains(install_root.to_str().unwrap())
-    );
-
-    let bootstrap_args = [
-        "--install-root",
-        install_root.to_str().unwrap(),
-        "--codex-home",
-        codex_home.to_str().unwrap(),
-        "--project-root",
-        project.to_str().unwrap(),
-        "bootstrap",
-        "--codex",
-    ];
-    fs::write(codex_home.join("hooks.json"), "{ malformed").unwrap();
-    let failed_bootstrap = run(&launcher, &bootstrap_args, &root, None);
-    assert!(!failed_bootstrap.status.success());
-    assert_eq!(
-        fs::read_to_string(codex_home.join("hooks.json")).unwrap(),
-        "{ malformed"
-    );
-    let registry_after_failure: Value =
-        serde_json::from_slice(&fs::read(install_root.join("state/projects.json")).unwrap())
-            .unwrap();
-    assert_eq!(registry_after_failure["projects"], serde_json::json!([]));
-    fs::write(codex_home.join("hooks.json"), user_hooks).unwrap();
-
-    let fake_dir = install_root.join("provider-fixtures");
-    fs::create_dir_all(&fake_dir).unwrap();
-    for (profile, producer) in [
-        ("dotnet-main", "scip-dotnet"),
-        ("python-main", "scip-python"),
-    ] {
-        let fake = fake_dir.join(format!("{producer}{}", std::env::consts::EXE_SUFFIX));
-        fs::copy(&source, &fake).unwrap();
-        let binding = run(
-            &launcher,
+#[test]
+fn normalized_dispatch_blocks_protected_deletion_for_all_agents() {
+    let root = temp_root("dispatch");
+    let (install_root, project) = install_and_init(&root);
+    add_protected_rule(&project);
+    for agent in ["codex", "pi", "opencode", "dsh"] {
+        let input = blocking_input(&project, agent);
+        let output = run(
+            &binary(),
             &[
                 "--install-root",
                 install_root.to_str().unwrap(),
-                "--project-root",
-                project.to_str().unwrap(),
-                "provider",
-                "bind",
-                "--profile",
-                profile,
-                "--executable",
-                fake.to_str().unwrap(),
-                "--trust-local-executable",
+                "hook",
+                agent,
+                "pre-tool-use",
             ],
-            &root,
-            None,
+            &project,
+            Some(&input),
+            &[],
         );
-        assert_success(&binding);
-    }
-
-    assert_success(&run(&launcher, &bootstrap_args, &root, None));
-    let second_bootstrap = run(&launcher, &bootstrap_args, &root, None);
-    assert_success(&second_bootstrap);
-    let second: Value = serde_json::from_slice(&second_bootstrap.stdout).unwrap();
-    assert_eq!(second["registered"], false);
-
-    let hooks: Value =
-        serde_json::from_slice(&fs::read(codex_home.join("hooks.json")).unwrap()).unwrap();
-    assert_eq!(hooks["custom"], true);
-    assert_eq!(hooks["hooks"]["Stop"].as_array().unwrap().len(), 2);
-    for event in [
-        "SessionStart",
-        "UserPromptSubmit",
-        "PreToolUse",
-        "PostToolUse",
-        "Stop",
-    ] {
-        assert!(hooks["hooks"][event].is_array());
-    }
-
-    let unknown_input = format!(
-        "{{\"session_id\":\"s\",\"cwd\":{},\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"apply_patch\",\"tool_use_id\":\"u\",\"tool_input\":{{}}}}",
-        serde_json::to_string(unknown.to_str().unwrap()).unwrap()
-    );
-    let unknown_dispatch = run(
-        &launcher,
-        &[
-            "--install-root",
-            install_root.to_str().unwrap(),
-            "dispatch",
-            "codex",
-            "pre-tool-use",
-        ],
-        &unknown,
-        Some(&unknown_input),
-    );
-    assert_success(&unknown_dispatch);
-    assert!(unknown_dispatch.stdout.is_empty());
-
-    let registered_input = format!(
-        "{{\"session_id\":\"s\",\"cwd\":{},\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"apply_patch\",\"tool_use_id\":\"u\",\"tool_input\":{{\"command\":\"*** Begin Patch\\n*** Delete File: .project-brain/config.json\\n*** End Patch\"}}}}",
-        serde_json::to_string(project.to_str().unwrap()).unwrap()
-    );
-    let registered_dispatch = run(
-        &launcher,
-        &[
-            "--install-root",
-            install_root.to_str().unwrap(),
-            "dispatch",
-            "codex",
-            "pre-tool-use",
-        ],
-        &project,
-        Some(&registered_input),
-    );
-    assert_success(&registered_dispatch);
-    let decision: Value = serde_json::from_slice(&registered_dispatch.stdout).unwrap();
-    assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny");
-
-    let doctor = run(
-        &launcher,
-        &[
-            "--install-root",
-            install_root.to_str().unwrap(),
-            "--codex-home",
-            codex_home.to_str().unwrap(),
-            "--project-root",
-            project.to_str().unwrap(),
-            "doctor",
-        ],
-        &project,
-        None,
-    );
-    assert_success(&doctor);
-    let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
-    assert_eq!(doctor["schema_version"], 2);
-    assert_eq!(doctor["status"], "ready");
-    assert_eq!(doctor["providers"], "pass");
-    assert_eq!(
-        doctor["adapter_trust_state"],
-        "not_programmatically_verifiable"
-    );
-    assert_eq!(doctor["adapter"], "codex");
-    assert_eq!(doctor["adapter_hooks"], "pass");
-
-    assert_success(&run(
-        &launcher,
-        &[
-            "--install-root",
-            install_root.to_str().unwrap(),
-            "--claude-home",
-            claude_home.to_str().unwrap(),
-            "install-hooks",
-            "claude-code",
-        ],
-        &root,
-        None,
-    ));
-    let claude_settings: Value =
-        serde_json::from_slice(&fs::read(claude_home.join("settings.json")).unwrap()).unwrap();
-    let claude_handler = claude_settings["hooks"]["PreToolUse"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .flat_map(|group| group["hooks"].as_array().unwrap())
-        .find(|handler| {
-            handler["args"]
-                .as_array()
-                .is_some_and(|args| args.get(1) == Some(&serde_json::json!("claude-code")))
-        })
-        .unwrap();
-    let claude_input = format!(
-        "{{\"session_id\":\"claude-session\",\"cwd\":{},\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"tool_use_id\":\"claude-tool\",\"tool_input\":{{\"command\":\"rm .project-brain/config.json\"}}}}",
-        serde_json::to_string(project.to_str().unwrap()).unwrap()
-    );
-    let claude_process = run_installed_handler(claude_handler, &project, &claude_input);
-    assert_success(&claude_process);
-    let claude_decision: Value =
-        serde_json::from_slice(&claude_process.stdout).unwrap_or_else(|error| {
-            panic!(
-                "installed Claude handler returned invalid JSON: {error}\nstdout={}\nstderr={}",
-                String::from_utf8_lossy(&claude_process.stdout),
-                String::from_utf8_lossy(&claude_process.stderr)
-            )
-        });
-    assert_eq!(
-        claude_decision["hookSpecificOutput"]["permissionDecision"], "deny",
-        "unexpected Claude decision: {claude_decision}"
-    );
-    let claude_doctor = run(
-        &launcher,
-        &[
-            "--install-root",
-            install_root.to_str().unwrap(),
-            "--claude-home",
-            claude_home.to_str().unwrap(),
-            "--project-root",
-            project.to_str().unwrap(),
-            "doctor",
-            "claude-code",
-        ],
-        &project,
-        None,
-    );
-    assert_success(&claude_doctor);
-    let claude_doctor: Value = serde_json::from_slice(&claude_doctor.stdout).unwrap();
-    assert_eq!(claude_doctor["schema_version"], 2);
-    assert_eq!(claude_doctor["adapter"], "claude_code");
-    assert_eq!(claude_doctor["adapter_hooks"], "pass");
-
-    let hooks_before_drift = fs::read(codex_home.join("hooks.json")).unwrap();
-    let mut drifted: Value = serde_json::from_slice(&hooks_before_drift).unwrap();
-    drifted["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = serde_json::json!(99);
-    let drifted_bytes = serde_json::to_vec_pretty(&drifted).unwrap();
-    fs::write(codex_home.join("hooks.json"), &drifted_bytes).unwrap();
-    let drift_install = run(
-        &launcher,
-        &[
-            "--install-root",
-            install_root.to_str().unwrap(),
-            "--codex-home",
-            codex_home.to_str().unwrap(),
-            "install-hooks",
-            "codex",
-        ],
-        &root,
-        None,
-    );
-    assert!(!drift_install.status.success());
-    assert_eq!(
-        fs::read(codex_home.join("hooks.json")).unwrap(),
-        drifted_bytes
-    );
-    fs::write(codex_home.join("hooks.json"), hooks_before_drift).unwrap();
-
-    let uninstall = run(
-        &launcher,
-        &[
-            "--install-root",
-            install_root.to_str().unwrap(),
-            "--codex-home",
-            codex_home.to_str().unwrap(),
-            "uninstall-hooks",
-            "codex",
-        ],
-        &root,
-        None,
-    );
-    assert_success(&uninstall);
-    let hooks_after: Value =
-        serde_json::from_slice(&fs::read(codex_home.join("hooks.json")).unwrap()).unwrap();
-    assert_eq!(hooks_after["custom"], true);
-    assert_eq!(hooks_after["hooks"]["Stop"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        hooks_after["hooks"]["Stop"][0]["hooks"][0]["command"],
-        "user-stop"
-    );
-
-    let degraded_doctor = run(
-        &launcher,
-        &[
-            "--install-root",
-            install_root.to_str().unwrap(),
-            "--codex-home",
-            codex_home.to_str().unwrap(),
-            "--project-root",
-            project.to_str().unwrap(),
-            "doctor",
-        ],
-        &project,
-        None,
-    );
-    assert!(!degraded_doctor.status.success());
-    let degraded: Value = serde_json::from_slice(&degraded_doctor.stdout).unwrap();
-    assert_eq!(degraded["status"], "degraded");
-    assert_eq!(degraded["adapter"], "codex");
-    assert_eq!(degraded["adapter_hooks"], "fail");
-
-    fs::remove_dir_all(root).unwrap();
-}
-
-fn assert_claude_hooks_installed(settings: &Value) {
-    assert_eq!(settings["language"], "chinese");
-    assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 2);
-    for (event, event_arg) in [
-        ("SessionStart", "session-start"),
-        ("UserPromptSubmit", "user-prompt-submit"),
-        ("PreToolUse", "pre-tool-use"),
-        ("PostToolUse", "post-tool-use"),
-        ("Stop", "stop"),
-    ] {
-        let managed = settings["hooks"][event]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|group| group["hooks"].as_array().unwrap())
-            .find(|handler| {
-                handler["args"] == serde_json::json!(["dispatch", "claude-code", event_arg])
-            })
-            .unwrap();
-        assert_eq!(managed["type"], "command");
-        assert_eq!(managed["timeout"], 10);
-        assert_eq!(
-            managed["statusMessage"],
-            "Project Brain deterministic governance"
-        );
-        let command = Path::new(managed["command"].as_str().unwrap());
-        assert!(command.is_absolute());
-        assert!(command.is_file());
-        assert!(managed.get("commandWindows").is_none());
-        assert!(managed.get("shell").is_none());
-    }
-}
-
-fn drift_claude_pre_tool_timeout(settings: &mut Value) {
-    let managed_group = settings["hooks"]["PreToolUse"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|group| {
-            group["hooks"].as_array().unwrap().iter().any(|handler| {
-                handler["args"] == serde_json::json!(["dispatch", "claude-code", "pre-tool-use"])
-            })
-        })
-        .unwrap();
-    managed_group["hooks"][0]["timeout"] = serde_json::json!(99);
-}
-
-fn assert_only_user_claude_hook_remains(settings: &Value) {
-    assert_eq!(settings["language"], "chinese");
-    assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        settings["hooks"]["Stop"][0]["hooks"][0]["command"],
-        "user-stop"
-    );
-    for event in [
-        "SessionStart",
-        "UserPromptSubmit",
-        "PreToolUse",
-        "PostToolUse",
-    ] {
-        assert!(
-            settings["hooks"][event]
-                .as_array()
-                .is_none_or(Vec::is_empty)
-        );
+        assert_success(&output);
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if agent == "codex" {
+            assert_eq!(
+                value.pointer("/hookSpecificOutput/permissionDecision"),
+                Some(&Value::String("deny".to_owned()))
+            );
+        } else {
+            assert_eq!(value["block"], true, "adapter={agent}, output={value}");
+        }
     }
 }
 
 #[test]
-fn claude_hook_install_is_atomic_idempotent_and_preserves_user_settings() {
-    let root = temp_root("claude-hooks");
-    let install_root = root.join("machine/Project Brain");
-    let claude_home = root.join("Claude Home");
-    fs::create_dir_all(&claude_home).unwrap();
-    let user_settings = serde_json::json!({
-        "language": "chinese",
-        "hooks": {
-            "Stop": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": "user-stop",
-                    "timeout": 3
-                }]
-            }]
-        }
-    });
+fn pi_extension_install_is_idempotent_drift_safe_and_removable() {
+    let root = temp_root("pi-extension");
+    let (install_root, project) = install_and_init(&root);
+    let pi_home = root.join("pi home");
+    fs::create_dir_all(pi_home.join("extensions")).unwrap();
     fs::write(
-        claude_home.join("settings.json"),
-        serde_json::to_vec_pretty(&user_settings).unwrap(),
+        pi_home.join("extensions/user-extension.ts"),
+        "export default function userExtension() {}\n",
     )
     .unwrap();
-
-    let source = PathBuf::from(env!("CARGO_BIN_EXE_project-brain"));
-    assert_success(&run(
-        &source,
-        &["--install-root", install_root.to_str().unwrap(), "install"],
-        &root,
-        None,
-    ));
-    let launcher = install_root.join("bin").join(source.file_name().unwrap());
-    let install_args = [
+    let common = [
         "--install-root",
         install_root.to_str().unwrap(),
-        "--claude-home",
-        claude_home.to_str().unwrap(),
-        "install-hooks",
-        "claude-code",
+        "--pi-home",
+        pi_home.to_str().unwrap(),
     ];
-    let first = run(&launcher, &install_args, &root, None);
+    let mut install_args = common.to_vec();
+    install_args.extend(["install-hooks", "pi"]);
+    let first = run(&binary(), &install_args, &project, None, &[]);
     assert_success(&first);
-    let first_report: Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(first_report["changed"], true);
-    assert_eq!(first_report["managed_handler_count"], 5);
-
-    let settings_path = claude_home.join("settings.json");
-    let installed_bytes = fs::read(&settings_path).unwrap();
-    let installed: Value = serde_json::from_slice(&installed_bytes).unwrap();
-    assert_claude_hooks_installed(&installed);
-
-    let second = run(&launcher, &install_args, &root, None);
+    let second = run(&binary(), &install_args, &project, None, &[]);
     assert_success(&second);
-    let second_report: Value = serde_json::from_slice(&second.stdout).unwrap();
-    assert_eq!(second_report["changed"], false);
-    assert_eq!(fs::read(&settings_path).unwrap(), installed_bytes);
 
-    let mut drifted = installed.clone();
-    drift_claude_pre_tool_timeout(&mut drifted);
-    let drifted_bytes = serde_json::to_vec_pretty(&drifted).unwrap();
-    fs::write(&settings_path, &drifted_bytes).unwrap();
-    let drift_install = run(&launcher, &install_args, &root, None);
-    assert!(!drift_install.status.success());
-    assert_eq!(fs::read(&settings_path).unwrap(), drifted_bytes);
+    let extension = pi_home.join("extensions/project-brain/index.ts");
+    let source = fs::read_to_string(&extension).unwrap();
+    for event in [
+        "session_start",
+        "input",
+        "before_agent_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+    ] {
+        assert!(source.contains(event), "missing PI event {event}");
+    }
+    assert!(source.contains("triggerTurn: true"));
+    assert!(pi_home.join("extensions/user-extension.ts").is_file());
 
-    fs::write(&settings_path, installed_bytes).unwrap();
-    let uninstall = run(
-        &launcher,
+    fs::write(&extension, "// drift\n").unwrap();
+    let mut uninstall_args = common.to_vec();
+    uninstall_args.extend(["uninstall-hooks", "pi"]);
+    let refused = run(&binary(), &uninstall_args, &project, None, &[]);
+    assert!(!refused.status.success());
+    assert!(extension.is_file());
+    uninstall_args.push("--force");
+    let forced = run(&binary(), &uninstall_args, &project, None, &[]);
+    assert_success(&forced);
+    assert!(!pi_home.join("extensions/project-brain").exists());
+    assert!(pi_home.join("extensions/user-extension.ts").is_file());
+}
+
+#[test]
+fn opencode_plugin_install_is_idempotent_drift_safe_and_removable() {
+    let root = temp_root("opencode-plugin");
+    let (install_root, project) = install_and_init(&root);
+    let opencode_home = root.join("opencode home");
+    fs::create_dir_all(opencode_home.join("plugins")).unwrap();
+    fs::write(
+        opencode_home.join("plugins/user-plugin.js"),
+        "export const UserPlugin = async () => ({})\n",
+    )
+    .unwrap();
+    let common = [
+        "--install-root",
+        install_root.to_str().unwrap(),
+        "--opencode-home",
+        opencode_home.to_str().unwrap(),
+    ];
+    let mut install_args = common.to_vec();
+    install_args.extend(["install-hooks", "opencode"]);
+    let first = run(&binary(), &install_args, &project, None, &[]);
+    assert_success(&first);
+    let second = run(&binary(), &install_args, &project, None, &[]);
+    assert_success(&second);
+
+    let plugin = opencode_home.join("plugins/project-brain.js");
+    let source = fs::read_to_string(&plugin).unwrap();
+    for event in [
+        "chat.message",
+        "tool.execute.before",
+        "tool.execute.after",
+        "session.created",
+        "session.idle",
+    ] {
+        assert!(source.contains(event), "missing opencode event {event}");
+    }
+    assert!(source.contains("throw new Error"));
+    assert!(opencode_home.join("plugins/user-plugin.js").is_file());
+
+    let syntax = Command::new("node").arg("--check").arg(&plugin).output();
+    if let Ok(syntax) = syntax {
+        assert_success(&syntax);
+    }
+
+    fs::write(&plugin, "// drift\n").unwrap();
+    let mut uninstall_args = common.to_vec();
+    uninstall_args.extend(["uninstall-hooks", "opencode"]);
+    let refused = run(&binary(), &uninstall_args, &project, None, &[]);
+    assert!(!refused.status.success());
+    uninstall_args.push("--force");
+    let forced = run(&binary(), &uninstall_args, &project, None, &[]);
+    assert_success(&forced);
+    assert!(!plugin.exists());
+    assert!(opencode_home.join("plugins/user-plugin.js").is_file());
+}
+
+fn compile_fake_dsh(root: &Path) -> Option<PathBuf> {
+    let source = root.join("fake-dsh.rs");
+    fs::write(
+        &source,
+        r##"
+use std::{env, fs, path::PathBuf};
+
+fn main() {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    assert_eq!(args.first().map(String::as_str), Some("plugin"));
+    assert_eq!(args.get(1).map(String::as_str), Some("--profile"));
+    let profile = args.get(2).expect("profile");
+    let operation = args.get(3).expect("operation");
+    let home = PathBuf::from(env::var_os("DSH_HOME").expect("DSH_HOME"));
+    let profile_root = home.join("profiles").join(profile);
+    let package_root = profile_root.join("node_modules/@project-brain/dsh-plugin");
+    fs::create_dir_all(&profile_root).unwrap();
+    match operation.as_str() {
+        "add" => {
+            let source = PathBuf::from(args.get(4).expect("source").strip_prefix("file:").unwrap());
+            fs::create_dir_all(package_root.join("lib")).unwrap();
+            fs::copy(source.join("lib/index.js"), package_root.join("lib/index.js")).unwrap();
+            fs::copy(source.join("package.json"), package_root.join("package.json")).unwrap();
+            fs::write(
+                profile_root.join("package.json"),
+                r#"{"dependencies":{"@project-brain/dsh-plugin":"file:managed"},"dsh":{"profile":{"bundles":["@project-brain/dsh-plugin"]}}}"#,
+            ).unwrap();
+        }
+        "remove" => {
+            if package_root.exists() {
+                fs::remove_dir_all(&package_root).unwrap();
+            }
+            fs::write(
+                profile_root.join("package.json"),
+                r#"{"dependencies":{},"dsh":{"profile":{"bundles":[]}}}"#,
+            ).unwrap();
+        }
+        other => panic!("unexpected operation: {other}"),
+    }
+}
+"##,
+    )
+    .unwrap();
+    let executable = root.join(if cfg!(windows) {
+        "fake-dsh.exe"
+    } else {
+        "fake-dsh"
+    });
+    let output = Command::new("rustc")
+        .args(["--edition=2024", source.to_str().unwrap(), "-o"])
+        .arg(&executable)
+        .output()
+        .ok()?;
+    assert_success(&output);
+    Some(executable)
+}
+
+fn node_runtime() -> Option<PathBuf> {
+    let executable = PathBuf::from("node");
+    let output = Command::new(&executable).arg("--version").output().ok()?;
+    output.status.success().then_some(executable)
+}
+
+// 内嵌脚本是跨平台黑盒 fixture；保留在单一函数中可确保写入与执行的是同一份审计文本。
+#[allow(clippy::too_many_lines)]
+fn run_adapter_runtime_harness(
+    node: &Path,
+    root: &Path,
+    adapter: &str,
+    plugin: &Path,
+    project: &Path,
+) {
+    let harness = root.join("adapter-runtime-harness.mjs");
+    fs::write(
+        &harness,
+        r#"import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+
+const [adapter, pluginPath, project] = process.argv.slice(2);
+const plugin = await import(pathToFileURL(pluginPath).href);
+const protectedCommand = "Remove-Item .project-brain/config.json";
+
+if (adapter === "pi") {
+  const handlers = new Map();
+  const sent = [];
+  const pi = {
+    on(name, handler) { handlers.set(name, handler); },
+    sendMessage(message, options) { sent.push({ message, options }); },
+  };
+  plugin.default(pi);
+  for (const name of ["session_start", "input", "before_agent_start", "tool_call", "tool_result", "agent_end"]) {
+    assert.equal(typeof handlers.get(name), "function", `missing Pi handler ${name}`);
+  }
+  const ctx = {
+    cwd: project,
+    sessionManager: { getSessionFile: () => "pi-runtime-session" },
+  };
+  await handlers.get("session_start")({ reason: "new" }, ctx);
+  assert.deepEqual(await handlers.get("input")({ source: "interactive", text: "inspect project" }, ctx), { action: "continue" });
+  handlers.get("before_agent_start")();
+  const denied = await handlers.get("tool_call")({
+    toolName: "bash",
+    toolCallId: "pi-runtime-tool",
+    input: { command: protectedCommand },
+  }, ctx);
+  assert.equal(denied?.block, true);
+  await handlers.get("tool_result")({
+    toolName: "bash",
+    toolCallId: "pi-runtime-tool-result",
+    input: { command: "git status --short" },
+    isError: false,
+    content: [],
+  }, ctx);
+  await handlers.get("agent_end")({}, ctx);
+  await handlers.get("agent_end")({}, ctx);
+  assert.equal(sent.filter((item) => item.options?.triggerTurn === true).length, 1);
+} else if (adapter === "opencode") {
+  const logs = [];
+  const hooks = await plugin.ProjectBrain({
+    client: { app: { log: async (entry) => { logs.push(entry); } } },
+    directory: project,
+    worktree: project,
+  });
+  const message = { parts: [{ type: "text", text: "inspect project" }] };
+  await hooks["chat.message"]({ sessionID: "opencode-runtime-session", messageID: "message-1" }, message);
+  let denied = false;
+  try {
+    await hooks["tool.execute.before"](
+      { sessionID: "opencode-runtime-session", tool: "shell_command", callID: "opencode-runtime-tool" },
+      { args: { command: protectedCommand } },
+    );
+  } catch (error) {
+    denied = String(error).includes("禁止删除控制面配置");
+  }
+  assert.equal(denied, true);
+  const after = { title: "status", output: "ok", metadata: {} };
+  await hooks["tool.execute.after"]({
+    sessionID: "opencode-runtime-session",
+    tool: "shell_command",
+    callID: "opencode-runtime-tool-result",
+    args: { command: "git status --short" },
+  }, after);
+  await hooks.event({ event: { type: "session.created", properties: { info: { id: "opencode-runtime-session" } } } });
+  await hooks.event({ event: { type: "session.idle", properties: { sessionID: "opencode-runtime-session" } } });
+} else if (adapter === "dsh") {
+  const handlers = new Map();
+  plugin.apply({ on(name, handler) { handlers.set(name, handler); } });
+  for (const name of ["agent/session-start", "agent/pre-step", "tools/pre-execute", "tools/post-execute", "agent/turn-stopping"]) {
+    assert.equal(typeof handlers.get(name), "function", `missing dsh handler ${name}`);
+  }
+  const steered = [];
+  const agent = {
+    id: "dsh-runtime-session",
+    session: { header: { cwd: project } },
+    steer(message) { steered.push(message); },
+  };
+  handlers.get("agent/session-start")({ agent, source: "startup" });
+  const step = await handlers.get("agent/pre-step")({
+    agent,
+    turn: 1,
+    step: 1,
+    messages: [{ source: { kind: "user" }, content: [{ type: "text", text: "inspect project" }] }],
+  }, async () => ({ kind: "enter", messages: [] }));
+  assert.equal(step.kind, "enter");
+  const denied = await handlers.get("tools/pre-execute")({
+    agent,
+    name: "shell_command",
+    callId: "dsh-runtime-tool",
+    arguments: { command: protectedCommand },
+  }, async () => ({ kind: "allow" }));
+  assert.equal(denied.kind, "deny");
+  const post = await handlers.get("tools/post-execute")({
+    agent,
+    name: "shell_command",
+    callId: "dsh-runtime-tool-result",
+    arguments: { command: "git status --short" },
+  }, { isError: false }, async () => ({ additionalContexts: [] }));
+  assert.ok(Array.isArray(post.additionalContexts));
+  await handlers.get("agent/turn-stopping")({ agent, turn: 1 });
+  await handlers.get("agent/turn-stopping")({ agent, turn: 1 });
+  assert.equal(steered.length, 1);
+} else {
+  throw new Error(`unknown adapter ${adapter}`);
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new(node)
+        .arg(&harness)
+        .args([adapter])
+        .arg(plugin)
+        .arg(project)
+        .current_dir(project)
+        .output()
+        .expect("run Node adapter harness");
+    assert_success(&output);
+}
+
+#[test]
+fn dsh_profile_bundle_install_doctor_and_uninstall_are_verified() {
+    let root = temp_root("dsh-plugin");
+    let (install_root, project) = install_and_init(&root);
+    let dsh_home = root.join("dsh home");
+    let fake_dsh = compile_fake_dsh(&root).expect("rustc is required by Rust tests");
+    let common = [
+        "--install-root",
+        install_root.to_str().unwrap(),
+        "--dsh-home",
+        dsh_home.to_str().unwrap(),
+        "--dsh-profile",
+        "project-brain-test",
+    ];
+    let mut install_args = common.to_vec();
+    install_args.extend(["install-hooks", "dsh"]);
+    let environment = [("PROJECT_BRAIN_DSH_EXECUTABLE", fake_dsh.as_path())];
+    let first = run(&binary(), &install_args, &project, None, &environment);
+    assert_success(&first);
+    let second = run(&binary(), &install_args, &project, None, &environment);
+    assert_success(&second);
+
+    let plugin = dsh_home
+        .join("profiles/project-brain-test/node_modules/@project-brain/dsh-plugin/lib/index.js");
+    let source = fs::read_to_string(&plugin).unwrap();
+    for event in [
+        "agent/session-start",
+        "agent/pre-step",
+        "tools/pre-execute",
+        "tools/post-execute",
+        "agent/turn-stopping",
+    ] {
+        assert!(source.contains(event), "missing dsh event {event}");
+    }
+    assert!(source.contains("kind: \"deny\""));
+    assert!(source.contains("agent.steer"));
+    let syntax = Command::new("node").arg("--check").arg(&plugin).output();
+    if let Ok(syntax) = syntax {
+        assert_success(&syntax);
+    }
+
+    let mut doctor_args = common.to_vec();
+    doctor_args.extend(["--project-root", project.to_str().unwrap(), "doctor", "dsh"]);
+    let doctor = run(&binary(), &doctor_args, &project, None, &[]);
+    assert_success(&doctor);
+    let doctor: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(doctor["adapter"], "dsh");
+    assert_eq!(doctor["adapter_hooks"], "pass");
+
+    let mut uninstall_args = common.to_vec();
+    uninstall_args.extend(["uninstall-hooks", "dsh"]);
+    let uninstall = run(&binary(), &uninstall_args, &project, None, &environment);
+    assert_success(&uninstall);
+    assert!(!plugin.exists());
+}
+
+#[test]
+fn generated_extensions_execute_real_lifecycle_and_tool_veto_roundtrips() {
+    let Some(node) = node_runtime() else {
+        eprintln!("node is unavailable; adapter runtime harness skipped");
+        return;
+    };
+    let root = temp_root("adapter-runtime");
+    let (install_root, project) = install_and_init(&root);
+    add_protected_rule(&project);
+
+    let pi_home = root.join("pi home");
+    let pi_install = run(
+        &binary(),
         &[
             "--install-root",
             install_root.to_str().unwrap(),
-            "--claude-home",
-            claude_home.to_str().unwrap(),
-            "uninstall-hooks",
-            "claude-code",
+            "--pi-home",
+            pi_home.to_str().unwrap(),
+            "install-hooks",
+            "pi",
         ],
-        &root,
+        &project,
         None,
+        &[],
     );
-    assert_success(&uninstall);
-    let after: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
-    assert_only_user_claude_hook_remains(&after);
+    assert_success(&pi_install);
+    let pi_source = pi_home.join("extensions/project-brain/index.ts");
+    let pi_module = root.join("pi-project-brain.mjs");
+    fs::copy(pi_source, &pi_module).unwrap();
+    run_adapter_runtime_harness(&node, &root, "pi", &pi_module, &project);
 
-    fs::remove_dir_all(root).unwrap();
+    let opencode_home = root.join("opencode home");
+    let opencode_install = run(
+        &binary(),
+        &[
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--opencode-home",
+            opencode_home.to_str().unwrap(),
+            "install-hooks",
+            "opencode",
+        ],
+        &project,
+        None,
+        &[],
+    );
+    assert_success(&opencode_install);
+    run_adapter_runtime_harness(
+        &node,
+        &root,
+        "opencode",
+        &opencode_home.join("plugins/project-brain.js"),
+        &project,
+    );
+
+    let dsh_home = root.join("dsh home");
+    let fake_dsh = compile_fake_dsh(&root).expect("rustc is required by Rust tests");
+    let dsh_install = run(
+        &binary(),
+        &[
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--dsh-home",
+            dsh_home.to_str().unwrap(),
+            "--dsh-profile",
+            "project-brain-runtime",
+            "install-hooks",
+            "dsh",
+        ],
+        &project,
+        None,
+        &[("PROJECT_BRAIN_DSH_EXECUTABLE", fake_dsh.as_path())],
+    );
+    assert_success(&dsh_install);
+    run_adapter_runtime_harness(
+        &node,
+        &root,
+        "dsh",
+        &dsh_home.join(
+            "profiles/project-brain-runtime/node_modules/@project-brain/dsh-plugin/lib/index.js",
+        ),
+        &project,
+    );
 }

@@ -28,7 +28,7 @@ Build、Test 与 Runtime 回答不同问题。Build 证明固定构建合同的�
 6. 继续复用通用 `evidence_snapshots/attestations/heads/staleness_events` 账本，不新增 Test 专用快照表。
    SQLite schema v14 仅扩展 `evidence_snapshots.plane` 检查约束以接受 `test`，迁移保留既有快照、head、
    attestation 与外键关系。
-7. 本 ADR 只建立 Test plane 与治理映射核心。具体 .NET、Rust、Python、Godot Test Provider 必须另行
+7. 本 ADR 只建立 Test plane 与治理映射核心。具体 .NET、Rust、Python 或外部框架 Test Provider 必须另行
    实现 adapter-owned 固定合同；仓库不得提供任意 command、shell、args、restore、network 或 export。
 
 ## 验证
@@ -43,5 +43,5 @@ Build、Test 与 Runtime 回答不同问题。Build 证明固定构建合同的�
 
 - Project Brain 可以表达测试覆盖和测试失败，而不冒充 Runtime 正确性。
 - Provider 负责报告事实，仓库规则负责赋予 effect；二者分离后可以审计“为什么被阻断”。
-- 后续 ADR 已实现 .NET 固定 Test、Godot structured scenario、Rust offline/frozen Test 与 Python manifest
+- 后续 ADR 已实现 .NET 固定 Test、Rust offline/frozen Test 与 Python manifest
   Test Provider；Python Test 仍依赖独立 Build head，不能由 Python Build validation 冒充。

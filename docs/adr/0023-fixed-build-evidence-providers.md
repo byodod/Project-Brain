@@ -11,8 +11,7 @@ Semantic、Engine 与 Build 证明不同事实。`dotnet build` 和 `cargo build
 会形成错误安全边界。Python 的语法有效性又不需要 import 或执行项目模块。
 
 Build 还必须区分“完整观测到构建失败”和“机器工具链无法完成合同”。前者可以成为确定性 error
-finding，后者只能 advisory。对于 Godot C#，编译事实必须引用已实际验证的 Engine 快照，而不是仅凭
-文件扩展名猜测项目类型。
+finding，后者只能 advisory。框架特有的构建语义不得仅凭文件扩展名猜测，必须由外部 Provider 声明。
 
 ## 决策
 
@@ -32,15 +31,12 @@ finding，后者只能 advisory。对于 Godot C#，编译事实必须引用已�
 7. 运行前后 worktree 指纹或 executable hash 漂移时丢弃结果。
 8. `coverage=complete` 不代表成功。项目构建错误为 complete error finding；工具链/准备状态不可用为
    partial warning finding。失败证据先持久化，CLI 再返回非零。
-9. Godot C# 可要求唯一 fresh+complete+deterministic Engine head，并把该 fingerprint 写入 upstream。
-10. 成功的 Godot C# 最终输出必须在 scratch 删除前提升为机器级内容寻址 RuntimeArtifactBundle；
-    精确运行绑定的完整合同见 ADR-0024。
+9. 成功且需要供后续 Test 消费的最终输出在 scratch 删除前提升为机器级内容寻址 bundle；
+   下游只能消费 manifest 中逐文件固定的字节。
 
 ## 验证
 
-- Godot 4.6 C# 项目：真实 Engine upstream 后，隔离 `.NET 9.0.308` Debug build 得到 0 warning、
-  0 error；连续构建的最终 `bin/Debug` 文件哈希一致，只有 4 个 obj cache 因 scratch 路径变化而不同，
-  因此这些 cache 被排除。项目仓库没有新增跟踪修改，也未执行 export。
+- .NET 受控项目：隔离 Debug build 的最终输出哈希稳定；包含 scratch 绝对路径的中间 cache 被排除。
 - 本仓库 Rust workspace：全新临时 target、`--workspace --all-targets --frozen` 成功，记录 2996 个
   产物条目，完成后 scratch 删除。
 - Python 工具目录：isolated compile validation 成功，合同显示 `compiler_only + validation_only`。
@@ -48,7 +44,7 @@ finding，后者只能 advisory。对于 Godot C#，编译事实必须引用已�
 
 ## 后果
 
-- Runtime Provider 可引用一份明确成功、无 error finding 且精确产物仍可验证的 Build Snapshot，而不会把
+- 下游 Test 或外部 Provider 可引用一份明确成功、无 error finding 且精确产物仍可验证的 Build Snapshot，而不会把
   complete 误读为成功，也不会重新构建后冒充旧 Build。
-- 构建不会隐式下载依赖、运行测试、启动应用或执行引擎 export。
+- 构建不会隐式下载依赖、运行测试或启动应用。
 - v1 `.NET` 暂不接受多项目 solution；多项目必须先定义逐项目 restore/output 隔离与聚合身份。

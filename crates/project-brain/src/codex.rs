@@ -55,6 +55,10 @@ impl CodexHookInput {
     pub fn cwd(&self) -> &str {
         &self.cwd
     }
+
+    pub fn stop_hook_active(&self) -> bool {
+        self.stop_hook_active
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -348,8 +352,16 @@ fn normalized_tool(
         .get("command")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let kind = classify_action(&input.tool_name, command.as_deref());
+    let kind = classify_action(
+        root,
+        &input.tool_name,
+        &input.tool_input,
+        command.as_deref(),
+    );
     let mut target_files = extract_target_files(&input.tool_input);
+    if let Some(command) = command.as_deref() {
+        target_files.extend(extract_destructive_command_paths(command));
+    }
     target_files.sort();
     target_files.dedup();
     let target_files = target_files
@@ -531,11 +543,25 @@ fn hash_id_bytes(label: &str, parts: &[&[u8]]) -> String {
     format!("{label}_{:x}", digest.finalize())
 }
 
-fn classify_action(tool_name: &str, command: Option<&str>) -> brain_core::ActionKind {
+fn classify_action(
+    root: &Path,
+    tool_name: &str,
+    tool_input: &Value,
+    command: Option<&str>,
+) -> brain_core::ActionKind {
     use brain_core::ActionKind;
 
     let tool = tool_name.to_ascii_lowercase();
-    if matches!(tool.as_str(), "apply_patch" | "edit" | "write") {
+    if tool == "write" {
+        let target = extract_target_files(tool_input).into_iter().next();
+        return if target.is_some_and(|path| root.join(make_project_relative(root, &path)).exists())
+        {
+            ActionKind::Modify
+        } else {
+            ActionKind::Create
+        };
+    }
+    if matches!(tool.as_str(), "apply_patch" | "edit") {
         let command = command.unwrap_or_default();
         if command.contains("*** Delete File:") {
             return ActionKind::Delete;
@@ -545,8 +571,19 @@ fn classify_action(tool_name: &str, command: Option<&str>) -> brain_core::Action
         }
         return ActionKind::Modify;
     }
-    if tool == "bash" || tool == "shell_command" {
+    if tool == "str_replace_editor" {
+        return match command.unwrap_or_default().to_ascii_lowercase().as_str() {
+            "view" => ActionKind::Read,
+            "create" => ActionKind::Create,
+            "str_replace" | "insert" => ActionKind::Modify,
+            _ => ActionKind::Unknown,
+        };
+    }
+    if matches!(tool.as_str(), "bash" | "pwsh" | "shell_command") {
         let command = command.unwrap_or_default().to_ascii_lowercase();
+        if !extract_destructive_command_paths(&command).is_empty() {
+            return ActionKind::Delete;
+        }
         if command.contains("git ") || command.starts_with("git") {
             return ActionKind::GitOperation;
         }
@@ -566,6 +603,84 @@ fn classify_action(tool_name: &str, command: Option<&str>) -> brain_core::Action
     ActionKind::Unknown
 }
 
+fn extract_destructive_command_paths(command: &str) -> Vec<String> {
+    let tokens = shell_like_tokens(command);
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index].to_ascii_lowercase();
+        let (is_delete, operands_start) = if matches!(
+            token.as_str(),
+            "rm" | "unlink" | "del" | "erase" | "remove-item"
+        ) {
+            (true, index + 1)
+        } else if token == "git"
+            && tokens
+                .get(index + 1)
+                .is_some_and(|next| next.eq_ignore_ascii_case("rm"))
+        {
+            (true, index + 2)
+        } else {
+            (false, index + 1)
+        };
+        if !is_delete {
+            index += 1;
+            continue;
+        }
+        index = operands_start;
+        while index < tokens.len() && tokens[index] != ";" {
+            let candidate = &tokens[index];
+            if !candidate.starts_with('-') && literal_command_path(candidate) {
+                paths.push(candidate.to_owned());
+            }
+            index += 1;
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn literal_command_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains(['*', '?', '$', '%', '`', '\n', '\r'])
+        && !matches!(value.to_ascii_lowercase().as_str(), "--" | "true" | "false")
+}
+
+fn shell_like_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for character in command.chars() {
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            } else {
+                current.push(character);
+            }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else if matches!(character, ';' | '|' | '&') {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            if tokens.last().is_none_or(|last| last != ";") {
+                tokens.push(";".to_owned());
+            }
+        } else {
+            current.push(character);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 fn extract_target_files(tool_input: &Value) -> Vec<String> {
     let mut targets = Vec::new();
     if let Some(object) = tool_input.as_object() {
@@ -579,7 +694,12 @@ fn extract_target_files(tool_input: &Value) -> Vec<String> {
 
 fn deterministic_impacts(root: &Path, input: &CodexHookInput) -> Vec<brain_core::ToolImpact> {
     let tool = input.tool_name.to_ascii_lowercase();
-    if tool == "write" {
+    let editor_command = input
+        .tool_input
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if tool == "write" || (tool == "str_replace_editor" && editor_command == "create") {
         return extract_target_files(&input.tool_input)
             .into_iter()
             .map(|path| brain_core::ToolImpact {
@@ -608,13 +728,35 @@ fn deterministic_impacts(root: &Path, input: &CodexHookInput) -> Vec<brain_core:
         impacts.dedup_by(|left, right| left.path == right.path);
         return impacts;
     }
-    if tool == "edit" {
+    if tool == "str_replace_editor" && editor_command == "insert" {
+        let path = input.tool_input.get("path").and_then(Value::as_str);
+        let line = input
+            .tool_input
+            .get("insert_line")
+            .and_then(Value::as_u64)
+            .and_then(|line| usize::try_from(line).ok());
+        if let (Some(path), Some(line)) = (path, line) {
+            return vec![brain_core::ToolImpact {
+                path: make_project_relative(root, path),
+                whole_file: false,
+                ranges: vec![brain_core::ToolLineRange {
+                    start_line: line.saturating_add(1),
+                    end_line: line.saturating_add(1),
+                }],
+            }];
+        }
+    }
+    if tool == "edit" || (tool == "str_replace_editor" && editor_command == "str_replace") {
         let path = input
             .tool_input
             .get("file_path")
             .or_else(|| input.tool_input.get("path"))
             .and_then(Value::as_str);
-        let old = input.tool_input.get("old_string").and_then(Value::as_str);
+        let old = input
+            .tool_input
+            .get("old_string")
+            .or_else(|| input.tool_input.get("old_str"))
+            .and_then(Value::as_str);
         if let (Some(path), Some(old)) = (path, old)
             && !old.is_empty()
         {
@@ -703,8 +845,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CodexHookInput, classify_action, deterministic_impacts, extract_target_files,
-        failure_output, handle,
+        CodexHookInput, classify_action, deterministic_impacts, extract_destructive_command_paths,
+        extract_target_files, failure_output, handle,
     };
     use crate::app::HookEvent;
 
@@ -758,7 +900,7 @@ mod tests {
             project_key,
             EvidencePlane::Engine,
             EvidenceProvider {
-                id: "godot-engine-resolver".to_owned(),
+                id: "engine-resolver".to_owned(),
                 version: "4.6+sha256.test".to_owned(),
                 contract_version: 1,
                 authority: EvidenceAuthority::Deterministic,
@@ -806,13 +948,51 @@ mod tests {
 
     #[test]
     fn classifies_destructive_shell_commands() {
+        let root = Path::new("C:/repo");
         assert_eq!(
-            classify_action("shell_command", Some("Remove-Item file.txt")),
+            classify_action(
+                root,
+                "shell_command",
+                &json!({"command": "Remove-Item file.txt"}),
+                Some("Remove-Item file.txt"),
+            ),
             ActionKind::Delete
         );
         assert_eq!(
-            classify_action("shell_command", Some("git status")),
+            classify_action(
+                root,
+                "shell_command",
+                &json!({"command": "git status"}),
+                Some("git status"),
+            ),
             ActionKind::GitOperation
+        );
+        assert_eq!(
+            extract_destructive_command_paths(
+                "git status && git rm '.project-brain/config.json'; Remove-Item -Force other.txt"
+            ),
+            vec![
+                ".project-brain/config.json".to_owned(),
+                "other.txt".to_owned()
+            ]
+        );
+        assert_eq!(
+            classify_action(
+                root,
+                "str_replace_editor",
+                &json!({"command": "str_replace", "path": "src/lib.rs"}),
+                Some("str_replace"),
+            ),
+            ActionKind::Modify
+        );
+        assert_eq!(
+            classify_action(
+                root,
+                "pwsh",
+                &json!({"command": "Remove-Item file.txt"}),
+                Some("Remove-Item file.txt"),
+            ),
+            ActionKind::Delete
         );
     }
 

@@ -14,19 +14,21 @@ use crate::{
     provider::ProviderTrustStatus,
 };
 
-const PRIME_AGENT_ADAPTER_VERSION: u16 = 1;
+const PI_ADAPTER_VERSION: u16 = 1;
 
-/// Prime Agent Extension 将正式 runtime event 规范化到此字段子集。
+/// PI Extension 将正式 runtime event 规范化到此字段子集。
 ///
 /// 该桥接输入复用已验证的工具归一化逻辑，但保留独立 adapter identity、事件幂等域和输出协议。
-pub type PrimeHookInput = CodexHookInput;
+pub type PiHookInput = CodexHookInput;
 
 #[derive(Debug, Serialize)]
 #[serde(transparent)]
-pub struct PrimeHookOutput(pub(crate) Value);
+pub struct ExtensionHookOutput(pub(crate) Value);
+
+pub type PiHookOutput = ExtensionHookOutput;
 
 pub const fn capabilities() -> AdapterCapabilities {
-    AdapterCapabilities::prime_agent()
+    AdapterCapabilities::pi()
 }
 
 #[cfg(test)]
@@ -35,8 +37,8 @@ pub fn handle(
     config: &BrainConfig,
     store: &BrainStore,
     event: HookEvent,
-    input: &PrimeHookInput,
-) -> PrimeHookOutput {
+    input: &PiHookInput,
+) -> PiHookOutput {
     let provider_trust = BTreeMap::new();
     handle_with_provider_trust(root, config, store, &provider_trust, event, input)
 }
@@ -47,8 +49,35 @@ pub fn handle_with_provider_trust(
     store: &BrainStore,
     provider_trust: &BTreeMap<String, ProviderTrustStatus>,
     event: HookEvent,
-    input: &PrimeHookInput,
-) -> PrimeHookOutput {
+    input: &PiHookInput,
+) -> PiHookOutput {
+    handle_adapter_with_provider_trust(
+        root,
+        config,
+        store,
+        provider_trust,
+        event,
+        input,
+        AdapterKind::Pi,
+        PI_ADAPTER_VERSION,
+        "pi",
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn handle_adapter_with_provider_trust(
+    root: &Path,
+    config: &BrainConfig,
+    store: &BrainStore,
+    provider_trust: &BTreeMap<String, ProviderTrustStatus>,
+    event: HookEvent,
+    input: &CodexHookInput,
+    adapter_kind: AdapterKind,
+    adapter_version: u16,
+    identity_namespace: &'static str,
+    continuation_supported: bool,
+) -> ExtensionHookOutput {
     match codex::process_vendor_with_provider_trust(
         root,
         config,
@@ -56,36 +85,55 @@ pub fn handle_with_provider_trust(
         provider_trust,
         event,
         input,
-        AdapterKind::PrimeAgent,
-        PRIME_AGENT_ADAPTER_VERSION,
-        "prime_agent",
+        adapter_kind,
+        adapter_version,
+        identity_namespace,
     ) {
-        Ok(outcome) => map_outcome(&outcome),
-        Err(error) => failure_output(event, &error.to_string()),
+        Ok(outcome) => map_outcome(&outcome, continuation_supported),
+        Err(error) => adapter_failure_output(
+            event,
+            &error.to_string(),
+            continuation_supported,
+            input.stop_hook_active(),
+        ),
     }
 }
 
-pub fn failure_output(event: HookEvent, error: &str) -> PrimeHookOutput {
+pub fn failure_output(event: HookEvent, input: &PiHookInput, error: &str) -> PiHookOutput {
+    adapter_failure_output(event, error, true, input.stop_hook_active())
+}
+
+pub(crate) fn adapter_failure_output(
+    event: HookEvent,
+    error: &str,
+    continuation_supported: bool,
+    stop_hook_active: bool,
+) -> ExtensionHookOutput {
     let reason = format!("Project Brain 治理或审计失败：{error}");
     match event {
-        HookEvent::PreToolUse => PrimeHookOutput(json!({
+        HookEvent::PreToolUse => ExtensionHookOutput(json!({
             "schema_version": 1,
             "event": "tool_about_to_run",
             "block": true,
             "reason": reason,
             "context": []
         })),
-        HookEvent::Stop => PrimeHookOutput(json!({
+        HookEvent::Stop => ExtensionHookOutput(json!({
             "schema_version": 1,
             "event": "task_stopping",
             "feedback": [reason],
             "continuation": {
-                "requested": false,
-                "supported": false
+                "requested": continuation_supported && !stop_hook_active,
+                "supported": continuation_supported,
+                "reason": if continuation_supported && !stop_hook_active {
+                    Some(reason.as_str())
+                } else {
+                    None
+                }
             }
         })),
         HookEvent::SessionStart | HookEvent::UserPromptSubmit | HookEvent::PostToolUse => {
-            PrimeHookOutput(json!({
+            ExtensionHookOutput(json!({
                 "schema_version": 1,
                 "event": event_name(event),
                 "degraded": true,
@@ -95,7 +143,7 @@ pub fn failure_output(event: HookEvent, error: &str) -> PrimeHookOutput {
     }
 }
 
-fn map_outcome(outcome: &InternalHookOutcome) -> PrimeHookOutput {
+fn map_outcome(outcome: &InternalHookOutcome, continuation_supported: bool) -> ExtensionHookOutput {
     let value = match &outcome.payload {
         HookOutcomePayload::SessionOpened { inject } => json!({
             "schema_version": 1,
@@ -126,13 +174,13 @@ fn map_outcome(outcome: &InternalHookOutcome) -> PrimeHookOutput {
                 "feedback": feedback.iter().map(|item| item.text.as_str()).collect::<Vec<_>>(),
                 "continuation": {
                     "requested": requested,
-                    "supported": false,
+                    "supported": continuation_supported,
                     "reason": reason
                 }
             })
         }
     };
-    PrimeHookOutput(value)
+    ExtensionHookOutput(value)
 }
 
 fn gate_output(event: &str, gate: &GateDecision, context: &[&str]) -> Value {
@@ -178,7 +226,7 @@ mod tests {
     use brain_store::BrainStore;
     use serde_json::json;
 
-    use super::{PrimeHookInput, capabilities, handle};
+    use super::{PiHookInput, capabilities, handle};
     use crate::app::HookEvent;
 
     fn config() -> BrainConfig {
@@ -209,9 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn prime_pre_tool_denial_uses_an_independent_adapter_domain() {
+    fn pi_pre_tool_denial_uses_an_independent_adapter_domain() {
         let store = BrainStore::open_in_memory().unwrap();
-        let input: PrimeHookInput = serde_json::from_value(json!({
+        let input: PiHookInput = serde_json::from_value(json!({
             "session_id": "session",
             "cwd": "C:/repo",
             "tool_name": "edit",
@@ -235,10 +283,10 @@ mod tests {
         assert_eq!(output.0["block"], true);
         let records = store.recent_adapter_audit("project_a", 10).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].adapter_kind, "prime_agent");
+        assert_eq!(records[0].adapter_kind, "pi");
         assert_eq!(
             capabilities().continue_after_stop,
-            CapabilitySupport::Unsupported
+            CapabilitySupport::Emulated
         );
     }
 }

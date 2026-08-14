@@ -1,12 +1,14 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read,
     path::Path,
     process::{Command, Output},
 };
 
 use brain_analyzer::LineRange;
 use brain_core::normalize_project_path;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
@@ -17,6 +19,90 @@ pub struct DiffHunk {
     pub new: Option<LineRange>,
     pub old_start: usize,
     pub new_start: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeSourceState {
+    pub schema_version: u32,
+    pub fingerprint: String,
+    pub entries: Vec<WorktreeSourceEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WorktreeSourceEntry {
+    pub path: String,
+    pub kind: WorktreeSourceEntryKind,
+    pub content_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeSourceEntryKind {
+    File,
+    Symlink,
+    Missing,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceDeltaV1 {
+    pub schema_version: u32,
+    pub before_fingerprint: String,
+    pub after_fingerprint: String,
+    pub created_paths: Vec<String>,
+    pub modified_paths: Vec<String>,
+    pub deleted_paths: Vec<String>,
+}
+
+impl SourceDeltaV1 {
+    pub fn between(before: &WorktreeSourceState, after: &WorktreeSourceState) -> Self {
+        let before_entries = before
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let after_entries = after
+            .entries
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let created_paths = after_entries
+            .keys()
+            .filter(|path| !before_entries.contains_key(**path))
+            .map(|path| (*path).to_owned())
+            .collect();
+        let deleted_paths = before_entries
+            .keys()
+            .filter(|path| !after_entries.contains_key(**path))
+            .map(|path| (*path).to_owned())
+            .collect();
+        let modified_paths = before_entries
+            .iter()
+            .filter_map(|(path, before_entry)| {
+                after_entries
+                    .get(path)
+                    .filter(|after_entry| *after_entry != before_entry)
+                    .map(|_| (*path).to_owned())
+            })
+            .collect();
+        Self {
+            schema_version: 1,
+            before_fingerprint: before.fingerprint.clone(),
+            after_fingerprint: after.fingerprint.clone(),
+            created_paths,
+            modified_paths,
+            deleted_paths,
+        }
+    }
+
+    pub fn changed_paths(&self) -> Vec<String> {
+        let mut paths = self.created_paths.clone();
+        paths.extend(self.modified_paths.iter().cloned());
+        paths.extend(self.deleted_paths.iter().cloned());
+        paths.sort();
+        paths.dedup();
+        paths
+    }
 }
 
 pub fn changed_files(root: &Path, base: &str) -> Result<Vec<String>, AppError> {
@@ -66,8 +152,15 @@ pub fn repository_files(root: &Path) -> Result<Vec<String>, AppError> {
 
 /// 对 Git 已跟踪及未忽略的未跟踪文件建立内容指纹，用于拒绝索引期间发生的源码变化。
 pub fn worktree_fingerprint(root: &Path) -> Result<String, AppError> {
+    Ok(worktree_source_state(root)?.fingerprint)
+}
+
+/// 对 Git 可见工作树建立可重放的内容状态；fingerprint 与 v1
+/// `worktree_fingerprint` 字节合同完全一致。
+pub fn worktree_source_state(root: &Path) -> Result<WorktreeSourceState, AppError> {
     let root = root.canonicalize()?;
     let mut digest = Sha256::new();
+    let mut entries = Vec::new();
     digest.update(b"project-brain/worktree-fingerprint/v1\0");
     for path in repository_files(&root)? {
         let relative = Path::new(&path);
@@ -90,23 +183,58 @@ pub fn worktree_fingerprint(root: &Path) -> Result<String, AppError> {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 digest.update(b"missing\0");
+                entries.push(WorktreeSourceEntry {
+                    path,
+                    kind: WorktreeSourceEntryKind::Missing,
+                    content_sha256: None,
+                });
                 continue;
             }
             Err(error) => return Err(error.into()),
         };
         if metadata.file_type().is_symlink() {
             digest.update(b"symlink\0");
-            digest.update(fs::read_link(candidate)?.as_os_str().as_encoded_bytes());
+            let target = fs::read_link(candidate)?;
+            let bytes = target.as_os_str().as_encoded_bytes();
+            digest.update(bytes);
+            entries.push(WorktreeSourceEntry {
+                path,
+                kind: WorktreeSourceEntryKind::Symlink,
+                content_sha256: Some(format!("{:x}", Sha256::digest(bytes))),
+            });
         } else if metadata.is_file() {
             digest.update(b"file\0");
             let mut file = fs::File::open(candidate)?;
-            std::io::copy(&mut file, &mut DigestWriter(&mut digest))?;
+            let mut file_digest = Sha256::new();
+            let mut buffer = vec![0_u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                digest.update(&buffer[..read]);
+                file_digest.update(&buffer[..read]);
+            }
+            entries.push(WorktreeSourceEntry {
+                path,
+                kind: WorktreeSourceEntryKind::File,
+                content_sha256: Some(format!("{:x}", file_digest.finalize())),
+            });
         } else {
             digest.update(b"other\0");
+            entries.push(WorktreeSourceEntry {
+                path,
+                kind: WorktreeSourceEntryKind::Other,
+                content_sha256: None,
+            });
         }
         digest.update([0]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(WorktreeSourceState {
+        schema_version: 1,
+        fingerprint: format!("{:x}", digest.finalize()),
+        entries,
+    })
 }
 
 pub fn worktree_is_clean(root: &Path) -> Result<bool, AppError> {
@@ -116,19 +244,6 @@ pub fn worktree_is_clean(root: &Path) -> Result<bool, AppError> {
         .output()?;
     ensure_success(&output)?;
     Ok(output.stdout.is_empty())
-}
-
-struct DigestWriter<'a, D>(&'a mut D);
-
-impl<D: Digest> std::io::Write for DigestWriter<'_, D> {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.0.update(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 pub fn head_revision(root: &Path) -> Result<String, AppError> {

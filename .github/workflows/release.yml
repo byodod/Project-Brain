@@ -71,8 +71,9 @@ jobs:
         run: |
           binary="target/${{ matrix.target }}/release/${{ matrix.executable }}"
           "$binary" capabilities codex
-          "$binary" capabilities claude-code
-          "$binary" capabilities prime-agent
+          "$binary" capabilities pi
+          "$binary" capabilities opencode
+          "$binary" capabilities dsh
       - name: Qualify release control plane
         shell: bash
         run: |

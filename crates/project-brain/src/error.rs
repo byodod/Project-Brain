@@ -26,7 +26,7 @@ pub enum AppError {
     Scip(#[from] brain_scip::ScipError),
 
     #[error(transparent)]
-    Godot(#[from] brain_godot::GodotError),
+    Evidence(#[from] brain_evidence::EvidenceError),
 
     #[error("找不到 Project Brain 配置；请先在项目根目录执行 project-brain init")]
     ProjectNotInitialized,

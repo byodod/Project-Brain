@@ -110,16 +110,18 @@ impl HookEventKind {
 #[serde(rename_all = "snake_case")]
 pub enum AdapterKind {
     Codex,
-    ClaudeCode,
-    PrimeAgent,
+    Pi,
+    Opencode,
+    Dsh,
 }
 
 impl AdapterKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
-            Self::ClaudeCode => "claude_code",
-            Self::PrimeAgent => "prime_agent",
+            Self::Pi => "pi",
+            Self::Opencode => "opencode",
+            Self::Dsh => "dsh",
         }
     }
 }
@@ -134,6 +136,7 @@ pub struct AdapterIdentity {
 #[serde(rename_all = "snake_case")]
 pub enum CapabilitySupport {
     Supported,
+    Emulated,
     Unsupported,
 }
 
@@ -157,23 +160,33 @@ impl AdapterCapabilities {
         }
     }
 
-    pub const fn claude_code() -> Self {
+    pub const fn pi() -> Self {
         Self {
             deny_intent: CapabilitySupport::Supported,
             deny_tool: CapabilitySupport::Supported,
             inject_context: CapabilitySupport::Supported,
             post_feedback: CapabilitySupport::Supported,
-            continue_after_stop: CapabilitySupport::Supported,
+            continue_after_stop: CapabilitySupport::Emulated,
         }
     }
 
-    pub const fn prime_agent() -> Self {
+    pub const fn opencode() -> Self {
         Self {
-            deny_intent: CapabilitySupport::Supported,
+            deny_intent: CapabilitySupport::Unsupported,
             deny_tool: CapabilitySupport::Supported,
             inject_context: CapabilitySupport::Supported,
             post_feedback: CapabilitySupport::Supported,
             continue_after_stop: CapabilitySupport::Unsupported,
+        }
+    }
+
+    pub const fn dsh() -> Self {
+        Self {
+            deny_intent: CapabilitySupport::Unsupported,
+            deny_tool: CapabilitySupport::Supported,
+            inject_context: CapabilitySupport::Supported,
+            post_feedback: CapabilitySupport::Supported,
+            continue_after_stop: CapabilitySupport::Supported,
         }
     }
 }
@@ -388,10 +401,18 @@ mod tests {
     }
 
     #[test]
-    fn prime_does_not_claim_stop_continuation_support() {
+    fn adapter_capabilities_match_verified_lifecycle_seams() {
         assert_eq!(
-            AdapterCapabilities::prime_agent().continue_after_stop,
+            AdapterCapabilities::opencode().continue_after_stop,
             CapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            AdapterCapabilities::pi().continue_after_stop,
+            CapabilitySupport::Emulated
+        );
+        assert_eq!(
+            AdapterCapabilities::dsh().continue_after_stop,
+            CapabilitySupport::Supported
         );
         assert_eq!(
             AdapterCapabilities::codex().continue_after_stop,

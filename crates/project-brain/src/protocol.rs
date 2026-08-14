@@ -8,9 +8,12 @@ use brain_core::{
     path_has_prefix,
 };
 use brain_evidence::{EvidenceFreshness, EvidencePlane};
-use brain_store::{BrainStore, SemanticResolutionKind, SemanticSourceTrust};
+use brain_store::{
+    BrainStore, EvidenceHeadIdentity, EvidenceHeadTransition, EvidenceImpactPlan,
+    SemanticResolutionKind, SemanticSourceTrust,
+};
 
-use crate::evidence::{CurrentSourceVerification, effective_evidence_freshness};
+use crate::evidence::{CurrentSourceVerification, effective_evidence_freshness_v2};
 use crate::provider::ProviderTrustStatus;
 use crate::{app::decision_reason, error::AppError, git, reconcile};
 
@@ -22,27 +25,6 @@ const SOURCE_BOUND_EVIDENCE_PLANES: [EvidencePlane; 6] = [
     EvidencePlane::Test,
     EvidencePlane::Runtime,
 ];
-
-struct EvidenceStalenessTrigger {
-    invalidation: EvidenceInvalidation,
-    reason: String,
-    changed_paths: Vec<String>,
-}
-
-enum EvidenceInvalidation {
-    AllSourceBound(EvidenceFreshness),
-    ReconcileSource(Option<String>),
-}
-
-impl EvidenceInvalidation {
-    fn freshness(&self) -> EvidenceFreshness {
-        match self {
-            Self::AllSourceBound(freshness) => *freshness,
-            Self::ReconcileSource(Some(_)) => EvidenceFreshness::Stale,
-            Self::ReconcileSource(None) => EvidenceFreshness::Unknown,
-        }
-    }
-}
 
 pub fn process(
     root: &Path,
@@ -59,6 +41,7 @@ pub fn process(
                 text: session_context(config),
             }];
             inject.extend(evidence_context(
+                root,
                 store,
                 &config.project_key,
                 &current_source,
@@ -70,7 +53,7 @@ pub fn process(
             let current_source = CurrentSourceVerification::inspect(root);
             HookOutcomePayload::IntentDeclared {
                 gate: GateDecision::NoVeto,
-                inject: evidence_context(store, &config.project_key, &current_source, false)?,
+                inject: evidence_context(root, store, &config.project_key, &current_source, false)?,
             }
         }
         HookEventPayload::ToolAboutToRun(tool) => {
@@ -86,11 +69,29 @@ pub fn process(
             let mut inject = context_from_decision(&decision);
             let current_source = CurrentSourceVerification::inspect(root);
             inject.extend(evidence_context(
+                root,
                 store,
                 &config.project_key,
                 &current_source,
                 false,
             )?);
+            if matches!(
+                decision.decision,
+                DecisionKind::Allow | DecisionKind::AllowWithContext
+            ) && pre_action_may_mutate_source(&tool.action)
+                && let Ok(source_state) = git::worktree_source_state(root)
+            {
+                let source_state_json = serde_json::to_string(&source_state)?;
+                store.record_source_operation_baseline(
+                    &config.project_key,
+                    event.adapter.kind,
+                    &event.session_key,
+                    &tool.operation_id,
+                    &event.event_id,
+                    &source_state.fingerprint,
+                    &source_state_json,
+                )?;
+            }
             HookOutcomePayload::ToolAboutToRun {
                 gate: gate_from_decision(&decision),
                 inject,
@@ -110,6 +111,7 @@ pub fn process(
                 stopping.vendor_loop_active,
             );
             feedback.extend(evidence_feedback(
+                root,
                 store,
                 &config.project_key,
                 &current_source,
@@ -142,43 +144,33 @@ fn tool_finished_payload(
         &tool.tool_name,
     )?;
     let mut feedback = feedback_from_decision(&decision);
-    if let Some(trigger) =
-        evidence_staleness_trigger(root, store, &config.project_key, &tool.action, tool.status)?
-    {
-        let invalidation = match &trigger.invalidation {
-            EvidenceInvalidation::AllSourceBound(EvidenceFreshness::Stale) => store
-                .mark_evidence_planes_stale(
-                    &config.project_key,
-                    &SOURCE_BOUND_EVIDENCE_PLANES,
-                    &event.event_id,
-                    &trigger.reason,
-                    &trigger.changed_paths,
-                )?,
-            EvidenceInvalidation::AllSourceBound(EvidenceFreshness::Unknown) => store
-                .mark_evidence_planes_unknown(
-                    &config.project_key,
-                    &SOURCE_BOUND_EVIDENCE_PLANES,
-                    &event.event_id,
-                    &trigger.reason,
-                    &trigger.changed_paths,
-                )?,
-            EvidenceInvalidation::AllSourceBound(EvidenceFreshness::Fresh) => {
-                unreachable!("invalidation 不能产生 fresh")
-            }
-            EvidenceInvalidation::ReconcileSource(current_source_fingerprint) => store
-                .reconcile_evidence_source(
-                    &config.project_key,
-                    current_source_fingerprint.as_deref(),
-                    &event.event_id,
-                    &trigger.reason,
-                    &trigger.changed_paths,
-                )?,
-        };
-        if invalidation.heads_marked > 0 {
-            let freshness = trigger.invalidation.freshness().as_str();
+    if let Some(plan) = evidence_impact_plan(root, store, &config.project_key, event, tool)? {
+        let result = store.apply_evidence_impact_plan(&config.project_key, &plan)?;
+        if result.heads_marked > 0 {
+            let stale_count = plan
+                .transitions
+                .iter()
+                .filter(|transition| transition.freshness == EvidenceFreshness::Stale)
+                .count();
+            let unknown_count = plan
+                .transitions
+                .iter()
+                .filter(|transition| transition.freshness == EvidenceFreshness::Unknown)
+                .count();
+            let transition_summary = match (stale_count, unknown_count) {
+                (stale, 0) => format!("{stale} 个 head 已标记为 stale"),
+                (0, unknown) => format!("{unknown} 个 head 已标记为 unknown"),
+                (stale, unknown) => {
+                    format!("{stale} 个 head 已标记为 stale，{unknown} 个 head 已标记为 unknown")
+                }
+            };
             feedback.push(FeedbackItem {
                 severity: FeedbackSeverity::Warning,
-                text: format!("Project Brain：检测到源码变更或无法排除不透明工具的源码变更，现有 Source/Semantic/Engine/Build/Test/Runtime Evidence 已标记为 {freshness}；非 fresh 证据没有硬阻断资格。请重新运行对应的受信任 Provider 恢复 fresh。"),
+                text: format!(
+                    "Project Brain：按 Evidence Input Manifest 精确复核后，{transition_summary}；共 {} 个 head 被降权，{} 个未受影响 head 保持 fresh。非 fresh 证据没有硬阻断资格。",
+                    result.heads_marked,
+                    result.heads_preserved,
+                ),
             });
         }
     }
@@ -199,74 +191,147 @@ fn opaque_action_may_mutate_source(action: &ToolAction) -> bool {
     )
 }
 
-fn evidence_staleness_trigger(
+fn pre_action_may_mutate_source(action: &ToolAction) -> bool {
+    explicit_mutation(action)
+        || matches!(action.kind, ActionKind::Execute | ActionKind::GitOperation)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "精准影响计划必须完整处理基线、当前 Source、input manifest 与未知降级"
+)]
+fn evidence_impact_plan(
     root: &Path,
     store: &BrainStore,
     project_key: &str,
-    action: &ToolAction,
-    status: brain_core::ToolStatus,
-) -> Result<Option<EvidenceStalenessTrigger>, AppError> {
-    let heads = store.list_evidence_head_summaries(project_key)?;
-    let affected_heads = heads
-        .iter()
-        .filter(|head| SOURCE_BOUND_EVIDENCE_PLANES.contains(&head.plane))
-        .collect::<Vec<_>>();
-    if affected_heads.is_empty() {
+    event: &InternalHookEvent,
+    tool: &brain_core::ToolFinished,
+) -> Result<Option<EvidenceImpactPlan>, AppError> {
+    let explicit_mutation = explicit_mutation(&tool.action);
+    if !explicit_mutation && !opaque_action_may_mutate_source(&tool.action) {
         return Ok(None);
     }
-    if explicit_mutation(action) {
-        return Ok(Some(EvidenceStalenessTrigger {
-            invalidation: EvidenceInvalidation::AllSourceBound(EvidenceFreshness::Stale),
-            reason: format!(
-                "PostToolUse observed {status:?} {:?}; downstream Evidence must be refreshed",
-                action.kind
-            ),
-            changed_paths: mutation_paths(action),
-        }));
-    }
-    if !opaque_action_may_mutate_source(action) {
-        return Ok(None);
-    }
-    if affected_heads
-        .iter()
-        .all(|head| head.freshness == EvidenceFreshness::Stale)
-    {
-        return Ok(None);
-    }
-
-    let Ok(current_fingerprint) = git::worktree_fingerprint(root) else {
-        if !affected_heads
-            .iter()
-            .any(|head| head.freshness == EvidenceFreshness::Fresh)
-        {
-            return Ok(None);
-        }
-        return Ok(Some(EvidenceStalenessTrigger {
-            invalidation: EvidenceInvalidation::ReconcileSource(None),
-            reason: format!(
-                "PostToolUse observed {status:?} opaque {:?}; current Source fingerprint is unavailable, so source-dependent Evidence validity is unknown",
-                action.kind
-            ),
-            changed_paths: git::changed_files(root, "HEAD").unwrap_or_default(),
-        }));
-    };
-    let mismatched_heads = affected_heads
-        .iter()
+    let heads = store
+        .list_evidence_heads(project_key)?
+        .into_iter()
         .filter(|head| {
-            head.freshness != EvidenceFreshness::Stale
-                && head.source_fingerprint != current_fingerprint
+            SOURCE_BOUND_EVIDENCE_PLANES.contains(&head.plane)
+                && head.freshness == EvidenceFreshness::Fresh
         })
-        .count();
-    if mismatched_heads == 0 {
+        .collect::<Vec<_>>();
+    if heads.is_empty() {
         return Ok(None);
     }
-    Ok(Some(EvidenceStalenessTrigger {
-        invalidation: EvidenceInvalidation::ReconcileSource(Some(current_fingerprint)),
-        reason: format!(
-            "PostToolUse observed {status:?} opaque {:?}; current Source fingerprint differs from {mismatched_heads} non-stale source-bound Evidence head(s)",
-            action.kind
-        ),
-        changed_paths: git::changed_files(root, "HEAD").unwrap_or_default(),
+    let baseline = store.source_operation_baseline(
+        project_key,
+        event.adapter.kind,
+        &event.session_key,
+        &tool.operation_id,
+    )?;
+    let (current_source, mut changed_paths, baseline_problem) = if let Some(baseline) = baseline {
+        let before = serde_json::from_str::<git::WorktreeSourceState>(&baseline.source_state_json)
+            .map_err(|error| {
+                AppError::Provider(format!("Source operation baseline JSON 已损坏：{error}"))
+            })?;
+        if before.fingerprint != baseline.source_fingerprint {
+            return Err(AppError::Provider(
+                "Source operation baseline fingerprint 与状态内容不一致".to_owned(),
+            ));
+        }
+        match git::worktree_source_state(root) {
+            Ok(after) => {
+                let delta = git::SourceDeltaV1::between(&before, &after);
+                (
+                    CurrentSourceVerification::Verified(after.fingerprint),
+                    delta.changed_paths(),
+                    None,
+                )
+            }
+            Err(error) => (
+                CurrentSourceVerification::Unavailable(error.to_string()),
+                mutation_paths(&tool.action),
+                Some("post_source_state_unavailable".to_owned()),
+            ),
+        }
+    } else {
+        let current = CurrentSourceVerification::inspect(root);
+        let mut paths = mutation_paths(&tool.action);
+        paths.extend(git::changed_files(root, "HEAD").unwrap_or_default());
+        (
+            current,
+            paths,
+            Some("pre_source_baseline_missing".to_owned()),
+        )
+    };
+    changed_paths.sort();
+    changed_paths.dedup();
+    let mut transitions = Vec::new();
+    let mut preserved = Vec::new();
+    let identity = |head: &brain_store::EvidenceHeadRecord| EvidenceHeadIdentity {
+        plane: head.plane,
+        provider_id: head.provider_id.clone(),
+        snapshot_fingerprint: head.snapshot_fingerprint.clone(),
+    };
+    for head in &heads {
+        if explicit_mutation && head.input_manifest.is_none() {
+            transitions.push(EvidenceHeadTransition {
+                identity: identity(head),
+                freshness: EvidenceFreshness::Stale,
+                reason: format!(
+                    "PostToolUse observed {:?} {:?}; legacy project-wide Evidence 被显式源码变更失效",
+                    tool.status, tool.action.kind
+                ),
+            });
+            continue;
+        }
+        let effective = effective_evidence_freshness_v2(
+            root,
+            head.freshness,
+            &head.snapshot.source_fingerprint,
+            head.input_manifest.as_ref(),
+            &current_source,
+        );
+        match effective.freshness {
+            EvidenceFreshness::Fresh => preserved.push(identity(head)),
+            EvidenceFreshness::Stale | EvidenceFreshness::Unknown => {
+                transitions.push(EvidenceHeadTransition {
+                    identity: identity(head),
+                    freshness: effective.freshness,
+                    reason: effective.reason.unwrap_or_else(|| {
+                        format!(
+                            "PostToolUse observed {:?} {:?}; Evidence input validity changed",
+                            tool.status, tool.action.kind
+                        )
+                    }),
+                });
+            }
+        }
+    }
+    let final_source = CurrentSourceVerification::inspect(root);
+    let mut unknown_reason = baseline_problem;
+    if final_source != current_source {
+        transitions = heads
+            .iter()
+            .map(|head| EvidenceHeadTransition {
+                identity: identity(head),
+                freshness: EvidenceFreshness::Unknown,
+                reason: "Evidence impact 规划期间 whole Source 发生并发变化".to_owned(),
+            })
+            .collect();
+        preserved.clear();
+        unknown_reason = Some("source_changed_during_impact_planning".to_owned());
+    } else if let CurrentSourceVerification::Unavailable(error) = &current_source {
+        unknown_reason = Some(error.clone());
+    }
+    Ok(Some(EvidenceImpactPlan {
+        event_id: event.event_id.clone(),
+        hook_event_id: Some(event.event_id.clone()),
+        operation_id: Some(tool.operation_id.clone()),
+        observed_source_fingerprint: final_source.fingerprint().map(ToOwned::to_owned),
+        transitions,
+        preserved,
+        changed_paths,
+        unknown_reason,
     }))
 }
 
@@ -284,6 +349,7 @@ fn mutation_paths(action: &ToolAction) -> Vec<String> {
 }
 
 fn evidence_context(
+    root: &Path,
     store: &BrainStore,
     project_key: &str,
     current_source: &CurrentSourceVerification,
@@ -293,9 +359,11 @@ fn evidence_context(
         .list_evidence_head_summaries(project_key)?
         .into_iter()
         .filter_map(|head| {
-            let effective = effective_evidence_freshness(
+            let effective = effective_evidence_freshness_v2(
+                root,
                 head.freshness,
                 &head.source_fingerprint,
+                head.input_manifest.as_ref(),
                 current_source,
             );
             (include_fresh || effective.freshness != EvidenceFreshness::Fresh).then(|| {
@@ -319,6 +387,7 @@ fn evidence_context(
 }
 
 fn evidence_feedback(
+    root: &Path,
     store: &BrainStore,
     project_key: &str,
     current_source: &CurrentSourceVerification,
@@ -327,9 +396,11 @@ fn evidence_feedback(
         .list_evidence_head_summaries(project_key)?
         .into_iter()
         .filter_map(|head| {
-            let effective = effective_evidence_freshness(
+            let effective = effective_evidence_freshness_v2(
+                root,
                 head.freshness,
                 &head.source_fingerprint,
+                head.input_manifest.as_ref(),
                 current_source,
             );
             (effective.freshness != EvidenceFreshness::Fresh).then(|| FeedbackItem {
@@ -669,7 +740,7 @@ fn stop_decision(
         return (StopDecision::AllowStop, Vec::new());
     }
     let (finding_violations, finding_feedback) =
-        evaluate_finding_stop(config, store, current_source);
+        evaluate_finding_stop(root, config, store, current_source);
     if !config.stop_reconcile.enabled {
         let (mut violations, mut feedback) =
             evaluate_symbol_stop(root, config, store, provider_trust);
@@ -747,6 +818,7 @@ fn stop_decision(
 /// 只把精确命中、fresh、complete、deterministic 且声明为确定性违规的 finding
 /// 提升为 Stop gate。存储不可用、缺失 head、合同漂移和 stale 都按 fail-open 反馈。
 fn evaluate_finding_stop(
+    root: &Path,
     config: &BrainConfig,
     store: &BrainStore,
     current_source: &CurrentSourceVerification,
@@ -799,9 +871,11 @@ fn evaluate_finding_stop(
             });
             continue;
         }
-        let effective = effective_evidence_freshness(
+        let effective = effective_evidence_freshness_v2(
+            root,
             head.freshness,
             &head.snapshot.source_fingerprint,
+            head.input_manifest.as_ref(),
             current_source,
         );
         for finding in head
@@ -1379,14 +1453,19 @@ mod tests {
             .unwrap();
         let matching_source = CurrentSourceVerification::Verified("sha256_source".to_owned());
 
-        let (unmapped, unmapped_feedback) =
-            evaluate_finding_stop(&finding_config(Vec::new()), &store, &matching_source);
+        let (unmapped, unmapped_feedback) = evaluate_finding_stop(
+            Path::new("."),
+            &finding_config(Vec::new()),
+            &store,
+            &matching_source,
+        );
         assert!(unmapped.is_empty());
         assert!(unmapped_feedback.is_empty());
 
         let config = finding_config(vec![finding_mapping()]);
         config.validate().unwrap();
-        let (mapped, feedback) = evaluate_finding_stop(&config, &store, &matching_source);
+        let (mapped, feedback) =
+            evaluate_finding_stop(Path::new("."), &config, &store, &matching_source);
         assert_eq!(mapped.len(), 1);
         assert!(feedback.is_empty());
         assert!(mapped[0].contains("TEST-ASSERT-001"));
@@ -1394,7 +1473,7 @@ mod tests {
         let mismatched_source =
             CurrentSourceVerification::Verified("sha256_different_source".to_owned());
         let (mismatched, mismatched_feedback) =
-            evaluate_finding_stop(&config, &store, &mismatched_source);
+            evaluate_finding_stop(Path::new("."), &config, &store, &mismatched_source);
         assert!(mismatched.is_empty());
         assert!(
             mismatched_feedback
@@ -1405,7 +1484,7 @@ mod tests {
         let unavailable_source =
             CurrentSourceVerification::Unavailable("git unavailable".to_owned());
         let (unavailable, unavailable_feedback) =
-            evaluate_finding_stop(&config, &store, &unavailable_source);
+            evaluate_finding_stop(Path::new("."), &config, &store, &unavailable_source);
         assert!(unavailable.is_empty());
         assert!(
             unavailable_feedback
@@ -1422,7 +1501,8 @@ mod tests {
                 &["src/Save.cs".to_owned()],
             )
             .unwrap();
-        let (stale, stale_feedback) = evaluate_finding_stop(&config, &store, &matching_source);
+        let (stale, stale_feedback) =
+            evaluate_finding_stop(Path::new("."), &config, &store, &matching_source);
         assert!(stale.is_empty());
         assert!(
             stale_feedback

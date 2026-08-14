@@ -1328,7 +1328,7 @@ pub(crate) fn provider_cli_path(path: &Path) -> String {
     }
 }
 
-fn provider_environment(
+pub(crate) fn provider_environment(
     repository_root: Option<&Path>,
 ) -> Result<Vec<(OsString, OsString)>, AppError> {
     const ALLOWED: [&str; 22] = [
