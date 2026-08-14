@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-15
+
+### Added
+
+- 新增官方 `@byodod/project-brain` npm 分发：单包携带四平台已资格验证的原生 CLI、零安装脚本的
+  Node launcher、Release 组装/安装 smoke test，以及首次人工引导后可启用的 GitHub OIDC 自动发布。
+
 ### Changed
 
 - 精简项目首页，将 Agent 接入、Provider/Evidence 和数据库/资格/发布细节迁移到分区文档，并增加统一

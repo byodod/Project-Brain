@@ -26,6 +26,11 @@ jobs:
         run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
       - name: Select pinned Rust toolchain
         run: rustup default 1.92.0
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - name: Require tag to match workspace version
         run: python scripts/verify_release_tag.py "${GITHUB_REF_NAME}"
       - name: Verify source gate
@@ -33,6 +38,8 @@ jobs:
           cargo fmt --all -- --check
           cargo test --workspace --all-targets --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings
+          node --test npm/test/*.test.js
+          python -B -m unittest discover -s scripts/tests -p "test_*.py" -v
 
   build:
     name: Package ${{ matrix.target }}
@@ -114,9 +121,58 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  npm-package:
+    name: Package npm distribution
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Download native release archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist/native
+          merge-multiple: true
+      - name: Assemble npm package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python scripts/assemble_npm_package.py \
+            --dist dist/native \
+            --output target/npm-package \
+            --version "$version"
+          mkdir -p dist/npm
+          npm pack ./target/npm-package --pack-destination dist/npm
+      - name: Install and smoke-test packed npm CLI
+        shell: bash
+        run: |
+          npm install --prefix target/npm-smoke --ignore-scripts ./dist/npm/*.tgz
+          cli="target/npm-smoke/node_modules/.bin/project-brain"
+          "$cli" --version
+          "$cli" capabilities codex
+          "$cli" capabilities pi
+          "$cli" capabilities opencode
+          "$cli" capabilities dsh
+      - name: Upload npm package
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: dist/npm/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish GitHub release
-    needs: build
+    needs: [build, npm-package]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -128,16 +184,50 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
+      - name: Download npm package
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: dist
       - name: Generate SHA-256 checksums
         shell: bash
         run: |
           cd dist
-          find . -maxdepth 1 -type f \( -name 'project-brain-*.tar.gz' -o -name 'project-brain-*.zip' \) -printf '%f\0' \
+          find . -maxdepth 1 -type f \( -name 'project-brain-*.tar.gz' -o -name 'project-brain-*.zip' -o -name 'byodod-project-brain-*.tgz' \) -printf '%f\0' \
             | sort -z \
             | xargs -0 sha256sum > SHA256SUMS
-          test "$(wc -l < SHA256SUMS)" -eq 4
+          test "$(wc -l < SHA256SUMS)" -eq 5
       - name: Publish immutable tag assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes --title "Project Brain ${GITHUB_REF_NAME}"
+
+  publish-npm:
+    name: Publish npm package
+    needs: publish
+    if: vars.PROJECT_BRAIN_NPM_TRUSTED_PUBLISHING == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Set up Node.js for trusted publishing
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+      - name: Install OIDC-capable npm CLI
+        run: npm install --global npm@11.18.0
+      - name: Download npm package
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: dist
+      - name: Publish public package with npm OIDC
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          npm publish "dist/byodod-project-brain-${version}.tgz" --access public

@@ -1,0 +1,44 @@
+{
+  "name": "@byodod/project-brain",
+  "version": "0.0.0-development",
+  "description": "Deterministic project decision and memory control plane for coding agents",
+  "license": "MIT OR Apache-2.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "project-brain": "bin/project-brain.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "vendor",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/byodod/Project-Brain.git"
+  },
+  "homepage": "https://github.com/byodod/Project-Brain",
+  "bugs": {
+    "url": "https://github.com/byodod/Project-Brain/issues"
+  },
+  "keywords": [
+    "coding-agent",
+    "codex",
+    "pi",
+    "opencode",
+    "dsh",
+    "governance",
+    "memory",
+    "rust"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

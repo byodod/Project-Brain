@@ -4,7 +4,21 @@
 
 ## 1. 获取与安装
 
-从 [GitHub Releases](https://github.com/byodod/Project-Brain/releases) 下载当前平台的压缩包，并使用同一
+推荐通过 npm 安装官方跨平台包：
+
+```text
+npm install --global @byodod/project-brain
+project-brain --version
+```
+
+临时运行可以使用：
+
+```text
+npx @byodod/project-brain --version
+```
+
+npm 包直接携带四个平台的原生 Rust CLI，不运行 `postinstall` 下载脚本。也可以从
+[GitHub Releases](https://github.com/byodod/Project-Brain/releases) 下载当前平台压缩包，并使用同一
 Release 中的 `SHA256SUMS` 校验归档。将 `project-brain` 或 `project-brain.exe` 放到可执行路径后运行：
 
 ```text
@@ -13,6 +27,9 @@ project-brain install
 
 该命令把当前二进制安装到机器级稳定位置，并创建供各 Agent 调用的 launcher。可用
 `--install-root` 显式覆盖机器级安装根。
+
+npm 分发支持 Windows x64、Linux glibc x64、macOS Intel x64 和 macOS Apple Silicon arm64；其它平台
+应使用源码构建。
 
 ## 2. 初始化仓库
 

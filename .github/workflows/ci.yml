@@ -31,8 +31,17 @@ jobs:
         run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
       - name: Select pinned Rust toolchain
         run: rustup default 1.92.0
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
       - name: Verify formatting
         run: cargo fmt --all -- --check
+      - name: Verify npm distribution tooling
+        run: |
+          node --test npm/test/*.test.js
+          python -B -m unittest discover -s scripts/tests -p "test_*.py" -v
       - name: Run strict Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

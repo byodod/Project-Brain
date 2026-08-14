@@ -84,7 +84,10 @@ cargo test --workspace --all-targets --locked
 2. 在四个平台分别构建 release binary；
 3. 运行四 Adapter 能力自检与完整 Production Qualification；
 4. 打包二进制、README、CHANGELOG 和双许可证；
-5. 生成包含四条归档记录的 `SHA256SUMS`；
-6. 发布非草稿、非预发布的 GitHub Release。
+5. 从四份原生归档组装并 smoke-test `@byodod/project-brain` npm tarball；
+6. 生成包含四份原生归档和一份 npm tarball 的 `SHA256SUMS`；
+7. 发布非草稿、非预发布的 GitHub Release；
+8. 已启用 Trusted Publisher 时，通过 OIDC 自动发布 npm 包。
 
-维护者的逐项发布清单见 [RELEASING.md](RELEASING.md)。
+维护者的逐项发布清单见 [RELEASING.md](RELEASING.md)，首次 npm 身份引导见
+[npm 分发](npm-distribution.md)。

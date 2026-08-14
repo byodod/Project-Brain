@@ -1,4 +1,6 @@
 target/
+__pycache__/
+*.py[cod]
 .project-brain/brain.db
 .project-brain/brain.db-shm
 .project-brain/brain.db-wal
