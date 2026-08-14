@@ -5,7 +5,7 @@ Project Brain 是面向 Coding Agent 的确定性项目决策与长期记忆控�
 
 核心在没有 LLM 时完整工作。LLM 可以作为低权限语义 Provider，但不能自行获得阻断权限。
 
-当前稳定版本为 [`v0.2.1`](https://github.com/byodod/Project-Brain/releases/tag/v0.2.1)。
+当前稳定版本为 [`v0.2.2`](https://github.com/byodod/Project-Brain/releases/tag/v0.2.2)。
 
 ## 为什么使用 Project Brain
 
@@ -17,7 +17,7 @@ Project Brain 是面向 Coding Agent 的确定性项目决策与长期记忆控�
 
 ## 支持的 Agent
 
-Project Brain `v0.2.1` 正式支持四个 Agent 接入：
+Project Brain `v0.2.2` 正式支持四个 Agent 接入：
 
 | Agent | 接入方式 | 工具前阻断 | 工具后反馈 | Stop 续轮 |
 |---|---|---:|---:|---:|
@@ -128,4 +128,10 @@ project-brain doctor codex
 
 项目要求 Rust 1.92。开发门禁和发布流程见 [运维、资格与发布](docs/operations.md)。
 
-许可证：[MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE)。
+## 许可证
+
+Project Brain 采用 `MIT OR Apache-2.0` 双许可证。使用者可以自行选择遵守
+[MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE) 中的任意一种，无需同时遵守两者；完整说明见
+[LICENSE](LICENSE)。
+
+Copyright (c) 2026 byodod and Project Brain contributors。

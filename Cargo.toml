@@ -12,11 +12,11 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
-authors = ["Project Brain contributors"]
+authors = ["byodod", "Project Brain contributors"]
 
 [workspace.dependencies]
 atomic-write-file = "=0.3.0"

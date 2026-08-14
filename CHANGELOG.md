@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-15
+
+### Changed
+
+- 明确 `MIT OR Apache-2.0` 表示使用者可任选其一，统一 `byodod and Project Brain contributors`
+  版权署名，并让 npm 包和原生 Release 归档携带顶层双许可说明。
+
 ## [0.2.1] - 2026-08-15
 
 ### Added

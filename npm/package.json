@@ -3,6 +3,7 @@
   "version": "0.0.0-development",
   "description": "Deterministic project decision and memory control plane for coding agents",
   "license": "MIT OR Apache-2.0",
+  "author": "byodod and Project Brain contributors",
   "private": true,
   "type": "module",
   "bin": {
@@ -13,6 +14,7 @@
     "lib",
     "vendor",
     "README.md",
+    "LICENSE",
     "LICENSE-MIT",
     "LICENSE-APACHE"
   ],

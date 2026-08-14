@@ -27,7 +27,7 @@ Project Brain 的发布产物由 GitHub Actions 从版本标签构建，不接�
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 
-每个原生归档包含 CLI、README、变更记录和双许可证。四份原生归档随后组装为
+每个原生归档包含 CLI、README、变更记录、顶层双许可说明和两份完整许可证正文。四份原生归档随后组装为
 `byodod-project-brain-X.Y.Z.tgz`；组装任务会通过实际 npm 安装运行 CLI 与四 Adapter 能力自检。
 
 发布任务生成覆盖四份原生归档和 npm tarball 的 `SHA256SUMS`，然后创建对应 tag 的 GitHub Release。

@@ -83,7 +83,7 @@ cargo test --workspace --all-targets --locked
 1. 验证 tag、格式、测试和 Clippy；
 2. 在四个平台分别构建 release binary；
 3. 运行四 Adapter 能力自检与完整 Production Qualification；
-4. 打包二进制、README、CHANGELOG 和双许可证；
+4. 打包二进制、README、CHANGELOG、顶层双许可说明和两份完整许可证正文；
 5. 从四份原生归档组装并 smoke-test `@byodod/project-brain` npm tarball；
 6. 生成包含四份原生归档和一份 npm tarball 的 `SHA256SUMS`；
 7. 发布非草稿、非预发布的 GitHub Release；

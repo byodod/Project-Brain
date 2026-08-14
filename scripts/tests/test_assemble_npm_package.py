@@ -46,14 +46,16 @@ class AssembleNpmPackageTests(unittest.TestCase):
             package = json.loads((output / "package.json").read_text(encoding="utf-8"))
             self.assertEqual(package["name"], npm_package.PACKAGE_NAME)
             self.assertEqual(package["version"], version)
+            self.assertEqual(package["license"], "MIT OR Apache-2.0")
+            self.assertEqual(package["author"], "byodod and Project Brain contributors")
             self.assertNotIn("private", package)
             manifest = json.loads((output / "vendor" / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(len(manifest["binaries"]), 4)
             for entry in manifest["binaries"]:
                 self.assertEqual((output / entry["file"]).read_bytes(), expected[entry["target"]])
             self.assertFalse((output / "test").exists())
-            self.assertTrue((output / "LICENSE-MIT").is_file())
-            self.assertTrue((output / "LICENSE-APACHE").is_file())
+            for license_name in ("LICENSE", "LICENSE-MIT", "LICENSE-APACHE"):
+                self.assertEqual((output / license_name).read_bytes(), (repo / license_name).read_bytes())
 
     def test_rejects_version_mismatch_and_existing_output(self) -> None:
         repo = SCRIPTS.parent

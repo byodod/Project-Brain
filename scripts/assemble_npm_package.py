@@ -78,7 +78,7 @@ def assemble(repo: pathlib.Path, dist: pathlib.Path, output: pathlib.Path, versi
     (output / "package.json").write_text(
         json.dumps(package, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n"
     )
-    for license_name in ("LICENSE-MIT", "LICENSE-APACHE"):
+    for license_name in ("LICENSE", "LICENSE-MIT", "LICENSE-APACHE"):
         shutil.copyfile(repo / license_name, output / license_name)
 
     binaries = []

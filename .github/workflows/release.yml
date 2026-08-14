@@ -98,7 +98,7 @@ jobs:
           bundle="project-brain-${version}-${{ matrix.target }}"
           mkdir -p "dist/${bundle}"
           cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "dist/${bundle}/"
-          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "dist/${bundle}/"
+          cp README.md CHANGELOG.md LICENSE LICENSE-MIT LICENSE-APACHE "dist/${bundle}/"
           chmod 755 "dist/${bundle}/${{ matrix.executable }}"
           tar -C dist -czf "dist/project-brain-${version}-${{ matrix.target }}.tar.gz" "${bundle}"
       - name: Package Windows archive
@@ -109,7 +109,7 @@ jobs:
           $bundle = "project-brain-$version-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.executable }}" "dist/$bundle/"
-          Copy-Item README.md,CHANGELOG.md,LICENSE-MIT,LICENSE-APACHE "dist/$bundle/"
+          Copy-Item README.md,CHANGELOG.md,LICENSE,LICENSE-MIT,LICENSE-APACHE "dist/$bundle/"
           Compress-Archive -Path "dist/$bundle" -DestinationPath "dist/project-brain-$version-${{ matrix.target }}.zip"
       - name: Upload release archive
         uses: actions/upload-artifact@v7
