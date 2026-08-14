@@ -46,12 +46,16 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            executable: project-brain
           - os: windows-2025
             target: x86_64-pc-windows-msvc
+            executable: project-brain.exe
           - os: macos-15-intel
             target: x86_64-apple-darwin
+            executable: project-brain
           - os: macos-15
             target: aarch64-apple-darwin
+            executable: project-brain
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -65,3 +69,12 @@ jobs:
         run: cargo test --workspace --all-targets --locked --target ${{ matrix.target }}
       - name: Build release CLI
         run: cargo build --release --locked --target ${{ matrix.target }} -p project-brain
+      - name: Qualify release control plane
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/${{ matrix.executable }}"
+          "$binary" \
+            --project-root "$GITHUB_WORKSPACE" \
+            --install-root "$RUNNER_TEMP/project-brain-qualification" \
+            qualification run \
+            --request-id "ci-${{ matrix.target }}-${GITHUB_SHA}"

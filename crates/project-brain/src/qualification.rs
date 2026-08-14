@@ -1377,8 +1377,10 @@ mod tests {
     use std::fs;
 
     use super::{
-        QualificationLedger, QualificationState, case_project_isolation, case_replay_idempotency,
-        case_stop_loop_boundedness, current_target, fixture_config, run,
+        BeginRun, QUALIFICATION_SCHEMA_VERSION, QUALIFICATION_SUITE_ID,
+        QUALIFICATION_SUITE_VERSION, QualificationCaseReport, QualificationContext,
+        QualificationLedger, QualificationRunReport, QualificationState, case_project_isolation,
+        case_replay_idempotency, case_stop_loop_boundedness, current_target, unix_seconds,
     };
 
     fn temporary_root(label: &str) -> std::path::PathBuf {
@@ -1408,16 +1410,64 @@ mod tests {
         let root = temporary_root("ledger");
         let project = root.join("project");
         let install = root.join("install");
-        fs::create_dir_all(project.join(".git")).unwrap();
-        let config = fixture_config("qualification_test");
-        let first = run(Some(&install), &project, &config, "request-1").unwrap();
-        assert_eq!(first.status, QualificationState::Qualified);
-        let replay = run(Some(&install), &project, &config, "request-1").unwrap();
+        let state = install.join("state");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&state).unwrap();
+
+        let ledger = QualificationLedger::open(&state.join("qualification.sqlite")).unwrap();
+        let target = current_target().unwrap();
+        let started_at = unix_seconds().unwrap();
+        let request_hash = "sha256_ledger_fixture_request";
+        let run_id = "qualification_ledger_fixture";
+        ledger
+            .begin_run(&BeginRun {
+                run_id,
+                request_id: "request-1",
+                request_hash,
+                target: &target,
+                project_key: "qualification_test",
+                source_fingerprint: None,
+                started_at,
+            })
+            .unwrap();
+        let case = QualificationCaseReport {
+            case_id: "ledger_fixture".to_owned(),
+            case_version: 1,
+            status: "passed".to_owned(),
+            failure_code: None,
+            failure_message: None,
+            observation_hash: "sha256_ledger_fixture_observation".to_owned(),
+            metrics: serde_json::json!({ "ledger_fixture": true }),
+            elapsed_ms: 0,
+        };
+        ledger.record_case(run_id, &case).unwrap();
+        let first = QualificationRunReport {
+            schema_version: QUALIFICATION_SCHEMA_VERSION,
+            suite_id: QUALIFICATION_SUITE_ID.to_owned(),
+            suite_version: QUALIFICATION_SUITE_VERSION,
+            run_id: run_id.to_owned(),
+            request_id: "request-1".to_owned(),
+            status: QualificationState::Qualified,
+            target: target.clone(),
+            context: QualificationContext {
+                project_key: "qualification_test".to_owned(),
+                project_root: project,
+                source_fingerprint_before: None,
+                source_fingerprint_after: None,
+            },
+            cases: vec![case],
+            started_at_unix_seconds: started_at,
+            finished_at_unix_seconds: started_at,
+        };
+        ledger.finish_run(&first).unwrap();
+
+        let replay = ledger
+            .replay_for_request("request-1", request_hash)
+            .unwrap()
+            .unwrap();
         assert_eq!(replay.run_id, first.run_id);
 
-        let ledger =
-            QualificationLedger::open(&install.join("state/qualification.sqlite")).unwrap();
-        let status = ledger.status(current_target().unwrap()).unwrap();
+        let status = ledger.status(target).unwrap();
         assert!(status.qualified);
         assert!(
             ledger

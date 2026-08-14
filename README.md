@@ -237,7 +237,9 @@ project-brain qualification status
 project-brain doctor codex --require-qualified
 ```
 
-Release workflow 会在每个平台执行同一套 qualification。
+主分支 CI 与 Release workflow 都会在每个平台构建最终二进制后，以独立进程执行同一套 qualification；
+账本单测不再与其它 Rust 单测并发执行 10,000 事件压力资格，避免把共享 runner 的并行 I/O 抖动误判为
+产品失败。
 
 ## 明确不做
 

@@ -22,6 +22,8 @@
 - SQLite schema v20 在 v18 规范事件载荷哈希与 v19 输入清单基础上，迁移旧 adapter CHECK 约束，确保
   `project_key` 继续隔离 Codex、Pi、OpenCode、dsh 的事件、幂等键、证据和审计。
 - dsh 的 Stop 审计或 continuation 最多重试一次；Pi continuation 明确标为 emulated 且最多一次，OpenCode 明确为 unsupported。
+- 四平台主分支 CI 在 release binary 构建后以独立进程运行完整 Q1-Q7；资格账本单测只验证账本语义，
+  不再受并行测试进程的共享磁盘负载干扰。
 
 ### Removed
 
