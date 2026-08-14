@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 精简项目首页，将 Agent 接入、Provider/Evidence 和数据库/资格/发布细节迁移到分区文档，并增加统一
+  文档索引。
+
 ## [0.2.0] - 2026-08-15
 
 ### Added
