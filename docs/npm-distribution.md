@@ -38,7 +38,7 @@ npm registry 上的首个版本需要由 `byodod` 账号完成身份引导：
 
 1. 等待对应 GitHub Release 成功，并下载 `byodod-project-brain-X.Y.Z.tgz`；
 2. 本地执行 `npm login`；
-3. 执行 `npm publish byodod-project-brain-X.Y.Z.tgz --access public` 并完成 2FA；
+3. 执行 `npm publish ./byodod-project-brain-X.Y.Z.tgz --access public` 并完成 2FA；
 4. 打开 npm 包设置中的 Trusted Publisher，选择 GitHub Actions；
 5. 填写 user `byodod`、repository `Project-Brain`、workflow filename `release.yml`、environment 留空，
    allowed action 选择 `npm publish`；
@@ -52,6 +52,9 @@ GitHub-hosted runner、`id-token: write` 和 npm OIDC trusted publishing，不�
 
 若 npm 发布失败，GitHub Release 与其中的 npm tarball 仍保持可审计；修复 Trusted Publisher 配置后，
 应在确认 registry 尚无同版本时重新运行失败 job。npm 版本不可覆盖。
+
+发布本地 tarball 时必须使用 `./` 开头的文件路径。`dist/name.tgz` 这类没有 `./` 的参数可能被 npm
+当作 package spec 或 Git 仓库 shorthand，而不是当前工作区中的文件。
 
 Trusted Publisher 的平台要求与配置字段以
 [npm 官方文档](https://docs.npmjs.com/trusted-publishers/)为准。

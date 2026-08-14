@@ -230,4 +230,4 @@ jobs:
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          npm publish "dist/byodod-project-brain-${version}.tgz" --access public
+          npm publish "./dist/byodod-project-brain-${version}.tgz" --access public

@@ -555,6 +555,50 @@ fn dsh_profile_bundle_install_doctor_and_uninstall_are_verified() {
     assert!(!plugin.exists());
 }
 
+#[cfg(windows)]
+#[test]
+fn dsh_install_discovers_npm_cmd_shim_from_path_on_windows() {
+    let root = temp_root("dsh-cmd-path");
+    let (install_root, project) = install_and_init(&root);
+    let dsh_home = root.join("dsh home");
+    let fake_dsh = compile_fake_dsh(&root).expect("rustc is required by Rust tests");
+    let shim_root = root.join("npm bin");
+    fs::create_dir_all(&shim_root).unwrap();
+    fs::write(
+        shim_root.join("dsh.cmd"),
+        format!("@echo off\r\n\"{}\" %*\r\n", fake_dsh.display()),
+    )
+    .unwrap();
+    let mut path_entries = vec![shim_root];
+    if let Some(path) = std::env::var_os("PATH") {
+        path_entries.extend(std::env::split_paths(&path));
+    }
+    let search_path = PathBuf::from(std::env::join_paths(path_entries).unwrap());
+
+    let output = run(
+        &binary(),
+        &[
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "--dsh-home",
+            dsh_home.to_str().unwrap(),
+            "--dsh-profile",
+            "cmd-shim",
+            "install-hooks",
+            "dsh",
+        ],
+        &project,
+        None,
+        &[("PATH", search_path.as_path())],
+    );
+    assert_success(&output);
+    assert!(
+        dsh_home
+            .join("profiles/cmd-shim/node_modules/@project-brain/dsh-plugin/lib/index.js")
+            .is_file()
+    );
+}
+
 #[test]
 fn generated_extensions_execute_real_lifecycle_and_tool_veto_roundtrips() {
     let Some(node) = node_runtime() else {

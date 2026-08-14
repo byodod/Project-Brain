@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-08-15
+
+### Fixed
+
+- Windows dsh 安装按 PATH 目录顺序显式发现 npm 生成的 `dsh.exe`、`dsh.cmd` 或 `dsh.bat`，并在启动
+  失败时给出可执行路径和覆盖变量提示。
+- npm OIDC 发布使用明确的 `./dist/...tgz` 文件路径，避免 npm 将 tarball 相对路径误判为 Git 地址。
+
+### Documentation
+
+- 新增 dsh 远程安装与验收说明，明确 npm 包来源、dsh lifecycle 和 Codex 独立验收不能互相替代，
+  并记录首次外部安装中观察到的前置条件与诊断问题。
+
 ## [0.2.2] - 2026-08-15
 
 ### Changed

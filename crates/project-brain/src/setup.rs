@@ -8,6 +8,9 @@ use std::{
     process::{Command, ExitCode, Stdio},
 };
 
+#[cfg(any(windows, test))]
+use std::ffi::OsStr;
+
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -980,8 +983,7 @@ fn run_dsh_plugin_command(
     profile: &str,
     arguments: &[String],
 ) -> Result<(), AppError> {
-    let executable = env::var_os("PROJECT_BRAIN_DSH_EXECUTABLE")
-        .map_or_else(|| PathBuf::from("dsh"), PathBuf::from);
+    let executable = resolve_dsh_executable()?;
     let output = Command::new(&executable)
         .env("DSH_HOME", dsh_home)
         .arg("plugin")
@@ -991,7 +993,13 @@ fn run_dsh_plugin_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()?;
+        .output()
+        .map_err(|error| {
+            AppError::Setup(format!(
+                "无法启动 dsh CLI（{}）：{error}；请确认 dsh 已安装且位于 PATH，或设置 PROJECT_BRAIN_DSH_EXECUTABLE 为精确可执行文件路径",
+                executable.display()
+            ))
+        })?;
     if output.status.success() {
         return Ok(());
     }
@@ -1001,6 +1009,52 @@ fn run_dsh_plugin_command(
         output.status,
         stderr.trim()
     )))
+}
+
+fn resolve_dsh_executable() -> Result<PathBuf, AppError> {
+    if let Some(explicit) = env::var_os("PROJECT_BRAIN_DSH_EXECUTABLE") {
+        if explicit.is_empty() {
+            return Err(AppError::Setup(
+                "PROJECT_BRAIN_DSH_EXECUTABLE 不能为空".to_owned(),
+            ));
+        }
+        return Ok(PathBuf::from(explicit));
+    }
+
+    #[cfg(windows)]
+    {
+        let search_path = env::var_os("PATH").ok_or_else(|| {
+            AppError::Setup(
+                "PATH 未设置，无法查找 dsh CLI；请设置 PROJECT_BRAIN_DSH_EXECUTABLE 为 dsh.exe、dsh.cmd 或 dsh.bat 的精确路径"
+                    .to_owned(),
+            )
+        })?;
+        find_windows_dsh_executable(&search_path).ok_or_else(|| {
+            AppError::Setup(
+                "PATH 中未找到 dsh.exe、dsh.cmd 或 dsh.bat；请安装 dsh，或设置 PROJECT_BRAIN_DSH_EXECUTABLE 为精确路径"
+                    .to_owned(),
+            )
+        })
+    }
+
+    #[cfg(not(windows))]
+    Ok(PathBuf::from("dsh"))
+}
+
+#[cfg(any(windows, test))]
+fn find_windows_dsh_executable(search_path: &OsStr) -> Option<PathBuf> {
+    for directory in env::split_paths(search_path) {
+        if !directory.is_absolute() {
+            continue;
+        }
+        for file_name in ["dsh.exe", "dsh.cmd", "dsh.bat"] {
+            let candidate = directory.join(file_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2822,14 +2876,14 @@ pub(crate) fn target_hash(path: &Path) -> Result<String, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::SystemTime};
+    use std::{env, fs, time::SystemTime};
 
     use serde_json::{Value, json};
 
     use super::{
         MutationLock, ProjectRegistry, append_managed_groups, canonical_directory_boundary,
-        handler_hashes, install_codex_hooks, managed_handlers, observed_managed_hashes, read_json,
-        remove_managed_handlers, stable_launcher_path,
+        find_windows_dsh_executable, handler_hashes, install_codex_hooks, managed_handlers,
+        observed_managed_hashes, read_json, remove_managed_handlers, stable_launcher_path,
     };
 
     fn temp_root(label: &str) -> std::path::PathBuf {
@@ -2967,6 +3021,22 @@ mod tests {
         drop(first);
         assert!(path.is_file());
         assert!(MutationLock::acquire(&path).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_dsh_resolution_uses_path_order_and_npm_cmd_shim() {
+        let root = temp_root("dsh-path");
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let expected = first.join("dsh.cmd");
+        fs::write(&expected, "@echo off\r\n").unwrap();
+        fs::write(second.join("dsh.exe"), b"fixture").unwrap();
+        let search_path = env::join_paths([&first, &second]).unwrap();
+
+        assert_eq!(find_windows_dsh_executable(&search_path), Some(expected));
         fs::remove_dir_all(root).unwrap();
     }
 }

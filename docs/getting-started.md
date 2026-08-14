@@ -77,6 +77,9 @@ project-brain --dsh-profile default install-hooks dsh
   `~/.config/opencode/plugins/project-brain.js`。
 - dsh：通过 `dsh plugin --profile <name> add/remove` 管理指定 profile，不修改其它 profile。
 
+dsh 还依赖其自身的 CLI 和 profile 包管理器。远程 npm 来源验收、Windows CLI 发现、生命周期证据及
+常见问题见 [dsh 接入、远程安装与验收](dsh-integration.md)。
+
 四个接入都调用稳定 launcher 的 `dispatch` 入口。未注册项目返回 NO-OP；已注册项目发生治理或审计错误
 时，工具前事件失败关闭。
 
