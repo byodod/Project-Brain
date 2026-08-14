@@ -36,6 +36,28 @@ pub(crate) struct RuntimeArtifactBundle {
     assembly_binding: Option<AssemblyBindingAttestation>,
 }
 
+impl RuntimeArtifactBundle {
+    pub(crate) fn project_key(&self) -> &str {
+        &self.project_key
+    }
+
+    pub(crate) fn build_provider_id(&self) -> &str {
+        &self.build_provider_id
+    }
+
+    pub(crate) fn source_fingerprint(&self) -> &str {
+        &self.source_fingerprint
+    }
+
+    pub(crate) fn assembly_binding(&self) -> Option<&AssemblyBindingAttestation> {
+        self.assembly_binding.as_ref()
+    }
+
+    pub(crate) fn canonical_manifest_bytes(&self) -> Result<Vec<u8>, AppError> {
+        canonical_json(self)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RuntimeArtifactBundleReceipt {
     pub(crate) bundle_fingerprint: String,
@@ -83,7 +105,7 @@ pub(crate) fn promote_runtime_bundle(
         validate_relative_path(&entry.relative_path)?;
         let source = canonical_artifact_root.join(&entry.relative_path);
         let metadata = fs::symlink_metadata(&source)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if is_link_or_reparse(&metadata) || !metadata.is_file() {
             return Err(AppError::Provider(format!(
                 "Runtime bundle 源不是普通文件：{}",
                 source.display()
@@ -122,6 +144,98 @@ pub(crate) fn verify_runtime_bundle(
     verify_bundle_at_root(&store_root(&install_root), bundle_fingerprint)
 }
 
+pub(crate) fn materialize_runtime_bundle(
+    explicit_install_root: Option<&Path>,
+    bundle_fingerprint: &str,
+    destination: &Path,
+) -> Result<RuntimeArtifactBundle, AppError> {
+    if destination.exists() {
+        return Err(AppError::Provider(
+            "Runtime bundle 物化目标必须尚不存在".to_owned(),
+        ));
+    }
+    let install_root = resolve_install_root(explicit_install_root)?;
+    let store_root = store_root(&install_root);
+    let bundle = verify_bundle_at_root(&store_root, bundle_fingerprint)?;
+    fs::create_dir_all(destination)?;
+    for entry in &bundle.entries {
+        let source = object_path(&store_root, &entry.sha256)?;
+        let target = destination.join(&entry.relative_path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut input = File::open(source)?;
+        let mut output = AtomicWriteFile::options().open(&target)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        output.commit()?;
+        let metadata = fs::symlink_metadata(&target)?;
+        if is_link_or_reparse(&metadata)
+            || has_multiple_hard_links(&metadata)
+            || !metadata.is_file()
+            || metadata.len() != entry.size
+            || provider::hash_file(&target)? != entry.sha256
+        {
+            return Err(AppError::Provider(format!(
+                "Runtime bundle 物化后校验失败：{}",
+                entry.relative_path
+            )));
+        }
+    }
+    Ok(bundle)
+}
+
+pub(crate) fn verify_materialized_bundle(
+    bundle: &RuntimeArtifactBundle,
+    destination: &Path,
+) -> Result<(), AppError> {
+    let mut observed = Vec::new();
+    let mut directories = vec![destination.to_owned()];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if is_link_or_reparse(&metadata)
+                || metadata.is_file() && has_multiple_hard_links(&metadata)
+            {
+                return Err(AppError::Provider(
+                    "物化 Runtime bundle 中出现链接".to_owned(),
+                ));
+            }
+            if metadata.is_dir() {
+                directories.push(path);
+            } else if metadata.is_file() {
+                let relative = path
+                    .strip_prefix(destination)
+                    .map_err(|_| AppError::Provider("Runtime bundle 文件越出物化根".to_owned()))?;
+                let relative_path = relative
+                    .components()
+                    .map(|component| component.as_os_str().to_str())
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| AppError::Provider("Runtime bundle 路径不是 UTF-8".to_owned()))?
+                    .join("/");
+                observed.push(ArtifactEntry {
+                    relative_path,
+                    size: metadata.len(),
+                    sha256: provider::hash_file(&path)?,
+                });
+            } else {
+                return Err(AppError::Provider(
+                    "物化 Runtime bundle 中出现非普通文件".to_owned(),
+                ));
+            }
+        }
+    }
+    observed.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    if observed != bundle.entries {
+        return Err(AppError::Provider(
+            "物化 Runtime bundle 已被增加、删除或改写".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn verify_bundle_at_root(
     store_root: &Path,
     bundle_fingerprint: &str,
@@ -153,7 +267,8 @@ fn verify_bundle_at_root(
         previous = Some(entry.relative_path.as_str());
         let object = object_path(store_root, &entry.sha256)?;
         let metadata = fs::symlink_metadata(&object)?;
-        if metadata.file_type().is_symlink()
+        if is_link_or_reparse(&metadata)
+            || has_multiple_hard_links(&metadata)
             || !metadata.is_file()
             || metadata.len() != entry.size
             || provider::hash_file(&object)? != entry.sha256
@@ -171,7 +286,8 @@ fn promote_object(store_root: &Path, source: &Path, entry: &ArtifactEntry) -> Re
     let target = object_path(store_root, &entry.sha256)?;
     if target.exists() {
         let metadata = fs::symlink_metadata(&target)?;
-        if metadata.file_type().is_symlink()
+        if is_link_or_reparse(&metadata)
+            || has_multiple_hard_links(&metadata)
             || !metadata.is_file()
             || metadata.len() != entry.size
             || provider::hash_file(&target)? != entry.sha256
@@ -192,7 +308,11 @@ fn promote_object(store_root: &Path, source: &Path, entry: &ArtifactEntry) -> Re
     output.sync_all()?;
     output.commit()?;
     let metadata = fs::symlink_metadata(&target)?;
-    if metadata.len() != entry.size || provider::hash_file(&target)? != entry.sha256 {
+    if is_link_or_reparse(&metadata)
+        || has_multiple_hard_links(&metadata)
+        || metadata.len() != entry.size
+        || provider::hash_file(&target)? != entry.sha256
+    {
         return Err(AppError::Provider(format!(
             "CAS object 原子提交后的内容校验失败：{}",
             entry.sha256
@@ -337,6 +457,37 @@ fn validate_relative_path(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+fn has_multiple_hard_links(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        // stable std 当前不公开 Windows link count；v1 通过物理复制避免主动创建 hardlink，
+        // 不声称能防御同用户在运行期间替换为 hardlink。
+        let _ = metadata;
+        false
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() > 1
+    }
+    #[cfg(not(any(windows, unix)))]
+    false
+}
+
 fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, AppError> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
@@ -416,6 +567,42 @@ mod tests {
         assert_eq!(verified.entries, manifest.entries);
         assert_eq!(receipt.file_count, 1);
         assert_eq!(receipt.assembly_binding.unwrap().assembly_name, "game");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_object_never_falls_back_to_rebuilding() {
+        let root = temp_root("corrupt");
+        let install = root.join("install");
+        let project = root.join("project");
+        let artifacts = root.join("artifacts");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(
+            project.join("project.godot"),
+            "[dotnet]\nproject/assembly_name=\"game\"\n",
+        )
+        .unwrap();
+        fs::write(artifacts.join("game.dll"), b"exact-build-bytes").unwrap();
+        let manifest = manifest(&artifacts);
+        let receipt = promote_runtime_bundle(
+            Some(&install),
+            "project-a",
+            "dotnet-build.main",
+            "sha256_source",
+            &project,
+            &artifacts,
+            &manifest,
+        )
+        .unwrap();
+        let hash = &manifest.entries[0].sha256;
+        let object = install
+            .join("state/artifact-store/v1/objects/sha256")
+            .join(&hash[..2])
+            .join(hash);
+        fs::write(object, b"corrupt").unwrap();
+
+        assert!(verify_runtime_bundle(Some(&install), &receipt.bundle_fingerprint).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

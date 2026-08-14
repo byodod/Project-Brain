@@ -43,10 +43,17 @@ Accepted
   `02941be7557c283808e3930775393728e368b06e9b7fbb8d71fc56090e007409`。
 - 单元测试覆盖成功提升、完整重校验、主程序集缺失拒绝、规范 manifest 身份；全 workspace test 与
   `clippy -D warnings` 通过。
+- 真实 Godot 4.6 Mono 对隔离 staged project 连续运行两次：import 与 120 帧主场景均 exit 0、无 error
+  finding，bundle 四阶段重校验通过；两次得到同一 Runtime Snapshot
+  `sha256_322c6b867d4c6b46f5b753e2af6ef64e92acf951494cb37dcfd343ca56b2202e`，第二次只追加 attestation。
+- staged `.godot/mono/temp` 最终只有 bundle 的 5 个 `bin/Debug` 文件，没有 obj 或新构建输出；固定 argv
+  与日志均未出现 build、script 或 export 行为。
 
 ## 后果
 
 - Runtime 能证明实际加载候选与先前 Build Evidence 是同一组字节，而不是“同样源码又构建了一次”。
 - CAS 会消耗机器空间；自动 GC 在 pin、quota、grace 与 crash recovery 合同实现前保持禁用。
 - 当前只为 Godot C# Build 创建 Runtime bundle；Rust/Python Build Evidence 不伪装成 Godot 可运行包。
-- 隔离 staged Runtime Provider 尚需按本 ADR 后半部分实现，CAS 完成不等于 Runtime 闭环已完成。
+- 隔离 staged Runtime Provider 已实现；通用测试 Evidence 与规则 finding 映射仍是后续治理层工作。
+- v1 通过普通文件校验与物理复制避免主动创建 link，但不是 OS 沙箱；尤其不声称能抵御同一机器用户在
+  检查间隙实施 hardlink/TOCTOU 替换。Windows Job Object 等强隔离仍需单独证明。

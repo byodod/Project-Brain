@@ -240,7 +240,8 @@ Extension 安装器仍留在后续阶段。
    快照/attestation/head/staleness ledger 与 Hook 新鲜度提示已经完成；Godot Engine 以及
    .NET/Rust/Python Build Evidence Provider v1 已通过真实项目验证；Godot C# 最终产物还会提升到
    机器级内容寻址存储，以不可变 RuntimeArtifactBundle 绑定精确文件字节与主程序集。下一阶段从该
-   bundle 建立隔离 Godot headless Runtime Provider 和规则到 finding 的显式映射。
+   bundle 建立的隔离 Godot headless Runtime Provider 已通过真实项目的连续确定性运行；下一阶段补齐
+   通用测试 Evidence 和规则到 finding 的显式映射。
 6. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
    直接 hard block。
 

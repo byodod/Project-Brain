@@ -320,6 +320,29 @@ Python v1 是 `validation_only`：以 `-I -S -B` 启动 Project Brain 内置 boo
 `complete + build_exit_failure`；工具链、链接器或预还原状态缺失则是
 `partial + build_unavailable`，不能冒充项目违规。CLI 会先保存这份失败证据再返回非零。
 
+## Godot 隔离 Runtime Evidence
+
+Runtime v1 只接受已绑定在当前 fresh、complete、deterministic Build head 上的
+`RuntimeArtifactBundle`：
+
+```text
+project-brain evidence runtime \
+  --bundle sha256_<bundle> \
+  --executable /absolute/path/to/godot \
+  --trust-local-executable \
+  --quit-after 120
+```
+
+Provider 从 Git 权威文件清单物理复制隔离 project mirror，拒绝 symlink/junction/reparse，排除 `.git`、
+`.godot`、`.project-brain` 与旧 bin/obj/artifacts；源码复制前后必须保持同一 worktree fingerprint。
+精确 Build bundle 随后物化到 staged `.godot/mono/temp/bin/Debug`，并在 import 前后、Runtime 前后
+重复校验完整文件集合、大小与 SHA-256。主程序集还必须与 `project.godot` 的明确声明一致。
+
+Godot 只使用内置固定 argv 进行 `--import` 和主场景 `--quit-after` headless 运行。合同禁止 restore、
+build、test、`--script`、editor/project-manager 与全部 export/release 入口；仓库不能注入 scene、参数、
+环境或 shell。`user://` 被隔离到 machine-private run root，已有 `override.cfg` 的项目在 v1 中直接拒绝。
+每个 run 保留 marker、原子 journal 与日志用于审计/崩溃恢复；Project Brain 不会自动删除或导出项目。
+
 手工验证适配器：
 
 ```text
@@ -664,9 +687,9 @@ crates/
 
 - Codex 与 Claude Code 已提供直接适配器、用户级 Hook 安装器和按 adapter 选择的 `doctor`；
   Prime Agent 已有独立 direct adapter，但用户级 Extension 安装器与 doctor 尚未实现。
-- Godot Engine Provider、Evidence ledger、Hook 失效传播、.NET/Rust/Python Build Provider v1 与 Godot
-  C# RuntimeArtifactBundle CAS 已完成；隔离 Godot headless Runtime Evidence、测试结果与规则 finding
-  的显式映射仍未完成，不能声称完整治理闭环。
+- Godot Engine Provider、Evidence ledger、Hook 失效传播、.NET/Rust/Python Build Provider v1、Godot
+  C# RuntimeArtifactBundle CAS 与隔离 Godot headless Runtime Evidence v1 已完成；通用测试结果与规则
+  finding 的显式映射仍未完成，不能声称全部治理能力已经完结。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。

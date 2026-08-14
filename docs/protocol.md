@@ -233,6 +233,22 @@ CAS 提升失败时仍保存已完成的 Build 观测，但状态为 `incomplete
 `runtime_bundle_unavailable(warning)`；错误文本只以 fingerprint 进入 Evidence，避免把机器绝对路径
 写入不可变快照。该 Build 不能供 Runtime 使用。
 
+Godot Runtime run schema v1 要求指定 bundle 必须由当前项目同 provider 的 fresh、complete、
+deterministic Build head 直接绑定，Build 不得含 finding，Source fingerprint 必须与当前 worktree
+相同，Build 引用的 Engine head 也必须仍为 current+fresh，且 Godot executable SHA-256 与该 Engine
+证明一致。任一准备条件失败只拒绝本次 run，不伪造 Runtime Snapshot。
+
+通过准备后，Runtime 以 Git `ls-files --cached --others --exclude-standard` 建立 staged Source manifest；
+排除控制面和旧生成目录，拒绝全部 link/reparse component，并执行 live Source A → 物理复制 → live
+Source B 的 TOCTOU 检查。之后从 CAS 物理复制 bundle 到 Godot 固定程序集目录；import 前、import 后、
+主场景运行前、主场景运行后都要求目录内文件集合、大小和 SHA-256 与 bundle 完全一致。
+
+固定 import argv 只有 `--headless --no-header --path <STAGED_PROJECT> --import --log-file
+<RUNTIME_LOG>`；固定 runtime argv 只增加 `--quit-after <bounded>`，不接受自定义 scene 或用户参数。
+所有路径在 Evidence contract 中规范化，不保存 machine run root。诊断文本只以 fingerprint 进入不可变
+Evidence，原始日志保留在 machine-private run 目录。每个目录包含 project-bound marker 与原子 journal；
+自动清理在精确 DB/marker/root 匹配的恢复合同完成前保持禁用。
+
 SQLite schema v13 为 Evidence Protocol 维护四类项目隔离记录：
 
 - `evidence_snapshots`：不可变完整快照；相同 project/plane/provider/fingerprint 只保存一次 JSON；

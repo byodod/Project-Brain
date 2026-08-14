@@ -12,6 +12,7 @@ mod prime;
 mod protocol;
 mod provider;
 mod reconcile;
+mod runtime;
 mod scip_index;
 mod setup;
 
@@ -242,6 +243,23 @@ enum EvidenceCommand {
     Build {
         #[command(subcommand)]
         command: BuildEvidenceCommand,
+    },
+
+    /// 从已验证 Build bundle 的精确字节运行隔离 Godot headless Runtime；绝不构建或导出
+    Runtime {
+        /// Build Evidence 中的 content-addressed `RuntimeArtifactBundle` fingerprint
+        #[arg(long)]
+        bundle: String,
+        /// Godot 4 editor/console binary 的机器绝对路径
+        #[arg(long)]
+        executable: PathBuf,
+        #[arg(long)]
+        trust_local_executable: bool,
+        /// headless 主场景最多处理的迭代帧数
+        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u32).range(1..=3600))]
+        quit_after: u32,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
     },
 }
 
@@ -633,6 +651,20 @@ fn main() -> ExitCode {
                         timeout_seconds,
                     ),
                 },
+                EvidenceCommand::Runtime {
+                    bundle,
+                    executable,
+                    trust_local_executable,
+                    quit_after,
+                    timeout_seconds,
+                } => app.evidence_runtime_godot(
+                    cli.install_root.as_deref(),
+                    &bundle,
+                    &executable,
+                    trust_local_executable,
+                    quit_after,
+                    timeout_seconds,
+                ),
             })
         }
         Command::Lineage { command } => App::open(cli.project_root).and_then(|app| match command {

@@ -25,7 +25,7 @@ use crate::{
     error::AppError,
     git, godot, index,
     prime::{self, PrimeHookInput},
-    provider, reconcile, scip_index, setup,
+    provider, reconcile, runtime, scip_index, setup,
 };
 
 const BRAIN_DIRECTORY: &str = ".project-brain";
@@ -599,6 +599,49 @@ impl App {
             )?
         );
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn evidence_runtime_godot(
+        &self,
+        install_root: Option<&Path>,
+        bundle_fingerprint: &str,
+        executable: &Path,
+        trust_local_executable: bool,
+        quit_after: u32,
+        timeout_seconds: u64,
+    ) -> Result<(), AppError> {
+        let heads = self.store.list_evidence_heads(&self.config.project_key)?;
+        let report = runtime::run_godot(&runtime::RuntimeRequest {
+            project_root: &self.root,
+            install_root,
+            project_key: &self.config.project_key,
+            bundle_fingerprint,
+            executable,
+            trust_local_executable,
+            quit_after,
+            timeout_seconds,
+            evidence_heads: &heads,
+        })?;
+        let succeeded = report.succeeded();
+        let persistence = self
+            .store
+            .apply_evidence_snapshot(report.evidence_snapshot())?;
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": 1,
+                "run": report,
+                "persistence": persistence,
+            }))?
+        );
+        if succeeded {
+            Ok(())
+        } else {
+            Err(AppError::Provider(
+                "Runtime Evidence 已保存失败结果；运行合同未通过".to_owned(),
+            ))
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
