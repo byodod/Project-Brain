@@ -80,6 +80,57 @@ fn assert_success(output: &Output) {
 }
 
 #[test]
+fn lineage_compaction_has_no_backup_bypass_flag() {
+    let root = temp_root("lineage-no-backup-flag");
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_project-brain"));
+    let output = run(
+        &executable,
+        &["lineage", "compact-legacy-proposals", "--no-backup"],
+        &root,
+        None,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument '--no-backup'"),
+        "{stderr}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lineage_compaction_rejects_machine_backup_root_inside_repository() {
+    let root = temp_root("lineage-backup-boundary");
+    let project = root.join("repo");
+    fs::create_dir_all(&project).unwrap();
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_project-brain"));
+    assert_success(&run(
+        &executable,
+        &["--project-root", project.to_str().unwrap(), "init"],
+        &root,
+        None,
+    ));
+    let install_root = project.join("machine-state");
+    let output = run(
+        &executable,
+        &[
+            "--project-root",
+            project.to_str().unwrap(),
+            "--install-root",
+            install_root.to_str().unwrap(),
+            "lineage",
+            "compact-legacy-proposals",
+        ],
+        &root,
+        None,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("必须位于项目工作树之外"), "{stderr}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn godot_evidence_requires_explicit_machine_executable_trust() {
     let root = temp_root("godot-trust");
     let project = root.join("repo");

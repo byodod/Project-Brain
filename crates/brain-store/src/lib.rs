@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
+    fs::{self, File},
+    io::{BufReader, Read},
+    path::{Path, PathBuf},
     time::{SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
@@ -25,12 +27,14 @@ use brain_symbols::{
     SourceFileState, SourceLanguage, SymbolNode, SymbolSnapshot, SymbolStatus, propose_lineage,
     symbol_id,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, MAIN_DB, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const DATABASE_SCHEMA_VERSION: i64 = 16;
+pub const DATABASE_SCHEMA_VERSION: i64 = 17;
 const ALL_EVIDENCE_PLANES: [EvidencePlane; 6] = [
     EvidencePlane::Source,
     EvidencePlane::Semantic,
@@ -44,9 +48,13 @@ const LEGACY_LINEAGE_ALGORITHM_VERSION: &str = "1";
 const LEGACY_COMPACTION_ALGORITHM_ID: &str = "project-brain-lineage-legacy-compaction";
 const LEGACY_COMPACTION_ALGORITHM_VERSION: &str = "1";
 const LEGACY_COMPACTION_OPERATION_VERSION: u32 = 2;
+const LEGACY_BACKUP_FIXED_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("文件操作失败：{0}")]
+    Io(#[from] std::io::Error),
+
     #[error("SQLite 操作失败：{0}")]
     Sqlite(#[from] rusqlite::Error),
 
@@ -395,6 +403,27 @@ pub struct LegacyLineageCompactionGroup {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LegacyLineageBackupReport {
+    pub backup_id: String,
+    pub file_name: String,
+    pub database_bytes: u64,
+    pub backup_file_sha256: String,
+    pub source_logical_manifest_sha256: String,
+    pub backup_logical_manifest_sha256: String,
+    pub reused_existing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LegacyLineageBackupPreflightReport {
+    pub estimated_backup_space_bytes: u64,
+    pub available_backup_space_bytes: u64,
+    pub estimated_source_wal_headroom_bytes: u64,
+    pub available_source_space_bytes: u64,
+    pub shares_source_filesystem: bool,
+    pub sufficient: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LegacyLineageCompactionReport {
     pub project_key: String,
     pub operation_version: u32,
@@ -404,6 +433,11 @@ pub struct LegacyLineageCompactionReport {
     pub request_id: Option<String>,
     #[serde(default)]
     pub approved_manifest_hash: Option<String>,
+    pub backup_preflight: LegacyLineageBackupPreflightReport,
+    #[serde(default)]
+    pub pre_compaction_logical_manifest_sha256: Option<String>,
+    #[serde(default)]
+    pub backup: Option<LegacyLineageBackupReport>,
     pub legacy_ambiguous_candidate_count: u64,
     pub compactable_group_count: u64,
     pub compactable_candidate_count: u64,
@@ -495,6 +529,7 @@ pub struct LineageMaterializationResult {
 
 pub struct BrainStore {
     connection: Connection,
+    database_path: Option<PathBuf>,
 }
 
 impl BrainStore {
@@ -505,7 +540,11 @@ impl BrainStore {
     /// 当数据库无法打开或 schema 初始化失败时返回错误。
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
-        let store = Self { connection };
+        let database_path = fs::canonicalize(path)?;
+        let store = Self {
+            connection,
+            database_path: Some(database_path),
+        };
         store.initialize()?;
         Ok(store)
     }
@@ -517,7 +556,10 @@ impl BrainStore {
     /// 当 `SQLite` 初始化失败时返回错误。
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let connection = Connection::open_in_memory()?;
-        let store = Self { connection };
+        let store = Self {
+            connection,
+            database_path: None,
+        };
         store.initialize()?;
         Ok(store)
     }
@@ -621,6 +663,8 @@ impl BrainStore {
         self.ensure_evidence_v14_test_plane()?;
         self.ensure_lineage_v15_materialization_requests()?;
         self.ensure_evidence_v16_invalidation_outcome()?;
+        self.ensure_lineage_v17_compaction_backup()?;
+        self.ensure_database_instance_id()?;
         self.initialize_adapter_audit_schema()?;
         self.connection.execute(
             "INSERT INTO metadata(key, value) VALUES('schema_version', ?1)
@@ -654,6 +698,25 @@ impl BrainStore {
             )),
             None => Ok(1),
         }
+    }
+
+    fn ensure_database_instance_id(&self) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO metadata(key, value)
+             VALUES('database_instance_id', lower(hex(randomblob(32))))",
+            [],
+        )?;
+        let instance_id: String = self.connection.query_row(
+            "SELECT value FROM metadata WHERE key = 'database_instance_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !is_raw_sha256(&instance_id) {
+            return Err(StoreError::Integrity(
+                "database_instance_id 必须是 64 位十六进制随机身份".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn initialize_adapter_audit_schema(&self) -> Result<(), StoreError> {
@@ -1185,6 +1248,68 @@ impl BrainStore {
              );
              CREATE INDEX IF NOT EXISTS idx_lineage_materialization_candidate
                  ON semantic_lineage_materialization_requests(project_key, candidate_id);",
+        )?;
+        Ok(())
+    }
+
+    fn ensure_lineage_v17_compaction_backup(&self) -> Result<(), StoreError> {
+        let columns = self
+            .connection
+            .prepare("PRAGMA table_info(semantic_lineage_compaction_runs)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let additions = [
+            (
+                "pre_compaction_logical_manifest_sha256",
+                "ALTER TABLE semantic_lineage_compaction_runs
+                 ADD COLUMN pre_compaction_logical_manifest_sha256 TEXT;",
+            ),
+            (
+                "backup_file_name",
+                "ALTER TABLE semantic_lineage_compaction_runs
+                 ADD COLUMN backup_file_name TEXT;",
+            ),
+            (
+                "backup_id",
+                "ALTER TABLE semantic_lineage_compaction_runs
+                 ADD COLUMN backup_id TEXT;",
+            ),
+            (
+                "backup_file_sha256",
+                "ALTER TABLE semantic_lineage_compaction_runs
+                 ADD COLUMN backup_file_sha256 TEXT;",
+            ),
+            (
+                "backup_logical_manifest_sha256",
+                "ALTER TABLE semantic_lineage_compaction_runs
+                 ADD COLUMN backup_logical_manifest_sha256 TEXT;",
+            ),
+        ];
+        for (column, statement) in additions {
+            if !columns.contains(column) {
+                self.connection.execute_batch(statement)?;
+            }
+        }
+        if columns.contains("keep_backup") {
+            self.connection.execute_batch(
+                "ALTER TABLE semantic_lineage_compaction_runs DROP COLUMN keep_backup;",
+            )?;
+        }
+        self.connection.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS trg_lineage_compaction_backup_required
+             BEFORE INSERT ON semantic_lineage_compaction_runs
+             WHEN NEW.operation_version >= 2 AND (
+                 NEW.pre_compaction_logical_manifest_sha256 IS NULL OR
+                 NEW.backup_id IS NULL OR
+                 NEW.backup_file_name IS NULL OR
+                 NEW.backup_file_sha256 IS NULL OR
+                 NEW.backup_logical_manifest_sha256 IS NULL OR
+                 NEW.pre_compaction_logical_manifest_sha256 !=
+                     NEW.backup_logical_manifest_sha256
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'operation v2 lineage compaction requires exact backup attestation');
+             END;",
         )?;
         Ok(())
     }
@@ -2463,17 +2588,20 @@ impl BrainStore {
     pub fn preview_legacy_lineage_compaction(
         &self,
         project_key: &str,
+        backup_root: &Path,
     ) -> Result<LegacyLineageCompactionReport, StoreError> {
-        Ok(
+        let mut report =
             build_legacy_lineage_compaction_plan(&self.connection, project_key, "dry_run", None)?
-                .report,
-        )
+                .report;
+        apply_legacy_backup_preflight(self, &mut report, backup_root)?;
+        Ok(report)
     }
 
     /// 把可证明为完整笛卡尔积的 V7 歧义 pair 压缩为不可变 group 摘要。
     ///
-    /// 操作以 `request_id` 幂等；同一请求重放返回原审计报告。删除仅覆盖本次计划
-    /// 中的 proposed 候选及其唯一 V7 证据，不执行 `VACUUM`。
+    /// 操作以 `request_id` 幂等；同一请求重放会先复验原备份再返回审计报告。
+    /// 删除前必须在机器级目录完成全库 Online Backup；删除仅覆盖本次计划中的
+    /// proposed 候选及其唯一 V7 证据，不执行 checkpoint 或 `VACUUM`。
     ///
     /// # Errors
     ///
@@ -2487,6 +2615,7 @@ impl BrainStore {
         project_key: &str,
         request_id: &str,
         approved_manifest_hash: &str,
+        backup_root: &Path,
     ) -> Result<LegacyLineageCompactionReport, StoreError> {
         let request_id = request_id.trim();
         if request_id.is_empty() || request_id.len() > 192 {
@@ -2501,24 +2630,28 @@ impl BrainStore {
             ));
         }
         let request_hash = legacy_compaction_request_hash(project_key, approved_manifest_hash);
+        if let Some(report) =
+            legacy_compaction_replay(&self.connection, project_key, request_id, &request_hash)?
+        {
+            verify_replayed_legacy_backup(&report, backup_root)?;
+            return Ok(report);
+        }
+        let preflight = legacy_backup_preflight(self, backup_root)?;
+        if !preflight.sufficient {
+            return Err(StoreError::Integrity(format!(
+                "lineage 备份磁盘空间不足：备份卷需要 {} bytes、可用 {} bytes；源卷 WAL 余量需要 {} bytes、可用 {} bytes",
+                preflight.estimated_backup_space_bytes,
+                preflight.available_backup_space_bytes,
+                preflight.estimated_source_wal_headroom_bytes,
+                preflight.available_source_space_bytes
+            )));
+        }
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let replay = transaction
-            .query_row(
-                "SELECT request_hash, report_json FROM semantic_lineage_compaction_runs
-                 WHERE project_key = ?1 AND request_id = ?2",
-                params![project_key, request_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-        if let Some((stored_hash, report_json)) = replay {
-            if stored_hash != request_hash {
-                return Err(StoreError::LineageIdempotencyConflict(
-                    request_id.to_owned(),
-                ));
-            }
-            let mut report: LegacyLineageCompactionReport = serde_json::from_str(&report_json)?;
-            report.replayed = true;
+        if let Some(report) =
+            legacy_compaction_replay(&transaction, project_key, request_id, &request_hash)?
+        {
+            verify_replayed_legacy_backup(&report, backup_root)?;
             return Ok(report);
         }
 
@@ -2534,6 +2667,17 @@ impl BrainStore {
                 current: plan.report.compaction_manifest_hash,
             });
         }
+        apply_preflight_to_report(&mut plan.report, &preflight);
+        let source_verification = maintenance::logical_verification(&transaction, false)?;
+        plan.report.pre_compaction_logical_manifest_sha256 =
+            Some(source_verification.logical_manifest_sha256.clone());
+        plan.report.backup = Some(create_verified_legacy_backup(
+            self,
+            backup_root,
+            request_id,
+            approved_manifest_hash,
+            &source_verification.logical_manifest_sha256,
+        )?);
         plan.report.applied = true;
         plan.report.approved_manifest_hash = Some(approved_manifest_hash.to_owned());
         let now = unix_seconds()?;
@@ -2597,8 +2741,14 @@ impl BrainStore {
                  project_key, request_id, request_hash, operation_version,
                  compacted_group_count, compacted_candidate_count,
                  compacted_evidence_count, protected_candidate_count,
-                 compaction_manifest_hash, report_json, created_at_unix_seconds
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 compaction_manifest_hash, pre_compaction_logical_manifest_sha256,
+                 backup_id, backup_file_name,
+                 backup_file_sha256, backup_logical_manifest_sha256,
+                 report_json, created_at_unix_seconds
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                 ?11, ?12, ?13, ?14, ?15, ?16
+             )",
             params![
                 project_key,
                 request_id,
@@ -2617,6 +2767,25 @@ impl BrainStore {
                     StoreError::InvalidLineage("protected candidate count 溢出".to_owned())
                 })?,
                 plan.report.compaction_manifest_hash,
+                plan.report
+                    .pre_compaction_logical_manifest_sha256
+                    .as_deref(),
+                plan.report
+                    .backup
+                    .as_ref()
+                    .map(|backup| backup.backup_id.as_str()),
+                plan.report
+                    .backup
+                    .as_ref()
+                    .map(|backup| backup.file_name.as_str()),
+                plan.report
+                    .backup
+                    .as_ref()
+                    .map(|backup| backup.backup_file_sha256.as_str()),
+                plan.report
+                    .backup
+                    .as_ref()
+                    .map(|backup| backup.backup_logical_manifest_sha256.as_str()),
                 report_json,
                 now,
             ],
@@ -3704,6 +3873,385 @@ struct LegacyCompactionManifest<'a> {
     groups: &'a [LegacyLineageCompactionGroup],
 }
 
+fn legacy_backup_preflight(
+    store: &BrainStore,
+    backup_root: &Path,
+) -> Result<LegacyLineageBackupPreflightReport, StoreError> {
+    let Some(database) = store.database_path.as_deref() else {
+        return Ok(LegacyLineageBackupPreflightReport {
+            estimated_backup_space_bytes: 0,
+            available_backup_space_bytes: 0,
+            estimated_source_wal_headroom_bytes: 0,
+            available_source_space_bytes: 0,
+            shares_source_filesystem: false,
+            sufficient: false,
+        });
+    };
+    let database_bytes = fs::metadata(database)?.len();
+    let per_volume_required = database_bytes
+        .checked_mul(6)
+        .map(|value| value / 5)
+        .and_then(|value| value.checked_add(LEGACY_BACKUP_FIXED_HEADROOM_BYTES))
+        .ok_or_else(|| StoreError::Integrity("lineage 备份空间预算溢出".to_owned()))?;
+    let source_parent = database.parent().ok_or_else(|| {
+        StoreError::Integrity(format!("数据库没有父目录：{}", database.display()))
+    })?;
+    let backup_volume_probe = nearest_existing_ancestor(backup_root)?;
+    let available_backup_space_bytes = fs2::available_space(&backup_volume_probe)?;
+    let available_source_space_bytes = fs2::available_space(source_parent)?;
+    let same_filesystem = paths_share_filesystem(source_parent, &backup_volume_probe)?;
+    let same_volume_required = per_volume_required
+        .checked_mul(2)
+        .ok_or_else(|| StoreError::Integrity("lineage 同卷备份空间预算溢出".to_owned()))?;
+    Ok(LegacyLineageBackupPreflightReport {
+        estimated_backup_space_bytes: per_volume_required,
+        available_backup_space_bytes,
+        estimated_source_wal_headroom_bytes: per_volume_required,
+        available_source_space_bytes,
+        shares_source_filesystem: same_filesystem,
+        sufficient: if same_filesystem {
+            available_backup_space_bytes >= same_volume_required
+        } else {
+            available_backup_space_bytes >= per_volume_required
+                && available_source_space_bytes >= per_volume_required
+        },
+    })
+}
+
+fn apply_legacy_backup_preflight(
+    store: &BrainStore,
+    report: &mut LegacyLineageCompactionReport,
+    backup_root: &Path,
+) -> Result<LegacyLineageBackupPreflightReport, StoreError> {
+    let preflight = legacy_backup_preflight(store, backup_root)?;
+    apply_preflight_to_report(report, &preflight);
+    Ok(preflight)
+}
+
+fn apply_preflight_to_report(
+    report: &mut LegacyLineageCompactionReport,
+    preflight: &LegacyLineageBackupPreflightReport,
+) {
+    report.backup_preflight = preflight.clone();
+}
+
+fn legacy_compaction_replay(
+    connection: &Connection,
+    project_key: &str,
+    request_id: &str,
+    request_hash: &str,
+) -> Result<Option<LegacyLineageCompactionReport>, StoreError> {
+    let replay = connection
+        .query_row(
+            "SELECT request_hash, report_json FROM semantic_lineage_compaction_runs
+             WHERE project_key = ?1 AND request_id = ?2",
+            params![project_key, request_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((stored_hash, report_json)) = replay else {
+        return Ok(None);
+    };
+    if stored_hash != request_hash {
+        return Err(StoreError::LineageIdempotencyConflict(
+            request_id.to_owned(),
+        ));
+    }
+    let mut report: LegacyLineageCompactionReport = serde_json::from_str(&report_json)?;
+    report.replayed = true;
+    Ok(Some(report))
+}
+
+fn verify_replayed_legacy_backup(
+    report: &LegacyLineageCompactionReport,
+    backup_root: &Path,
+) -> Result<(), StoreError> {
+    let backup = report.backup.as_ref().ok_or_else(|| {
+        StoreError::Integrity("lineage compaction 重放记录缺少强制删除前备份证明".to_owned())
+    })?;
+    if !is_sha256_fingerprint(&backup.backup_id)
+        || !is_sha256_fingerprint(&backup.backup_file_sha256)
+        || !is_raw_sha256(&backup.source_logical_manifest_sha256)
+        || !is_raw_sha256(&backup.backup_logical_manifest_sha256)
+        || backup.source_logical_manifest_sha256 != backup.backup_logical_manifest_sha256
+    {
+        return Err(StoreError::Integrity(
+            "lineage compaction 重放记录的备份证明格式或逻辑清单无效".to_owned(),
+        ));
+    }
+    let relative = Path::new(&backup.file_name);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(StoreError::Integrity(
+            "lineage compaction 重放记录的备份路径越过机器级根目录".to_owned(),
+        ));
+    }
+    let backup_path = backup_root.join(relative);
+    let metadata = fs::symlink_metadata(&backup_path).map_err(|error| {
+        StoreError::Integrity(format!(
+            "lineage compaction 重放备份不可用 {}：{error}",
+            backup_path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(StoreError::Integrity(format!(
+            "lineage compaction 重放备份不是普通文件：{}",
+            backup_path.display()
+        )));
+    }
+    let canonical_root = fs::canonicalize(backup_root)?;
+    let canonical_backup = fs::canonicalize(&backup_path)?;
+    if !canonical_backup.starts_with(&canonical_root) {
+        return Err(StoreError::Integrity(
+            "lineage compaction 重放备份越过机器级根目录".to_owned(),
+        ));
+    }
+    if digest_database_file(&backup_path)? != backup.backup_file_sha256 {
+        return Err(StoreError::Integrity(
+            "lineage compaction 重放备份文件 SHA-256 已漂移".to_owned(),
+        ));
+    }
+    let verification = inspect_database_logical_content(&backup_path, false)?;
+    if verification.logical_manifest_sha256 != backup.backup_logical_manifest_sha256
+        || verification.quick_check != "ok"
+        || verification.foreign_key_violation_count != 0
+    {
+        return Err(StoreError::Integrity(
+            "lineage compaction 重放备份逻辑清单或完整性已漂移".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn legacy_backup_path(
+    backup_root: &Path,
+    database_instance_id: &str,
+    request_id: &str,
+    approved_manifest_hash: &str,
+    source_logical_manifest_sha256: &str,
+) -> Result<(String, PathBuf, PathBuf), StoreError> {
+    if !is_raw_sha256(database_instance_id)
+        || !is_sha256_fingerprint(approved_manifest_hash)
+        || !is_raw_sha256(source_logical_manifest_sha256)
+    {
+        return Err(StoreError::Integrity(
+            "lineage 备份身份输入不是受支持的 sha256 格式".to_owned(),
+        ));
+    }
+    let backup_id = format!(
+        "sha256_{}",
+        stable_parts_hash(&[
+            database_instance_id,
+            request_id,
+            approved_manifest_hash,
+            source_logical_manifest_sha256,
+            "legacy-lineage-online-backup-v1",
+        ])
+    );
+    let instance_root = backup_root.join(format!("db-{}", &database_instance_id[..16]));
+    let file_token = &backup_id[7..];
+    let final_path = instance_root.join(format!("{file_token}.sqlite3"));
+    let partial_path = instance_root.join(format!("{file_token}.partial.sqlite3"));
+    Ok((backup_id, final_path, partial_path))
+}
+
+fn create_verified_legacy_backup(
+    store: &BrainStore,
+    backup_root: &Path,
+    request_id: &str,
+    approved_manifest_hash: &str,
+    source_logical_manifest_sha256: &str,
+) -> Result<LegacyLineageBackupReport, StoreError> {
+    let database = store.database_path.as_deref().ok_or_else(|| {
+        StoreError::InvalidLineage("内存数据库不能创建 lineage 压缩备份".to_owned())
+    })?;
+    let database_instance_id: String = store.connection.query_row(
+        "SELECT value FROM metadata WHERE key = 'database_instance_id'",
+        [],
+        |row| row.get(0),
+    )?;
+    let (backup_id, backup, partial) = legacy_backup_path(
+        backup_root,
+        &database_instance_id,
+        request_id,
+        approved_manifest_hash,
+        source_logical_manifest_sha256,
+    )?;
+    let instance_root = backup.parent().ok_or_else(|| {
+        StoreError::Integrity(format!("lineage 备份没有父目录：{}", backup.display()))
+    })?;
+    fs::create_dir_all(instance_root)?;
+    let canonical_backup_root = fs::canonicalize(backup_root)?;
+    let canonical_instance_root = fs::canonicalize(instance_root)?;
+    if !canonical_instance_root.starts_with(&canonical_backup_root) {
+        return Err(StoreError::Integrity(
+            "lineage 备份实例目录越过机器级备份根目录".to_owned(),
+        ));
+    }
+
+    let reused_existing =
+        ensure_online_backup(database, &backup, &partial, source_logical_manifest_sha256)?;
+    let backup_verification =
+        verify_legacy_backup_file(&backup, source_logical_manifest_sha256, "最终文件")?;
+    let canonical_backup = fs::canonicalize(&backup)?;
+    let relative = canonical_backup
+        .strip_prefix(&canonical_backup_root)
+        .map_err(|_| StoreError::Integrity("lineage 备份不在机器级备份根目录内".to_owned()))?;
+    let file_name = relative
+        .to_str()
+        .ok_or_else(|| StoreError::Integrity("lineage 备份相对路径不是 UTF-8".to_owned()))?;
+    Ok(LegacyLineageBackupReport {
+        backup_id,
+        file_name: file_name.replace('\\', "/"),
+        database_bytes: fs::metadata(&backup)?.len(),
+        backup_file_sha256: digest_database_file(&backup)?,
+        source_logical_manifest_sha256: source_logical_manifest_sha256.to_owned(),
+        backup_logical_manifest_sha256: backup_verification.logical_manifest_sha256,
+        reused_existing,
+    })
+}
+
+fn ensure_online_backup(
+    database: &Path,
+    backup: &Path,
+    partial: &Path,
+    source_logical_manifest_sha256: &str,
+) -> Result<bool, StoreError> {
+    match fs::symlink_metadata(backup) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            verify_legacy_backup_file(backup, source_logical_manifest_sha256, "既有最终文件")?;
+            remove_generated_partial(partial)?;
+            Ok(true)
+        }
+        Ok(_) => Err(StoreError::Integrity(format!(
+            "lineage 备份目标不是普通文件：{}",
+            backup.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            remove_generated_partial(partial)?;
+            let source = Connection::open_with_flags(
+                database,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            source.busy_timeout(std::time::Duration::from_secs(5))?;
+            source.backup(MAIN_DB, partial, None)?;
+            drop(source);
+            verify_legacy_backup_file(partial, source_logical_manifest_sha256, "临时文件")?;
+            fs::hard_link(partial, backup).map_err(|error| {
+                StoreError::Integrity(format!(
+                    "无法以不覆盖方式发布 lineage 备份 {}：{error}",
+                    backup.display()
+                ))
+            })?;
+            fs::remove_file(partial)?;
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn verify_legacy_backup_file(
+    backup: &Path,
+    source_logical_manifest_sha256: &str,
+    phase: &str,
+) -> Result<DatabaseLogicalVerification, StoreError> {
+    let verification = inspect_database_logical_content(backup, false)?;
+    if verification.logical_manifest_sha256 != source_logical_manifest_sha256
+        || verification.quick_check != "ok"
+        || verification.foreign_key_violation_count != 0
+    {
+        return Err(StoreError::Integrity(format!(
+            "lineage Online Backup {phase}的逻辑清单或完整性验证失败"
+        )));
+    }
+    Ok(verification)
+}
+
+fn remove_generated_partial(partial: &Path) -> Result<(), StoreError> {
+    match fs::symlink_metadata(partial) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            fs::remove_file(partial).map_err(Into::into)
+        }
+        Ok(_) => Err(StoreError::Integrity(format!(
+            "lineage 备份临时目标不是普通文件：{}",
+            partial.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf, StoreError> {
+    let mut candidate = path;
+    loop {
+        match fs::metadata(candidate) {
+            Ok(metadata) if metadata.is_dir() => return Ok(fs::canonicalize(candidate)?),
+            Ok(_) => {
+                return Err(StoreError::Integrity(format!(
+                    "lineage 备份路径祖先不是目录：{}",
+                    candidate.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                candidate = candidate.parent().ok_or_else(|| {
+                    StoreError::Integrity(format!(
+                        "找不到 lineage 备份路径的现有祖先：{}",
+                        path.display()
+                    ))
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn paths_share_filesystem(left: &Path, right: &Path) -> Result<bool, StoreError> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(fs::metadata(left)?.dev() == fs::metadata(right)?.dev())
+}
+
+#[cfg(windows)]
+fn paths_share_filesystem(left: &Path, right: &Path) -> Result<bool, StoreError> {
+    let left = fs::canonicalize(left)?;
+    let right = fs::canonicalize(right)?;
+    let left_prefix = left
+        .components()
+        .next()
+        .ok_or_else(|| StoreError::Integrity(format!("路径没有卷前缀：{}", left.display())))?;
+    let right_prefix = right
+        .components()
+        .next()
+        .ok_or_else(|| StoreError::Integrity(format!("路径没有卷前缀：{}", right.display())))?;
+    Ok(left_prefix
+        .as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right_prefix.as_os_str().to_string_lossy()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn paths_share_filesystem(_left: &Path, _right: &Path) -> Result<bool, StoreError> {
+    Ok(false)
+}
+
+fn digest_database_file(path: &Path) -> Result<String, StoreError> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("sha256_{:x}", digest.finalize()))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "压缩预演必须在同一只读快照中完成候选资格、完整笛卡尔积和摘要校验"
@@ -3992,6 +4540,16 @@ fn build_legacy_lineage_compaction_plan(
             replayed: false,
             request_id: request_id.map(str::to_owned),
             approved_manifest_hash: None,
+            backup_preflight: LegacyLineageBackupPreflightReport {
+                estimated_backup_space_bytes: 0,
+                available_backup_space_bytes: 0,
+                estimated_source_wal_headroom_bytes: 0,
+                available_source_space_bytes: 0,
+                shares_source_filesystem: false,
+                sufficient: false,
+            },
+            pre_compaction_logical_manifest_sha256: None,
+            backup: None,
             legacy_ambiguous_candidate_count: total,
             compactable_group_count,
             compactable_candidate_count,
@@ -4076,6 +4634,7 @@ fn legacy_compaction_request_hash(project_key: &str, approved_manifest_hash: &st
             "compact-legacy-proposals",
             operation_version.as_str(),
             approved_manifest_hash,
+            "mandatory-online-backup-v1",
         ])
     )
 }
@@ -6019,11 +6578,12 @@ mod tests {
         SYMBOL_PROTOCOL_VERSION, SourceFileState, SourceLanguage, SymbolNode, SymbolNodeInput,
         SymbolSnapshot, SymbolStatus, encode_provider_key,
     };
-    use rusqlite::{Connection, params};
+    use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 
     use super::{
-        AdapterRecordResult, BrainStore, LineageCandidateRecord, SemanticSnapshotSource,
-        StoreError, semantic_source_manifest_hash,
+        AdapterRecordResult, BrainStore, DATABASE_SCHEMA_VERSION, LineageCandidateRecord,
+        SemanticSnapshotSource, StoreError, create_verified_legacy_backup,
+        inspect_database_storage, is_raw_sha256, legacy_backup_path, semantic_source_manifest_hash,
     };
 
     const PROJECT_KEY: &str = "project_test";
@@ -6666,7 +7226,10 @@ mod tests {
         drop(connection);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 16);
+        assert_eq!(
+            migrated.database_schema_version().unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
         let planes_json: String = migrated
             .connection
             .query_row(
@@ -6742,7 +7305,10 @@ mod tests {
         drop(connection);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 16);
+        assert_eq!(
+            migrated.database_schema_version().unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
         assert_eq!(migrated.list_evidence_heads(PROJECT_KEY).unwrap().len(), 1);
         let test_snapshot = plane_evidence_snapshot(
             PROJECT_KEY,
@@ -7283,7 +7849,7 @@ mod tests {
         let before_changes = store.connection.total_changes();
         let stats = store.database_storage_stats().unwrap();
 
-        assert_eq!(stats.schema_version, 16);
+        assert_eq!(stats.schema_version, DATABASE_SCHEMA_VERSION);
         assert!(stats.page_size_bytes > 0);
         assert!(stats.page_count > 0);
         assert!(stats.database_bytes >= stats.reclaimable_bytes);
@@ -7416,7 +7982,10 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 16);
+        assert_eq!(
+            store.database_schema_version().unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, false, 10)
@@ -7501,7 +8070,10 @@ mod tests {
         drop(connection);
 
         let store = BrainStore::open(&database).unwrap();
-        assert_eq!(store.database_schema_version().unwrap(), 16);
+        assert_eq!(
+            store.database_schema_version().unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
         assert!(
             store
                 .list_symbols(PROJECT_KEY, None, true, 10)
@@ -7541,7 +8113,10 @@ mod tests {
         drop(connection);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 16);
+        assert_eq!(
+            migrated.database_schema_version().unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
         let legacy_source = migrated
             .connection
             .query_row(
@@ -7929,7 +8504,10 @@ mod tests {
         drop(legacy);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 16);
+        assert_eq!(
+            migrated.database_schema_version().unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
         let refreshed = SemanticSnapshotSource::trusted_provider(
             "d".repeat(64),
             "same-head".to_owned(),
@@ -8409,7 +8987,7 @@ mod tests {
             )
             .unwrap();
         let report = store
-            .preview_legacy_lineage_compaction(PROJECT_KEY)
+            .preview_legacy_lineage_compaction(PROJECT_KEY, std::path::Path::new("."))
             .unwrap();
         assert_eq!(report.mode, "dry_run");
         assert!(!report.applied);
@@ -8451,19 +9029,25 @@ mod tests {
             .unwrap();
 
         let report = store
-            .preview_legacy_lineage_compaction(PROJECT_KEY)
+            .preview_legacy_lineage_compaction(PROJECT_KEY, std::path::Path::new("."))
             .unwrap();
         assert_eq!(report.compactable_group_count, 0);
         assert_eq!(report.protected_candidate_count, 4);
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "单个场景同时验证压缩原子性、审计、幂等重放、血缘查询与备份漂移关闭"
+    )]
     fn legacy_compaction_is_audited_atomic_and_idempotent() {
-        let store = BrainStore::open_in_memory().unwrap();
+        let (root, database) = temporary_database("legacy-compaction-atomic");
+        let backup_root = root.join("backups");
+        let store = BrainStore::open(&database).unwrap();
         insert_legacy_cartesian_fixture(&store, true);
 
         let preview = store
-            .preview_legacy_lineage_compaction(PROJECT_KEY)
+            .preview_legacy_lineage_compaction(PROJECT_KEY, &backup_root)
             .unwrap();
         assert_eq!(preview.compactable_group_count, 1);
         assert_eq!(preview.compactable_candidate_count, 4);
@@ -8475,10 +9059,18 @@ mod tests {
                 PROJECT_KEY,
                 "compact-request-1",
                 &preview.compaction_manifest_hash,
+                &backup_root,
             )
             .unwrap();
         assert!(applied.applied);
         assert!(!applied.replayed);
+        assert!(applied.backup.is_some());
+        assert!(
+            applied
+                .pre_compaction_logical_manifest_sha256
+                .as_deref()
+                .is_some_and(is_raw_sha256)
+        );
         assert_eq!(
             applied.approved_manifest_hash.as_deref(),
             Some(preview.compaction_manifest_hash.as_str())
@@ -8520,6 +9112,7 @@ mod tests {
                 PROJECT_KEY,
                 "compact-request-1",
                 &preview.compaction_manifest_hash,
+                &backup_root,
             )
             .unwrap();
         assert!(replay.replayed);
@@ -8548,17 +9141,385 @@ mod tests {
                 PROJECT_KEY,
                 "compact-request-1",
                 &different_manifest,
+                &backup_root,
             ),
             Err(StoreError::LineageIdempotencyConflict(_))
         ));
+        let backup_path = backup_root.join(&applied.backup.as_ref().unwrap().file_name);
+        fs::remove_file(&backup_path).unwrap();
+        assert!(matches!(
+            store.apply_legacy_lineage_compaction(
+                PROJECT_KEY,
+                "compact-request-1",
+                &preview.compaction_manifest_hash,
+                &backup_root,
+            ),
+            Err(StoreError::Integrity(message)) if message.contains("重放备份不可用")
+        ));
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_compaction_creates_and_audits_an_exact_pre_delete_backup() {
+        let (root, database) = temporary_database("legacy-compaction-backup");
+        let backup_root = root.join("machine-backups");
+        let store = BrainStore::open(&database).unwrap();
+        store
+            .apply_symbol_snapshot(&snapshot_for(
+                "pb_other",
+                "other-project-revision",
+                vec![symbol_for("pb_other", "other-project-symbol")],
+            ))
+            .unwrap();
+        let other_project_symbols_before: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM symbol_nodes WHERE project_key = 'pb_other'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(other_project_symbols_before, 1);
+        insert_legacy_cartesian_fixture(&store, true);
+        let preview = store
+            .preview_legacy_lineage_compaction(PROJECT_KEY, &backup_root)
+            .unwrap();
+        assert!(preview.backup_preflight.estimated_backup_space_bytes > 0);
+        assert!(preview.backup_preflight.estimated_source_wal_headroom_bytes > 0);
+        assert!(preview.backup_preflight.sufficient);
+
+        let applied = store
+            .apply_legacy_lineage_compaction(
+                PROJECT_KEY,
+                "backup-compaction-request",
+                &preview.compaction_manifest_hash,
+                &backup_root,
+            )
+            .unwrap();
+        let backup = applied.backup.as_ref().unwrap();
+        assert!(!backup.reused_existing);
+        assert_eq!(
+            backup.source_logical_manifest_sha256,
+            backup.backup_logical_manifest_sha256
+        );
+        assert_eq!(
+            applied.pre_compaction_logical_manifest_sha256.as_deref(),
+            Some(backup.backup_logical_manifest_sha256.as_str())
+        );
+        let backup_path = backup_root.join(&backup.file_name);
+        let backup_stats = inspect_database_storage(&backup_path).unwrap();
+        assert_eq!(backup_stats.lineage_candidate_count, 4);
+        assert_eq!(backup_stats.lineage_evidence_count, 4);
+        assert_eq!(backup_stats.lineage_group_count, 0);
+        let backup_connection = Connection::open_with_flags(
+            &backup_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        let other_project_symbols: i64 = backup_connection
+            .query_row(
+                "SELECT COUNT(*) FROM symbol_nodes WHERE project_key = 'pb_other'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(other_project_symbols, 1);
+        let source_stats = inspect_database_storage(&database).unwrap();
+        assert_eq!(source_stats.lineage_candidate_count, 0);
+        assert_eq!(source_stats.lineage_evidence_count, 0);
+        assert_eq!(source_stats.lineage_group_count, 1);
+        let audit: (String, String, String, String) = store
+            .connection
+            .query_row(
+                "SELECT pre_compaction_logical_manifest_sha256, backup_id,
+                        backup_file_name, backup_file_sha256
+                 FROM semantic_lineage_compaction_runs
+                 WHERE project_key = ?1 AND request_id = 'backup-compaction-request'",
+                [PROJECT_KEY],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(audit.0, backup.source_logical_manifest_sha256);
+        assert_eq!(audit.1, backup.backup_id);
+        assert_eq!(audit.2, backup.file_name);
+        assert_eq!(audit.3, backup.backup_file_sha256);
+
+        drop(backup_connection);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_online_backup_preserves_nonempty_wal_and_blocks_a_second_writer() {
+        let (root, database) = temporary_database("legacy-compaction-wal");
+        let backup_root = root.join("machine-backups");
+        let store = BrainStore::open(&database).unwrap();
+        insert_legacy_cartesian_fixture(&store, true);
+        let preview = store
+            .preview_legacy_lineage_compaction(PROJECT_KEY, &backup_root)
+            .unwrap();
+        let wal = database.with_file_name(format!(
+            "{}-wal",
+            database.file_name().unwrap().to_string_lossy()
+        ));
+        let wal_bytes_before = fs::metadata(&wal).unwrap().len();
+        assert!(wal_bytes_before > 0);
+
+        let transaction =
+            Transaction::new_unchecked(&store.connection, TransactionBehavior::Immediate).unwrap();
+        let second_writer = Connection::open(&database).unwrap();
+        second_writer
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        assert!(
+            second_writer
+                .execute(
+                    "INSERT INTO metadata(key, value) VALUES('blocked-writer', '1')",
+                    [],
+                )
+                .is_err()
+        );
+
+        let verification = super::maintenance::logical_verification(&transaction, false).unwrap();
+        let prepared = create_verified_legacy_backup(
+            &store,
+            &backup_root,
+            "wal-backup-request",
+            &preview.compaction_manifest_hash,
+            &verification.logical_manifest_sha256,
+        )
+        .unwrap();
+        assert!(!prepared.reused_existing);
+        assert_eq!(fs::metadata(&wal).unwrap().len(), wal_bytes_before);
+        transaction.rollback().unwrap();
+
+        drop(second_writer);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_compaction_never_overwrites_a_conflicting_backup() {
+        let (root, database) = temporary_database("legacy-compaction-backup-conflict");
+        let backup_root = root.join("machine-backups");
+        let store = BrainStore::open(&database).unwrap();
+        insert_legacy_cartesian_fixture(&store, true);
+        let preview = store
+            .preview_legacy_lineage_compaction(PROJECT_KEY, &backup_root)
+            .unwrap();
+        let verification =
+            super::maintenance::logical_verification(&store.connection, false).unwrap();
+        let database_instance_id: String = store
+            .connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'database_instance_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (_, backup_path, _) = legacy_backup_path(
+            &backup_root,
+            &database_instance_id,
+            "backup-conflict-request",
+            &preview.compaction_manifest_hash,
+            &verification.logical_manifest_sha256,
+        )
+        .unwrap();
+        fs::create_dir_all(backup_path.parent().unwrap()).unwrap();
+        fs::write(&backup_path, b"not-a-database").unwrap();
+
+        assert!(
+            store
+                .apply_legacy_lineage_compaction(
+                    PROJECT_KEY,
+                    "backup-conflict-request",
+                    &preview.compaction_manifest_hash,
+                    &backup_root,
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(&backup_path).unwrap(), b"not-a-database");
+        let source_stats = inspect_database_storage(&database).unwrap();
+        assert_eq!(source_stats.lineage_candidate_count, 4);
+        assert_eq!(source_stats.lineage_evidence_count, 4);
+        assert_eq!(source_stats.lineage_group_count, 0);
+        let audit_runs: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_lineage_compaction_runs",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_runs, 0);
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_compaction_reuses_a_verified_backup_after_transaction_rollback() {
+        let (root, database) = temporary_database("legacy-compaction-backup-retry");
+        let backup_root = root.join("machine-backups");
+        let store = BrainStore::open(&database).unwrap();
+        insert_legacy_cartesian_fixture(&store, true);
+        let preview = store
+            .preview_legacy_lineage_compaction(PROJECT_KEY, &backup_root)
+            .unwrap();
+        let transaction =
+            Transaction::new_unchecked(&store.connection, TransactionBehavior::Immediate).unwrap();
+        let verification = super::maintenance::logical_verification(&transaction, false).unwrap();
+        let prepared = create_verified_legacy_backup(
+            &store,
+            &backup_root,
+            "backup-retry-request",
+            &preview.compaction_manifest_hash,
+            &verification.logical_manifest_sha256,
+        )
+        .unwrap();
+        assert!(!prepared.reused_existing);
+        transaction.rollback().unwrap();
+
+        let applied = store
+            .apply_legacy_lineage_compaction(
+                PROJECT_KEY,
+                "backup-retry-request",
+                &preview.compaction_manifest_hash,
+                &backup_root,
+            )
+            .unwrap();
+        assert!(applied.backup.as_ref().unwrap().reused_existing);
+        assert_eq!(
+            applied.backup.as_ref().unwrap().backup_file_sha256,
+            prepared.backup_file_sha256
+        );
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v16_migration_preserves_compaction_audit_and_adds_backup_attestation() {
+        let (root, database) = temporary_database("v16-lineage-backup-migration");
+        let store = BrainStore::open(&database).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE semantic_lineage_compaction_groups;
+                 DROP TABLE semantic_lineage_compaction_runs;
+                 CREATE TABLE semantic_lineage_compaction_runs (
+                     run_id TEXT PRIMARY KEY,
+                     project_key TEXT NOT NULL,
+                     request_id TEXT NOT NULL,
+                     request_hash TEXT NOT NULL,
+                     operation_version INTEGER NOT NULL,
+                     compacted_group_count INTEGER NOT NULL,
+                     compacted_candidate_count INTEGER NOT NULL,
+                     compacted_evidence_count INTEGER NOT NULL,
+                     protected_candidate_count INTEGER NOT NULL,
+                     compaction_manifest_hash TEXT NOT NULL,
+                     report_json TEXT NOT NULL,
+                     created_at_unix_seconds INTEGER NOT NULL,
+                     UNIQUE(project_key, request_id)
+                 );
+                 INSERT INTO semantic_lineage_compaction_runs(
+                     run_id, project_key, request_id, request_hash,
+                     operation_version, compacted_group_count,
+                     compacted_candidate_count, compacted_evidence_count,
+                     protected_candidate_count, compaction_manifest_hash,
+                     report_json, created_at_unix_seconds
+                 ) VALUES(
+                     'legacy-run', 'project_test', 'legacy-request',
+                     'legacy-request-hash', 1, 1, 4, 4, 0,
+                     'legacy-manifest', '{}', 1
+                 );
+                 UPDATE metadata SET value = '16' WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        drop(store);
+
+        let migrated = BrainStore::open(&database).unwrap();
+        assert_eq!(
+            migrated.database_schema_version().unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
+        let audit: (String, Option<String>, Option<String>, Option<String>) = migrated
+            .connection
+            .query_row(
+                "SELECT request_id, backup_id, backup_file_name,
+                        backup_logical_manifest_sha256
+                 FROM semantic_lineage_compaction_runs
+                 WHERE run_id = 'legacy-run'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(audit, ("legacy-request".to_owned(), None, None, None));
+
+        drop(migrated);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v17_migration_removes_the_unreleased_optional_backup_marker() {
+        let (root, database) = temporary_database("v17-remove-optional-backup-marker");
+        let store = BrainStore::open(&database).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "ALTER TABLE semantic_lineage_compaction_runs
+                 ADD COLUMN keep_backup INTEGER NOT NULL DEFAULT 0
+                 CHECK(keep_backup IN (0, 1));",
+            )
+            .unwrap();
+        drop(store);
+
+        let migrated = BrainStore::open(&database).unwrap();
+        let has_marker: i64 = migrated
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('semantic_lineage_compaction_runs')
+                 WHERE name = 'keep_backup'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_marker, 0);
+
+        drop(migrated);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v17_storage_boundary_rejects_v2_compaction_without_exact_backup_attestation() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let insert = |operation_version: i64, request_id: &str| {
+            store.connection.execute(
+                "INSERT INTO semantic_lineage_compaction_runs(
+                     project_key, request_id, request_hash, operation_version,
+                     compacted_group_count, compacted_candidate_count,
+                     compacted_evidence_count, protected_candidate_count,
+                     compaction_manifest_hash, report_json, created_at_unix_seconds
+                 ) VALUES(
+                     'project_test', ?1, 'request-hash', ?2,
+                     0, 0, 0, 0, 'manifest-hash', '{}', 1
+                 )",
+                params![request_id, operation_version],
+            )
+        };
+        assert!(insert(2, "missing-backup-v2").is_err());
+        assert_eq!(insert(1, "legacy-v1").unwrap(), 1);
     }
 
     #[test]
     fn legacy_compaction_rejects_a_stale_approved_manifest_without_deleting() {
-        let store = BrainStore::open_in_memory().unwrap();
+        let (root, database) = temporary_database("legacy-compaction-stale");
+        let backup_root = root.join("machine-backups");
+        let store = BrainStore::open(&database).unwrap();
         insert_legacy_cartesian_fixture(&store, true);
         let preview = store
-            .preview_legacy_lineage_compaction(PROJECT_KEY)
+            .preview_legacy_lineage_compaction(PROJECT_KEY, &backup_root)
             .unwrap();
         store
             .connection
@@ -8574,6 +9535,7 @@ mod tests {
                 PROJECT_KEY,
                 "stale-compaction",
                 &preview.compaction_manifest_hash,
+                &backup_root,
             ),
             Err(StoreError::LineageCompactionPlanStale { .. })
         ));
@@ -8596,6 +9558,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(audit_runs, 0);
+        assert!(!backup_root.exists());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -8603,7 +9568,7 @@ mod tests {
         let store = BrainStore::open_in_memory().unwrap();
         insert_legacy_cartesian_fixture(&store, true);
         let before = store
-            .preview_legacy_lineage_compaction(PROJECT_KEY)
+            .preview_legacy_lineage_compaction(PROJECT_KEY, std::path::Path::new("."))
             .unwrap();
         store
             .connection
@@ -8630,7 +9595,7 @@ mod tests {
             .unwrap();
 
         let after = store
-            .preview_legacy_lineage_compaction(PROJECT_KEY)
+            .preview_legacy_lineage_compaction(PROJECT_KEY, std::path::Path::new("."))
             .unwrap();
         assert_eq!(after.compactable_candidate_count, 4);
         assert_eq!(after.protected_candidate_count, 1);
@@ -8648,7 +9613,7 @@ mod tests {
             )
             .unwrap();
         let replacement = store
-            .preview_legacy_lineage_compaction(PROJECT_KEY)
+            .preview_legacy_lineage_compaction(PROJECT_KEY, std::path::Path::new("."))
             .unwrap();
         assert_eq!(replacement.protected_candidate_count, 1);
         assert_ne!(
@@ -8682,7 +9647,10 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            store.preview_legacy_lineage_compaction(PROJECT_KEY),
+            store.preview_legacy_lineage_compaction(
+                PROJECT_KEY,
+                std::path::Path::new("."),
+            ),
             Err(StoreError::Integrity(message)) if message.contains("跨项目")
         ));
     }
@@ -8708,7 +9676,10 @@ mod tests {
         drop(store);
 
         let migrated = BrainStore::open(&database).unwrap();
-        assert_eq!(migrated.database_schema_version().unwrap(), 16);
+        assert_eq!(
+            migrated.database_schema_version().unwrap(),
+            DATABASE_SCHEMA_VERSION
+        );
         assert_eq!(
             migrated
                 .list_symbols(PROJECT_KEY, None, false, 10)

@@ -145,6 +145,7 @@ dependencies = [
  "brain-core",
  "brain-evidence",
  "brain-symbols",
+ "fs2",
  "rusqlite",
  "serde",
  "serde_json",

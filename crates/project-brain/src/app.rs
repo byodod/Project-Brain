@@ -1546,11 +1546,25 @@ impl App {
 
     pub fn compact_legacy_lineage_proposals(
         &self,
+        install_root: Option<&Path>,
         apply: bool,
         request_id: Option<&str>,
         approved_manifest_hash: Option<&str>,
         human_confirmed: bool,
     ) -> Result<(), AppError> {
+        let install_root = setup::resolve_install_root(install_root)?;
+        let project_boundary = PathBuf::from(provider::provider_cli_path(&self.root));
+        let install_boundary = PathBuf::from(provider::provider_cli_path(&install_root));
+        if install_boundary.starts_with(&project_boundary)
+            || install_root.canonicalize().is_ok_and(|path| {
+                PathBuf::from(provider::provider_cli_path(&path)).starts_with(&project_boundary)
+            })
+        {
+            return Err(AppError::Governance(
+                "lineage 删除前备份必须位于项目工作树之外的机器级数据目录".to_owned(),
+            ));
+        }
+        let backup_root = install_root.join("state/backups/lineage-compaction");
         let report = if apply {
             require_human_confirmation(human_confirmed, "compact legacy lineage proposals")?;
             let request_id = request_id.ok_or_else(|| {
@@ -1568,6 +1582,7 @@ impl App {
                 &self.config.project_key,
                 request_id,
                 approved_manifest_hash,
+                &backup_root,
             )?
         } else {
             if request_id.is_some() || approved_manifest_hash.is_some() || human_confirmed {
@@ -1576,7 +1591,7 @@ impl App {
                 ));
             }
             self.store
-                .preview_legacy_lineage_compaction(&self.config.project_key)?
+                .preview_legacy_lineage_compaction(&self.config.project_key, &backup_root)?
         };
         println!("{}", pretty_json(&report)?);
         Ok(())

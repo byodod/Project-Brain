@@ -232,7 +232,7 @@ fn require_current_schema(connection: &Connection) -> Result<(), StoreError> {
     clippy::too_many_lines,
     reason = "完整逻辑清单必须在同一读取事务语义中覆盖 schema、表、行与完整性门禁"
 )]
-fn logical_verification(
+pub(super) fn logical_verification(
     connection: &Connection,
     full_check: bool,
 ) -> Result<DatabaseLogicalVerification, StoreError> {

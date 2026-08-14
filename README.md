@@ -16,7 +16,7 @@ Project Brain 是一个独立于具体 Coding Agent 的项目决策控制面。�
 - 按项目显式配置的 SCIP 导入与机器级安全 Runner，首批契约覆盖 rust-analyzer、scip-dotnet 与 scip-python；
 - 开放 language ID、逐文档语言映射和四态语义能力声明；
 - Project-scoped semantic lineage ledger、不可变证据与 append-only 显式裁决；
-- SQLite schema v1→v16 迁移、按项目隔离的符号 removed 历史、Evidence ledger、幂等增量更新与显式维护协议；
+- SQLite schema v1→v17 迁移、按项目隔离的符号 removed 历史、Evidence ledger、幂等增量更新与显式维护协议；
 - Windows、Linux、macOS 可构建的 Rust CLI。
 
 ## 核心原则
@@ -731,9 +731,16 @@ project-brain lineage compact-legacy-proposals \
 apply 会取得独占协作维护锁，并在 `BEGIN IMMEDIATE` 事务中重新计算完整计划。当前 manifest 与人工
 审核的 hash 不同会以 plan-stale 拒绝，且不会写审计、group 或删除记录；request ID 的参数摘要也绑定
 该 hash，同一 ID 换计划会触发幂等碰撞。计划还会 fail-closed 检查项目与 decision/candidate 的引用归属。
-验证通过后才在同一事务中保存 group/member、候选与证据 manifest hash 及追加式审计，再删除已证明
-冗余的旧 pair/evidence。重放同一 request ID 返回原报告；命令不会执行 `VACUUM`。由旧 token 指纹
-压缩成的 group 只保留历史事实，禁止重新 materialize。可用 `--lock-timeout-seconds` 调整独占锁等待。
+验证通过后，必须先在项目工作树之外的机器级
+`<install-root>/state/backups/lineage-compaction/` 创建删除前全库备份。实现使用独立只读连接调用 SQLite
+Online Backup API，不 checkpoint、不复制裸 `.db` 文件，也不执行 `VACUUM`；备份的全库逻辑清单、
+`quick_check` 和外键检查必须与持有 `BEGIN IMMEDIATE` 的删除前事务完全一致。只有备份发布并复验成功，
+才在该事务中保存 group/member、候选与证据 manifest hash、备份身份及追加式审计，再删除已证明冗余的
+旧 pair/evidence。该命令没有跳过备份的参数；现有同名备份只在逻辑清单完全相同时重用，永不覆盖。
+重放同一 request ID 会先重新验证原备份的路径边界、文件 SHA-256、逻辑清单和完整性，再返回原报告；
+备份缺失或漂移时 fail-closed。命令不会执行 `VACUUM`。由旧 token 指纹压缩成的 group 只保留历史
+事实，禁止重新 materialize。可用 `--install-root` 选择机器数据目录，用 `--lock-timeout-seconds` 调整
+独占锁等待。dry-run 会报告备份卷和源库 WAL 的保守空间预算，但不创建备份目录或文件。
 
 ## 数据库维护
 

@@ -149,7 +149,7 @@ SQLite 中的代码事实不能成为不可恢复的唯一来源。完整快照�
 进入 `removed` 状态而非物理删除，使历史规则引用仍可诊断。
 符号 ID、快照 revision、节点/边主键、查询和墓碑更新都包含 `project_key`。数据库 schema v4
 首次建立这组项目隔离约束；对应迁移会清除旧版无项目归属的可重建符号缓存，但保留动作与
-adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v16，并在这些约束上
+adapter 审计，避免把旧节点错误归入某个项目。当前数据库版本为 schema v17，并在这些约束上
 增加独立的语义血缘账本、append-only 来源证明、不可伪造的源码 Document manifest，以及
 Evidence Plane 当前 head 与带 `stale/unknown` 结果的失效事件。
 数据库迁移拒绝缺失或非整数的已有 `schema_version`，不会把损坏元数据静默当作 v1。
@@ -171,9 +171,15 @@ confirmed / rejected / superseded / invalidated
            └── never rewrites SymbolNode / tombstone / snapshot
 ```
 
-SQLite schema v16 保存 semantic snapshots、append-only source attestations、source manifests、
+SQLite schema v17 保存 semantic snapshots、append-only source attestations、source manifests、
 symbol observations、group/member/generation run、candidate/evidence/decision，以及显式旧账压缩的
-run/group 审计、人工 pair materialization request 与 append-only Provider qualification events。压缩默认只读；apply 必须携带人工确认与幂等 request ID，且逻辑删除与审计同事务。
+run/group 审计、删除前备份证明、人工 pair materialization request 与 append-only Provider qualification
+events。压缩默认只读；apply 必须携带人工确认、幂等 request ID 和已批准 dry-run manifest。它先持有
+immediate 写事务阻止并发写者，再由另一只读连接使用 SQLite Online Backup API 把完整删除前状态保存到
+项目外的机器级目录。逻辑清单、quick check 和外键复验成功之前，不产生任何压缩 DML；新审计绑定
+backup ID、相对路径、制品 SHA-256 和删除前逻辑清单。该路径不 checkpoint、不复制裸 `.db`，也没有
+跳过备份开关。schema v17 触发器在存储边界拒绝缺少完整备份证明或前后逻辑清单不相等的
+operation v2+ run。
 物理压缩是后续独立维护协议，不能替代候选资格证明。`database stats` 只读打开当前 schema；
 `database compact` 默认预演，apply 则在协作式独占锁下完成 WAL checkpoint、`VACUUM INTO`、源/候选
 全库逻辑清单等价验证、默认备份与同文件系统原子替换。操作日志位于被替换数据库之外；任何未完成或
@@ -298,4 +304,6 @@ Extension 安装器仍留在后续阶段。
 [ADR-0029](adr/0029-python-manifest-test-contract.md) 与
 [ADR-0030](adr/0030-dotnet-project-root-sdk-resolution.md) 与
 [ADR-0031](adr/0031-crash-safe-database-compaction.md) 与
-[ADR-0032](adr/0032-post-tool-source-fingerprint-reconciliation.md)。
+[ADR-0032](adr/0032-post-tool-source-fingerprint-reconciliation.md)、
+[ADR-0033](adr/0033-approved-legacy-lineage-compaction-plan.md) 与
+[ADR-0034](adr/0034-mandatory-online-backup-before-lineage-deletion.md)。

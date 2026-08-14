@@ -508,8 +508,11 @@ V8 的 ambiguity 属于 `semantic_lineage_groups`；candidate 的旧 `ambiguity_
 11. V7 逻辑压缩的 dry-run manifest 覆盖完整候选分类、受保护身份、精确 deletion set 摘要和目标 group；apply 必须
     在独占协作维护锁与 immediate 事务内重新计划，并与显式批准的 manifest hash 相等。任何计划漂移或
     decision/candidate 跨项目引用都 fail-closed，request ID 同时绑定 operation version 与批准 hash。
+12. V7 逻辑压缩 apply 没有无备份模式。删除前必须用独立只读连接执行 SQLite Online Backup，把整个数据库
+    保存到项目工作树外的机器级数据目录；备份的全库逻辑清单、quick check 与外键检查必须和持有
+    `BEGIN IMMEDIATE` 的删除前事务一致。备份发布并复验成功前不得写 group、run、审计或执行删除。
 
-SQLite schema v16 保存 semantic snapshots、source attestations、source manifests、symbol observations、
+SQLite schema v17 保存 semantic snapshots、source attestations、source manifests、symbol observations、
 lineage groups/members/generation runs、candidate/evidence/decision 与 legacy compaction audit。旧快照迁移后的来源字段为空且默认为 `offline_import`，不会被提升
 为硬证据，也不会从现存 symbol 反推缺失 Document。真实重跑相同 snapshot 时可以首次补录 manifest；
 可信重跑只追加 attestation，不改写 symbol observations 或人工 lineage 状态。attestation 的唯一身份
@@ -521,8 +524,16 @@ V7 legacy compaction 默认是 dry-run。只有一个 group 的所有行仍为 `
 fingerprint 重建后的实际 pair 集精确等于 from×to，才可进入 apply。任何缺行、附加证据、裁决或损坏
 observation 都保护整个 group。apply 必须携带人工审核的 dry-run manifest hash，在独占协作维护锁和
 immediate 事务内重新计划；计划漂移或跨项目引用直接拒绝。验证一致后先保存 group/member 与
-append-only compaction audit，再在同一事务删除对应 evidence/candidate；不执行 `VACUUM`，压缩后的
-legacy group 不得重新物化。
+删除前全库备份。备份使用独立只读连接的 SQLite Online Backup API，不 checkpoint、不按文件复制裸库，
+也不执行 `VACUUM`。备份路径由 database instance ID、request ID、批准 manifest 和删除前逻辑清单确定，
+位于 `<install-root>/state/backups/lineage-compaction/`；同名最终文件只允许在全库逻辑清单完全相同时
+重用，禁止覆盖。备份通过 quick check、外键和全库逻辑清单复验后，才写入 group/member 与 append-only
+compaction audit（包括 backup ID、相对路径、文件 SHA-256 和逻辑清单），再在同一事务删除对应
+evidence/candidate。文件 SHA-256 只证明备份制品本身，不与 WAL 模式的源 `.db` 裸文件摘要比较。
+schema v17 的存储触发器也拒绝任何缺少完整备份证明或前后逻辑清单不相等的 operation v2+ run，
+防止绕过 Rust API 写入伪成功审计。
+成功 request 重放前会重新验证原备份路径边界、文件 SHA-256、逻辑清单和完整性；缺失或漂移时
+fail-closed。压缩后的 legacy group 不得重新物化。
 
 物理文件维护使用独立的 Database Maintenance Protocol v1：`database stats` 以只读连接和一致性事务
 读取当前 schema，不初始化或迁移数据库；`database compact` 的 dry-run 计算全库逻辑清单、文件摘要

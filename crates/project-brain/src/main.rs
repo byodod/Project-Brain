@@ -924,6 +924,7 @@ fn main() -> ExitCode {
                     lock_timeout_seconds: _,
                     human_confirmed,
                 } => app.compact_legacy_lineage_proposals(
+                    cli.install_root.as_deref(),
                     apply,
                     request_id.as_deref(),
                     approved_manifest_hash.as_deref(),
