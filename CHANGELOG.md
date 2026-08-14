@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-15
+
 ### Added
 
 - Production Qualification v1：机器级不可变账本、`run/status/show`、七项固定控制面资格用例，以及
