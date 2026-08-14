@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "tests": [
+    {
+      "module": "sample_tests",
+      "function": "test_arithmetic"
+    },
+    {
+      "module": "sample_tests",
+      "function": "test_normalized_inventory"
+    }
+  ]
+}

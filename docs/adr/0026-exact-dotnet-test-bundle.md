@@ -31,7 +31,7 @@ restore metadata。Project Brain 的 Build 在机器 scratch 中完成后会删�
    DOTNET_CLI_HOME、NuGet cache、TEMP/TMP 指向本次 scratch；这不是 OS 沙箱，测试代码仍可能访问网络
    或机器上用户可访问的其他资源。
 5. TRX 文件数、大小、UTF-8 与 Counters 结构有固定边界。状态区分 passed、failed、crashed、timed_out、
-   no_tests、provider_failed；覆盖区分 covered、empty、unknown。NoTests 不是 Pass。
+   no_tests、provider_failed；覆盖区分 covered、partial、empty、unknown。NoTests 不是 Pass。
 6. TRX v1 汇总不能可靠区分断言失败与测试代码/环境异常，因此 `dotnet_test_failed` 虽为 error，authority
    仍是 advisory，不能经 mapping 获得 hard-block 资格。后续只有 adapter-owned 的结构化断言协议才能
    产生 `deterministic_violation`。
@@ -51,6 +51,6 @@ restore metadata。Project Brain 的 Build 在机器 scratch 中完成后会删�
 
 - Test 运行字节与 Build Evidence 一致，不依赖仓库 `bin/obj` 或第二次构建。
 - .NET Test 的 TRX 边界保持不变；Godot scenario 由 ADR-0027 定义独立结构化合同，Rust Test 由
-  ADR-0028 固定离线 Cargo 合同；Python Test Provider 仍需单独定义。
+  ADR-0028 固定离线 Cargo 合同，Python Test 由 ADR-0029 固定 manifest/bootstrap 合同。
 - 当前通用 CAS 类型沿用历史 `RuntimeArtifactBundle` 名称；协议上它已承担受控 execution bundle。后续
   若改名必须保持 manifest 与既有 Runtime 的向后兼容。

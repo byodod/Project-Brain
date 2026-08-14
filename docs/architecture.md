@@ -257,9 +257,9 @@ Extension 安装器仍留在后续阶段。
    快照/attestation/head/staleness ledger 与 Hook 新鲜度提示已经完成；Godot Engine 以及
    .NET/Rust/Python Build Evidence Provider v1 已通过真实项目验证；Godot C# 最终产物还会提升到
    机器级内容寻址存储，以不可变 RuntimeArtifactBundle 绑定精确文件字节与主程序集。下一阶段从该
-   bundle 建立的隔离 Godot headless Runtime Provider 已通过真实项目的连续确定性运行；.NET Test、
-   Godot Scenario Test 与 Rust Test 已使用独立 Test Plane，finding 到规则的阻断仍必须显式映射。
-   下一阶段补 Python Test Provider 与更强的真实项目重复运行证明。
+   bundle 建立的隔离 Godot headless Runtime Provider 已通过真实项目的连续确定性运行；.NET、Rust、
+   Python 与 Godot Scenario Test 已使用独立 Test Plane，finding 到规则的阻断仍必须显式映射。下一阶段
+   增加其他语言合同、更强 OS 隔离与更多真实项目重复运行证明。
 6. 后续增加 TypeScript 等 provider，并加入只读、可拔插的 Semantic Sentinel；LLM 不能
    直接 hard block。
 
@@ -284,4 +284,5 @@ Extension 安装器仍留在后续阶段。
 [ADR-0025](adr/0025-test-evidence-and-explicit-finding-effects.md) 与
 [ADR-0026](adr/0026-exact-dotnet-test-bundle.md) 与
 [ADR-0027](adr/0027-godot-structured-scenario-test.md) 与
-[ADR-0028](adr/0028-rust-test-fixed-contract.md)。
+[ADR-0028](adr/0028-rust-test-fixed-contract.md) 与
+[ADR-0029](adr/0029-python-manifest-test-contract.md)。

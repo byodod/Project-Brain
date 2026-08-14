@@ -225,9 +225,10 @@ SHA-256 必须精确匹配。实际 argv 固定为 `dotnet vstest <bundle assemb
 --ResultsDirectory:<scratch> --nologo`，不读取仓库 runner 参数。
 
 TRX 汇总的 `status` 是 passed/failed/crashed/timed_out/no_tests/provider_failed，`coverage` 是
-covered/empty/unknown。Test Evidence 的通用 coverage 仍表示 Provider 合同观测是否完整：NoTests 可为
-complete + empty，但 TimedOut/ProviderFailed 为 partial。v1 无法从 TRX Counters 证明失败一定是声明的
-assertion，因此 failure finding 默认为 advisory；这刻意阻止“所有测试 error 自动 block”。
+covered/partial/empty/unknown。存在未执行测试时为 partial。Test Evidence 的通用 coverage 仍表示
+Provider 合同观测是否完整：NoTests 可为 complete + empty，但 partial、TimedOut/ProviderFailed 不具备
+hard-block 资格。v1 无法从 TRX Counters 证明失败一定是声明的 assertion，因此 failure finding 默认为
+advisory；这刻意阻止“所有测试 error 自动 block”。
 
 Rust Test run schema v1 使用 `cargo-test.<profile>` provider。它只接受指定
 `cargo-build.<build_profile>` 当前 head，并要求该 Build 为 fresh、complete、deterministic、无 finding；
@@ -239,6 +240,18 @@ Source fingerprint、Build Snapshot 的规范 `build_target` artifact 与 cargo 
 feature、filter、runner、shell、env 或网络。多个稳定版 libtest `test result:` 摘要在有界 UTF-8 输出内
 聚合。无测试为 complete + empty；timeout/输出截断/缺少完整摘要为 partial 或 provider failure。普通
 `rust_test_failed` 只能是 advisory，因为文本 v1 不能证明失败一定来自声明断言。
+
+Python Test run schema v1 使用 `python-test.<profile>` provider。它只接受指定
+`python-compile.<build_profile>` 当前 head，并要求 Build 为 fresh、complete、deterministic、无 finding；
+Source fingerprint、规范 `build_target=source_root` 与 Python executable SHA-256 必须一致。仓库 manifest
+只接受 schema_version 与有界、无重复、按顺序的 ASCII `module/function`，module 必须唯一映射到
+source_root 内 Git Source 的 Python 文件。
+
+Provider 物理复制 Git Source，固定执行 isolated/no-site/no-bytecode UTF-8 adapter bootstrap；不接受 pytest、
+discovery、plugin、pip、repo runner、shell、args、env 或 install。bootstrap 只调用同步零参数模块自有函数，
+并输出无消息的 adapter-owned 结构化状态。合法 `AssertionError` 为 deterministic violation；其他 exception、
+runner failure、截断、超时和非法结果为 advisory。任何 finding 仍必须精确命中显式 mapping 才能产生治理
+effect。
 
 Godot Scenario Test schema v1 使用 `godot-scenario-test.<profile>` provider。它只接受与当前 Source、
 `build_target` 和主程序集绑定一致的 `dotnet-build.<build_profile>` CAS，并要求 Build upstream 恰好含

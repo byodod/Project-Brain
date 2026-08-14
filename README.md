@@ -346,9 +346,9 @@ project-brain evidence test dotnet \
 build、restore、shell 或 export。它要求 Build head 与 bundle 的 project、provider、target、Source
 fingerprint 和 dotnet executable SHA-256 全部一致。测试代码属于独立信任面；当前不是 OS 网络沙箱。
 
-结果区分 passed/failed/crashed/timed_out/no_tests/provider_failed 与 covered/empty/unknown。NoTests 不是
-Pass。TRX 汇总无法安全区分断言失败和测试/环境异常，因此 v1 的 `dotnet_test_failed` 保持 advisory；
-它不会因 severity=error 自动获得阻断资格。
+结果区分 passed/failed/crashed/timed_out/no_tests/provider_failed 与 covered/partial/empty/unknown。
+存在未执行测试时为 partial；NoTests 不是 Pass。TRX 汇总无法安全区分断言失败和测试/环境异常，因此
+v1 的 `dotnet_test_failed` 保持 advisory；它不会因 severity=error 自动获得阻断资格。
 
 ## Rust Test Evidence Provider
 
@@ -370,8 +370,35 @@ runner、shell 或 environment。build.rs、proc macro 和测试二进制仍属�
 OS 网络沙箱。
 
 Provider 聚合稳定版 libtest 的有界结果摘要，区分 passed/failed/crashed/timed_out/no_tests/
-provider_failed。文本结果无法可靠区分断言、panic 与 harness 异常，所以 `rust_test_failed` 保持
-advisory；它不会因测试命令非零就自动获得 hard-block 资格。
+provider_failed；ignored/filtered 测试会令 coverage=partial。文本结果无法可靠区分断言、panic 与 harness
+异常，所以 `rust_test_failed` 保持 advisory；它不会因测试命令非零就自动获得 hard-block 资格。
+
+## Python Test Evidence Provider
+
+Python Test 要求先对相同 Source、Python executable 与 `source_root` 生成成功的
+`python-compile.<profile>` Build head，然后显式指定仓库内受限清单：
+
+```text
+project-brain evidence test python \
+  --profile fixture-tests \
+  --build-profile fixture-compile \
+  --executable /absolute/path/to/python \
+  --source-root tests/fixtures/python-test-v1 \
+  --manifest tests/fixtures/python-test-v1/project-brain-tests.json \
+  --trust-local-executable \
+  --trust-repository-test-code
+```
+
+清单 schema v1 只接受 `schema_version` 与按顺序声明的 `module/function`；两者必须是有界 ASCII Python
+标识符，module 必须唯一对应 source_root 内属于 Git Source 的 `module.py` 或
+`module/__init__.py`。Provider 不使用 pytest、自动发现、插件、pip、仓库 runner、shell、任意参数或环境。
+
+Project Brain 先验证清单与 Build target，物理复制 Git Source，再固定执行 `python -I -S -B -X utf8 -c
+<adapter-bootstrap>`。bootstrap 只调用清单中的同步、零参数、模块自有函数；返回值必须为 None。结果由
+adapter 结构化为 passed/assertion_failed/error，不采信仓库提供的消息或结果文件。AssertionError 产生
+`python_test_assertion_failed + deterministic_violation`，但仍必须经过 fresh/complete Evidence 与显式
+finding effect 映射才可能 hard block；其他 exception、runner failure、截断与超时保持 advisory。当前
+执行环境不是 OS 网络沙箱，仓库测试代码仍需独立显式信任。
 
 ## Godot Scenario Test Evidence Provider
 
@@ -783,8 +810,8 @@ crates/
   Prime Agent 已有独立 direct adapter，但用户级 Extension 安装器与 doctor 尚未实现。
 - Godot Engine Provider、Evidence ledger、Hook 失效传播、.NET/Rust/Python Build Provider v1、Godot
   C# RuntimeArtifactBundle CAS、隔离 Godot headless Runtime Evidence v1、Test plane/finding 显式
-  effect 映射核心，以及 .NET、Rust、Godot Scenario Test Provider v1 已完成；Python Test Provider
-  仍未完成，不能声称全部治理能力已经完结。
+  effect 映射核心，以及 .NET、Rust、Python、Godot Scenario Test Provider v1 已完成；其他语言与更强
+  OS 沙箱仍未完成，不能声称全部治理能力已经完结。
 - shell 命令只做保守的显式危险模式识别，不承诺成为完整 shell 安全沙箱。
 - changed-symbol 与内置 Tree-sitter syntax Provider 当前只支持 Rust；.NET/Python 通过显式配置的
   SCIP semantic Provider 接入。

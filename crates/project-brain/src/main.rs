@@ -373,6 +373,29 @@ enum TestEvidenceCommand {
         timeout_seconds: u64,
     },
 
+    /// 在物理 Source staging 中执行 adapter-owned Python manifest runner；不使用 pytest/discovery/plugin
+    Python {
+        #[arg(long)]
+        profile: String,
+        /// 必须对应当前 `python-compile.<profile>` Evidence head
+        #[arg(long)]
+        build_profile: String,
+        #[arg(long)]
+        executable: PathBuf,
+        /// 与 Python Build Evidence 绑定的项目内源码根目录
+        #[arg(long, default_value = ".")]
+        source_root: PathBuf,
+        /// `source_root` 内由仓库声明 module/function 的受限 JSON 清单
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        trust_local_executable: bool,
+        #[arg(long)]
+        trust_repository_test_code: bool,
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        timeout_seconds: u64,
+    },
+
     /// 固定运行仓库内 Godot .tscn，并读取受限结构化断言结果；不会构建、还原或导出
     Godot {
         #[arg(long)]
@@ -764,6 +787,25 @@ fn main() -> ExitCode {
                         &executable,
                         &profile,
                         &build_profile,
+                        &manifest,
+                        trust_local_executable,
+                        trust_repository_test_code,
+                        timeout_seconds,
+                    ),
+                    TestEvidenceCommand::Python {
+                        profile,
+                        build_profile,
+                        executable,
+                        source_root,
+                        manifest,
+                        trust_local_executable,
+                        trust_repository_test_code,
+                        timeout_seconds,
+                    } => app.evidence_test_python(
+                        &executable,
+                        &profile,
+                        &build_profile,
+                        &source_root,
                         &manifest,
                         trust_local_executable,
                         trust_repository_test_code,
