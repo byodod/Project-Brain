@@ -175,6 +175,10 @@ delta、Evidence 和 Stop gate 裁决。
 `repair_required`、`verify_required`、硬门禁、证据 freshness 降级或实际 diff 外溢等明确偏移才在工具边界
 追加反馈。
 
+纠偏期间仍允许纯只读检查。PowerShell 的 `2>&1`、`1>&2` 仅合并进程输出流，不等同于向文件写入；
+包含这些流合并的 `git status`、`git log` 等只读组合命令不得被误判为输出重定向写入。真正的
+`> file` 文件重定向仍视为变更并受纠偏门禁约束。
+
 ## 7. Input Dependency Contract v1
 
 ```json

@@ -788,11 +788,11 @@ fn repair_inspection_action(action: &ToolAction) -> bool {
         "mkdir",
         "touch ",
         "apply_patch",
-        ">",
     ];
     if mutating_markers
         .iter()
         .any(|marker| command.contains(marker))
+        || contains_file_output_redirection(&command)
     {
         return false;
     }
@@ -820,6 +820,53 @@ fn repair_inspection_action(action: &ToolAction) -> bool {
             .iter()
             .any(|prefix| segment.starts_with(prefix))
     })
+}
+
+fn contains_file_output_redirection(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut quote = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if matches!(byte, b'\'' | b'"') {
+            if quote == Some(byte) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(byte);
+            }
+            index += 1;
+            continue;
+        }
+        if byte != b'>' || quote.is_some() {
+            index += 1;
+            continue;
+        }
+
+        let mut cursor = index + 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'&') {
+            return true;
+        }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let stream_start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor == stream_start
+            || bytes.get(cursor).is_some_and(|next| {
+                !next.is_ascii_whitespace() && !matches!(*next, b';' | b'|' | b')')
+            })
+        {
+            return true;
+        }
+        index = cursor;
+    }
+    false
 }
 
 fn read_only_output_literal(segment: &str) -> bool {
@@ -2167,6 +2214,14 @@ mod tests {
         };
         assert!(repair_inspection_action(&inspection));
 
+        let dsh_read_only_git = ToolAction {
+            command: Some(
+                "git status --short; Write-Output '---'; git log --oneline -3 2>&1".to_owned(),
+            ),
+            ..inspection.clone()
+        };
+        assert!(repair_inspection_action(&dsh_read_only_git));
+
         let interpolated_output = ToolAction {
             command: Some("git diff; \"$env:SECRET\"".to_owned()),
             ..inspection.clone()
@@ -2181,5 +2236,11 @@ mod tests {
             proposed_change: None,
         };
         assert!(!repair_inspection_action(&mutation));
+
+        let redirected_output = ToolAction {
+            command: Some("git status --short > status.txt".to_owned()),
+            ..inspection
+        };
+        assert!(!repair_inspection_action(&redirected_output));
     }
 }

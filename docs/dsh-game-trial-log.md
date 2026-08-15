@@ -193,3 +193,18 @@ Brain 只在 Agent 出现偏移时注入，而不是每个正常工具调用重�
 第 10 轮前修复：识别 PowerShell `New-Item`、`Move-Item` 的字面量源/目标作用域与浏览器
 `--screenshot=...` 输出；移动修复同时声明源和目标，避免纠偏目标翻转。软 `AllowWithContext` 规则只在
 Session/Intent、上下文版本变化或明确 hold/证据偏移时交付，普通成功工具的 Pre/Post 输出保持为空。
+
+## 第 10 轮：已终止
+
+DSH 自主创建 4 条规则并开发《星环守卫战》。真实工具流确认低噪声合同生效：初始会话交付一次上下文，
+规则版本变化与 claim 版本变化时各交付一次；连续的普通读取、规则写入、游戏文件写入、编辑和 30 项 Node
+测试均没有重复回显软规则。创建 `.testartifacts/` 浏览器临时目录后，Project Brain 才按预期注入
+`repair_required`。
+
+终止原因：纠偏期间 DSH 执行纯只读命令
+`git status --short; Write-Output '---'; git log --oneline -3 2>&1`，却被判为无关写入并阻断。
+根因是 inspection 检查把任何 `>` 字符都视为文件输出重定向，没有区分 PowerShell 的 `2>&1` 流合并。
+字面量 `Remove-Item .testartifacts -Recurse -Force` 随后能够完成修复，证明纠偏路径本身并未死锁。
+
+第 11 轮前修复：只忽略引号外、目标为数字流的 `>&N` 流合并；`> file` 仍被视为写入。加入第 10 轮原始
+命令回归，证明带 `2>&1` 的只读 Git 组合可在 repair hold 下检查，而真正文件重定向仍被拒绝。
