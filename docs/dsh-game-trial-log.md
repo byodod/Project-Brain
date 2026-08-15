@@ -142,3 +142,12 @@ DSH，authority/strength/effect 均保持 `agent_inference/soft/inject_context`�
 第 7 轮前修复：识别真实 `project-brain(.exe) rules upsert-agent` 命令段并声明
 `.project-brain/config.json` 为预期变更路径，同时允许纠偏检查使用只读 `Write-Output`；普通文本中偶然出现
 `rules upsert-agent` 不获得该路径声明。
+
+## 第 7 轮：基线受污染，已终止
+
+项目文件、Project Brain 规则和 `brain.db` 都已清空，但全新 DSH session 在首次检查时仍主动回忆出第 6 轮
+才产生的《虚空光轨》、20 波与最终 BOSS 方案，并明确表示要延续该概念。监督方在任何项目文件或规则写入前
+立即停止。本轮说明 DSH 自身的跨会话记忆仍与测试工作区关联，不计入 Project Brain 修复后的能力结论。
+
+用户随后明确确认已清空该文件夹相关的 DSH 记忆。第 8 轮再次从 `rules=[]`、无游戏文件、无旧
+Project Brain 数据库的同一 Git 零点启动，并把“不再复述前轮专有方案”作为首个基线验收点。
