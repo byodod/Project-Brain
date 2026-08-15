@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-08-15
+
 ### Added
 
 - Internal Hook Protocol v2 与 active-control 状态机：每步按 revision/epoch 主动恢复目标上下文，
@@ -21,12 +23,19 @@
 - dsh Plugin 在每个 `agent/pre-step` 请求按需控制上下文，工具后传递有界完整结果；能力合同细分为
   pre-model context、native replan、compact rehydrate、subagent lineage 等真实宿主 seam。
 - SQLite schema 升级为 v21，加入项目隔离的控制会话、放行提案和 Agent claim 表。
+- 软提示规则改为低噪声交付：只在 session/intent、规则或 claim 版本变化以及真实偏移时注入完整上下文，
+  普通成功工具的 PreTool/PostTool 不再重复回显整组规则。
 
 ### Fixed
 
 - DSH/Codex 归一化会把官方 `rules upsert-agent` 对 `.project-brain/config.json` 的修改纳入变更提案，
   包括先把受信任绝对路径赋给 PowerShell 变量后再调用的真实形态，避免自主建规触发错误的
   `repair_required`；纠偏检查同时允许无插值的只读字符串分隔输出。
+- PowerShell `New-Item`、`Move-Item` 的字面量源/目标以及浏览器 `--screenshot=...` 输出现在进入预期
+  变更范围；移动纠偏同时声明源和目标，避免往返修复时反复翻转意外路径。
+- `repair_required` 期间的只读检查会区分 PowerShell `2>&1` 流合并与真正的文件重定向；带流合并的
+  `git status`/`git log` 可用于诊断，`> file` 仍按写入拒绝。
+- `audit` 输出连接到提前关闭的 stdout 管道时正常结束，不再因 broken pipe 触发 Rust panic。
 
 ## [0.2.3] - 2026-08-15
 

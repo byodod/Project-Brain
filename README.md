@@ -5,7 +5,7 @@ Project Brain 是面向 Coding Agent 的确定性项目决策与长期记忆控�
 
 核心在没有 LLM 时完整工作。LLM 可以作为低权限语义 Provider，但不能自行获得阻断权限。
 
-当前稳定版本为 [`v0.2.3`](https://github.com/byodod/Project-Brain/releases/tag/v0.2.3)。
+当前稳定版本为 [`v0.2.8`](https://github.com/byodod/Project-Brain/releases/tag/v0.2.8)。
 
 ## 为什么使用 Project Brain
 
@@ -19,7 +19,7 @@ Project Brain 是面向 Coding Agent 的确定性项目决策与长期记忆控�
 
 ## 支持的 Agent
 
-Project Brain `v0.2.3` 正式支持四个 Agent 接入：
+Project Brain `v0.2.8` 正式支持四个 Agent 接入：
 
 | Agent | 接入方式 | 模型前主动上下文 | 工具前阻断 | 工具后反馈 | Stop 续轮 |
 |---|---|---:|---:|---:|---:|
