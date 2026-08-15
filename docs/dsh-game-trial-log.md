@@ -151,3 +151,18 @@ DSH，authority/strength/effect 均保持 `agent_inference/soft/inject_context`�
 
 用户随后明确确认已清空该文件夹相关的 DSH 记忆。第 8 轮再次从 `rules=[]`、无游戏文件、无旧
 Project Brain 数据库的同一 Git 零点启动，并把“不再复述前轮专有方案”作为首个基线验收点。
+
+## 第 8 轮：已终止
+
+用户清空 DSH 记忆后，监督方首次发送时工作区选择已被一并清除；用户指出后，该无工作区请求作废，监督方
+重新明确选择 `project-brain-dsh-game-trial` 才开始有效会话。DSH 没有复述《虚空光轨》，而是独立选择
+自包含单文件 HTML5 游戏，证明跨会话方案污染已解除。
+
+DSH 随后通过 PowerShell 变量 `$pb` 连续调用五次 `rules upsert-agent`。规则全部成功写入，但 0.2.5 的
+已知变更识别只覆盖直接出现的 `project-brain.exe`，未追踪同一命令中的字面量变量赋值，因此仍错误进入
+`repair_required`。它的检查命令又用无插值的 `"===== status ====="` 输出分隔符，该只读表达式不在
+纠偏检查白名单而被阻止。监督方立即停止。
+
+第 9 轮前修复：仅追踪同一 PowerShell 命令中由 Project Brain 绝对可执行路径字面量赋值的变量，并识别
+其后的 `rules upsert-agent`；普通变量或普通文本不获得路径声明。纠偏检查允许不含 `$`、反引号或换行的
+纯引号字符串输出，拒绝可插值表达式。

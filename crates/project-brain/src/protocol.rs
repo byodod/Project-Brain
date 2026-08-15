@@ -799,6 +799,7 @@ fn repair_inspection_action(action: &ToolAction) -> bool {
     command.split(';').all(|segment| {
         let segment = segment.trim();
         segment.is_empty()
+            || read_only_output_literal(segment)
             || [
                 "git status",
                 "git diff",
@@ -819,6 +820,14 @@ fn repair_inspection_action(action: &ToolAction) -> bool {
             .iter()
             .any(|prefix| segment.starts_with(prefix))
     })
+}
+
+fn read_only_output_literal(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    if bytes.len() < 2 || !matches!(bytes[0], b'\'' | b'"') || bytes[0] != bytes[bytes.len() - 1] {
+        return false;
+    }
+    !segment[1..segment.len() - 1].contains(['$', '`', '\n', '\r'])
 }
 
 fn evidence_context(
@@ -2157,13 +2166,19 @@ mod tests {
             kind: ActionKind::GitOperation,
             target_files: Vec::new(),
             command: Some(
-                "git status --short; Write-Output '---DIFF---'; git diff; Get-ChildItem -Recurse"
+                "git status --short; \"===== status =====\"; git diff; Get-ChildItem -Recurse"
                     .to_owned(),
             ),
             deterministic_impacts: Vec::new(),
             proposed_change: None,
         };
         assert!(repair_inspection_action(&inspection));
+
+        let interpolated_output = ToolAction {
+            command: Some("git diff; \"$env:SECRET\"".to_owned()),
+            ..inspection.clone()
+        };
+        assert!(!repair_inspection_action(&interpolated_output));
 
         let mutation = ToolAction {
             kind: ActionKind::Execute,

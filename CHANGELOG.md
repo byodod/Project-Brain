@@ -25,7 +25,8 @@
 ### Fixed
 
 - DSH/Codex 归一化会把官方 `rules upsert-agent` 对 `.project-brain/config.json` 的修改纳入变更提案，
-  避免自主建规触发错误的 `repair_required`；纠偏检查同时允许只读 `Write-Output` 分隔输出。
+  包括先把受信任绝对路径赋给 PowerShell 变量后再调用的真实形态，避免自主建规触发错误的
+  `repair_required`；纠偏检查同时允许无插值的只读字符串分隔输出。
 
 ## [0.2.3] - 2026-08-15
 

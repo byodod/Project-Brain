@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -744,15 +744,22 @@ fn extract_destructive_command_paths(command: &str) -> Vec<String> {
 
 fn extract_project_brain_command_paths(command: &str) -> Vec<String> {
     let tokens = shell_like_tokens(command);
+    let segments = tokens.split(|token| token == ";").collect::<Vec<_>>();
+    let assigned_executables = segments
+        .iter()
+        .filter(|segment| {
+            segment.len() >= 3
+                && segment[0].starts_with('$')
+                && segment[1] == "="
+                && project_brain_executable_token(&segment[2])
+        })
+        .map(|segment| segment[0].to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
     let mut paths = Vec::new();
-    for segment in tokens.split(|token| token == ";") {
+    for segment in segments {
         let Some(executable_index) = segment.iter().position(|token| {
-            token.rsplit(['/', '\\']).next().is_some_and(|name| {
-                matches!(
-                    name.to_ascii_lowercase().as_str(),
-                    "project-brain" | "project-brain.exe"
-                )
-            })
+            project_brain_executable_token(token)
+                || assigned_executables.contains(&token.to_ascii_lowercase())
         }) else {
             continue;
         };
@@ -765,6 +772,15 @@ fn extract_project_brain_command_paths(command: &str) -> Vec<String> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn project_brain_executable_token(token: &str) -> bool {
+    token.rsplit(['/', '\\']).next().is_some_and(|name| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "project-brain" | "project-brain.exe"
+        )
+    })
 }
 
 fn literal_command_path(value: &str) -> bool {
@@ -1124,13 +1140,19 @@ mod tests {
 
     #[test]
     fn agent_rule_cli_declares_its_control_plane_source_change() {
-        let command = "& 'C:\\Tools\\project-brain.exe' rules upsert-agent --rule AGENT-ONE --message one; & 'C:\\Tools\\project-brain.exe' rules upsert-agent --rule AGENT-TWO --message two";
+        let command = "$pb = \"C:\\Tools\\project-brain.exe\"; & $pb rules upsert-agent --rule AGENT-ONE --message one; & $pb rules upsert-agent --rule AGENT-TWO --message two; & $pb claims submit --help";
         assert_eq!(
             extract_project_brain_command_paths(command),
             vec![".project-brain/config.json".to_owned()]
         );
         assert!(
             extract_project_brain_command_paths("Write-Output 'rules upsert-agent'").is_empty()
+        );
+        assert!(
+            extract_project_brain_command_paths(
+                "$pb = 'C:\\Tools\\another.exe'; & $pb rules upsert-agent"
+            )
+            .is_empty()
         );
     }
 
@@ -1848,7 +1870,7 @@ mod tests {
             tool_name: "Pwsh".to_owned(),
             tool_use_id: "agent-rules-1".to_owned(),
             tool_input: json!({
-                "command": "& 'C:\\Tools\\project-brain.exe' rules upsert-agent --rule AGENT-ONE --message one; & 'C:\\Tools\\project-brain.exe' rules upsert-agent --rule AGENT-TWO --message two"
+                "command": "$pb = \"C:\\Tools\\project-brain.exe\"; & $pb rules upsert-agent --rule AGENT-ONE --message one; & $pb rules upsert-agent --rule AGENT-TWO --message two"
             }),
             ..CodexHookInput::default()
         };
