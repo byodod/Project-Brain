@@ -170,6 +170,11 @@ delta、Evidence 和 Stop gate 裁决。
 `project-brain doctor` 必须显式指定目标 Agent（例如 `doctor dsh`），不再默认检查 Codex。这样未知当前
 适配器的调用会直接失败并展示用法，而不会返回另一适配器的健康报告。
 
+软规则采用“初次交付、偏移时提醒”的低噪声合同：Session/Intent、规则或 claim 版本变化时交付完整上下文；
+普通 `AllowWithContext` 工具调用不再在 PreTool 与 PostTool 重复回显整组规则。只有 `replan`、
+`repair_required`、`verify_required`、硬门禁、证据 freshness 降级或实际 diff 外溢等明确偏移才在工具边界
+追加反馈。
+
 ## 7. Input Dependency Contract v1
 
 ```json

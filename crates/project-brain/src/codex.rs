@@ -387,6 +387,8 @@ fn normalized_tool(
     let mut target_files = extract_target_files(&input.tool_input);
     if let Some(command) = command.as_deref() {
         target_files.extend(extract_destructive_command_paths(command));
+        target_files.extend(extract_powershell_mutation_paths(command));
+        target_files.extend(extract_declared_output_paths(command));
         target_files.extend(extract_project_brain_command_paths(command));
     }
     target_files.sort();
@@ -685,6 +687,11 @@ fn classify_action(
         if !extract_destructive_command_paths(&command).is_empty() {
             return ActionKind::Delete;
         }
+        if !extract_powershell_mutation_paths(&command).is_empty()
+            || !extract_declared_output_paths(&command).is_empty()
+        {
+            return ActionKind::Modify;
+        }
         if command.contains("git ") || command.starts_with("git") {
             return ActionKind::GitOperation;
         }
@@ -740,6 +747,91 @@ fn extract_destructive_command_paths(command: &str) -> Vec<String> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn extract_powershell_mutation_paths(command: &str) -> Vec<String> {
+    let tokens = shell_like_tokens(command);
+    let mut paths = Vec::new();
+    for segment in tokens.split(|token| token == ";") {
+        for (command_index, token) in segment.iter().enumerate() {
+            let command_name = token.to_ascii_lowercase();
+            if command_name == "new-item" {
+                paths.extend(named_powershell_paths(
+                    &segment[command_index + 1..],
+                    &["-path", "-literalpath"],
+                ));
+            } else if matches!(command_name.as_str(), "move-item" | "mv" | "move") {
+                let arguments = &segment[command_index + 1..];
+                let named =
+                    named_powershell_paths(arguments, &["-path", "-literalpath", "-destination"]);
+                if named.is_empty() {
+                    paths.extend(positional_powershell_paths(arguments, 2));
+                } else {
+                    paths.extend(named);
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn named_powershell_paths(arguments: &[String], names: &[&str]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = arguments[index].to_ascii_lowercase();
+        if names.contains(&argument.as_str())
+            && let Some(value) = arguments.get(index + 1)
+            && let Some(path) = command_path_scope(value)
+        {
+            paths.push(path);
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    paths
+}
+
+fn positional_powershell_paths(arguments: &[String], limit: usize) -> Vec<String> {
+    arguments
+        .iter()
+        .filter(|argument| !argument.starts_with('-'))
+        .filter_map(|argument| command_path_scope(argument))
+        .take(limit)
+        .collect()
+}
+
+fn extract_declared_output_paths(command: &str) -> Vec<String> {
+    let mut paths = shell_like_tokens(command)
+        .into_iter()
+        .filter_map(|token| {
+            token
+                .split_once('=')
+                .filter(|(name, _)| name.eq_ignore_ascii_case("--screenshot"))
+                .and_then(|(_, value)| command_path_scope(value))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn command_path_scope(value: &str) -> Option<String> {
+    if value.is_empty() || value.contains(['$', '%', '`', '\n', '\r']) {
+        return None;
+    }
+    let wildcard = value.find(['*', '?']);
+    let candidate = wildcard.map_or(value, |index| &value[..index]);
+    let candidate = candidate.trim_end_matches(['/', '\\']);
+    (!candidate.is_empty()
+        && !matches!(
+            candidate.to_ascii_lowercase().as_str(),
+            "--" | "true" | "false"
+        ))
+    .then(|| candidate.to_owned())
 }
 
 fn extract_project_brain_command_paths(command: &str) -> Vec<String> {
@@ -987,7 +1079,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CodexHookInput, classify_action, deterministic_impacts, extract_destructive_command_paths,
+        CodexHookInput, classify_action, deterministic_impacts, extract_declared_output_paths,
+        extract_destructive_command_paths, extract_powershell_mutation_paths,
         extract_project_brain_command_paths, extract_target_files, failure_output, handle,
     };
     use crate::app::HookEvent;
@@ -1157,6 +1250,36 @@ mod tests {
     }
 
     #[test]
+    fn powershell_move_declares_both_source_and_destination_scopes() {
+        let command = "New-Item -ItemType Directory -Force -Path test\\shots | Out-Null; Move-Item shots\\*.png test\\shots\\ -Force; Remove-Item shots -Force";
+        assert_eq!(
+            extract_powershell_mutation_paths(command),
+            vec!["shots".to_owned(), "test\\shots".to_owned()]
+        );
+        assert_eq!(
+            classify_action(
+                Path::new("C:/repo"),
+                "pwsh",
+                &json!({"command": "Move-Item shots\\*.png test\\shots\\ -Force"}),
+                Some("Move-Item shots\\*.png test\\shots\\ -Force"),
+            ),
+            ActionKind::Modify
+        );
+    }
+
+    #[test]
+    fn browser_screenshot_flags_declare_their_output_files() {
+        let command = r#"& $edge --headless=new --screenshot="E:\repo\shots\menu.png" $base; & $edge --screenshot='shots\gameplay.png' $demo"#;
+        assert_eq!(
+            extract_declared_output_paths(command),
+            vec![
+                r"E:\repo\shots\menu.png".to_owned(),
+                r"shots\gameplay.png".to_owned()
+            ]
+        );
+    }
+
+    #[test]
     fn codex_pre_tool_hook_denies_without_approving_vendor_permissions() {
         let store = BrainStore::open_in_memory().unwrap();
         let output = handle(
@@ -1194,7 +1317,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_no_veto_with_context_does_not_approve_vendor_permissions() {
+    fn codex_soft_context_is_not_repeated_on_every_tool_call() {
         let store = BrainStore::open_in_memory().unwrap();
         let mut config = config("project_a");
         config.rules[0].effect = RuleEffect::InjectContext;
@@ -1207,16 +1330,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            output.0["hookSpecificOutput"]
-                .get("additionalContext")
-                .is_some()
-        );
-        assert!(
-            output.0["hookSpecificOutput"]
-                .get("permissionDecision")
-                .is_none()
-        );
+        assert_eq!(output.0, json!({}));
     }
 
     #[test]

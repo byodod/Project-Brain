@@ -1187,10 +1187,7 @@ fn gate_from_decision(decision: &Decision) -> GateDecision {
 }
 
 fn context_from_decision(decision: &Decision) -> Vec<ContextItem> {
-    if matches!(
-        decision.decision,
-        DecisionKind::AllowWithContext | DecisionKind::RequireReview
-    ) {
+    if decision.decision == DecisionKind::RequireReview {
         vec![ContextItem {
             text: decision_reason(decision),
         }]
@@ -1201,11 +1198,7 @@ fn context_from_decision(decision: &Decision) -> Vec<ContextItem> {
 
 fn feedback_from_decision(decision: &Decision) -> Vec<FeedbackItem> {
     match decision.decision {
-        DecisionKind::Allow => Vec::new(),
-        DecisionKind::AllowWithContext => vec![FeedbackItem {
-            severity: FeedbackSeverity::Info,
-            text: decision_reason(decision),
-        }],
+        DecisionKind::Allow | DecisionKind::AllowWithContext => Vec::new(),
         DecisionKind::RequireReview => vec![FeedbackItem {
             severity: FeedbackSeverity::Info,
             text: format!(

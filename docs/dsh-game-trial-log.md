@@ -166,3 +166,30 @@ DSH 随后通过 PowerShell 变量 `$pb` 连续调用五次 `rules upsert-agent`
 第 9 轮前修复：仅追踪同一 PowerShell 命令中由 Project Brain 绝对可执行路径字面量赋值的变量，并识别
 其后的 `rules upsert-agent`；普通变量或普通文本不获得路径声明。纠偏检查允许不含 `$`、反引号或换行的
 纯引号字符串输出，拒绝可插值表达式。
+
+## 第 9 轮：已终止
+
+DSH session：`session-2869a0d3-eab8-446c-8067-ddd6c2c9a465`
+
+### 已验证事实
+
+- 正确工作区从空规则 Git 零点启动，DSH 没有复用旧游戏概念，自主设计单文件 HTML 游戏《霓虹蜂鸟》。
+- DSH 自主创建 7 条 `AGENT-GAME-*` 规则，提交目标理解 claim，完成约 54 KiB 的游戏、设计文档与 Node
+  冒烟测试；16 项逻辑断言及真实 Edge `autotest` 均通过。
+- Project Brain 正确识别并引导删除语法检查临时文件与 Edge profile 残留，证明普通纠偏路径可用。
+- DSH 自行发现并修正 demo、暂停、静音、遮挡、测试驱动与 `requestAnimationFrame` 等问题。
+
+### 触发终止的问题
+
+Edge 命令以字面量 `--screenshot=...` 生成三张验证截图，但 Pwsh 归一化没有把这些明确输出或同一命令的
+`New-Item -Path shots` 声明为预期路径，导致截图被误判为提案外变更并进入 `repair_required`。DSH 随后
+尝试 claim、写像素分析器和 Git commit，均被正确要求先处理实际偏差；但当它执行
+`Move-Item shots\\*.png test\\shots\\` 时，归一化只记录随后 `Remove-Item shots` 的源目录，没有记录移动
+目标。于是 `test/shots` 被判为新的意外路径；移回后又反向把 `shots` 判为意外路径，形成不可达的往返纠偏。
+
+同时，7 条软规则在每次 PreTool 与 PostTool 都被整组回显，造成大量无偏移噪声。用户明确要求 Project
+Brain 只在 Agent 出现偏移时注入，而不是每个正常工具调用重复提醒。
+
+第 10 轮前修复：识别 PowerShell `New-Item`、`Move-Item` 的字面量源/目标作用域与浏览器
+`--screenshot=...` 输出；移动修复同时声明源和目标，避免纠偏目标翻转。软 `AllowWithContext` 规则只在
+Session/Intent、上下文版本变化或明确 hold/证据偏移时交付，普通成功工具的 Pre/Post 输出保持为空。

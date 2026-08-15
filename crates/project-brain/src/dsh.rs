@@ -150,4 +150,82 @@ mod tests {
         );
         assert_eq!(retry.0["block"], false);
     }
+
+    #[test]
+    fn dsh_soft_rules_are_quiet_on_normal_tool_boundaries() {
+        let config = BrainConfig {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: "project_a".to_owned(),
+            project_name: "test".to_owned(),
+            language_profiles: Vec::new(),
+            semantic_providers: Vec::new(),
+            finding_effect_mappings: Vec::new(),
+            stop_reconcile: StopReconcileConfig::default(),
+            rules: vec![Rule {
+                id: "AGENT-QUIET".to_owned(),
+                status: MemoryStatus::Active,
+                authority: Authority::AgentInference,
+                strength: RuleStrength::Soft,
+                effect: RuleEffect::InjectContext,
+                include_paths: Vec::new(),
+                exclude_paths: Vec::new(),
+                actions: vec![ActionKind::Create, ActionKind::Modify],
+                operations: Vec::new(),
+                operation_contains: Vec::new(),
+                symbol_scopes: Vec::new(),
+                message: "只在偏移时提醒".to_owned(),
+                rationale: String::new(),
+            }],
+        };
+        let store = BrainStore::open_in_memory().unwrap();
+        let session: DshHookInput = serde_json::from_value(json!({
+            "session_id":"session", "source":"startup"
+        }))
+        .unwrap();
+        let opened = handle_with_provider_trust(
+            Path::new("C:/repo"),
+            &config,
+            &store,
+            &BTreeMap::new(),
+            HookEvent::SessionStart,
+            &session,
+        );
+        assert!(
+            opened.0["context"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+
+        let tool = |response| -> DshHookInput {
+            serde_json::from_value(json!({
+                "session_id":"session",
+                "turn_id":"turn",
+                "tool_name":"Write",
+                "tool_use_id":"tool-1",
+                "tool_input":{"file_path":"README.md", "content":"updated"},
+                "tool_response": response
+            }))
+            .unwrap()
+        };
+        let before = handle_with_provider_trust(
+            Path::new("C:/repo"),
+            &config,
+            &store,
+            &BTreeMap::new(),
+            HookEvent::PreToolUse,
+            &tool(json!({})),
+        );
+        assert_eq!(before.0["block"], false);
+        assert_eq!(before.0["context"], json!([]));
+
+        let after = handle_with_provider_trust(
+            Path::new("C:/repo"),
+            &config,
+            &store,
+            &BTreeMap::new(),
+            HookEvent::PostToolUse,
+            &tool(json!({"status":"failed"})),
+        );
+        assert_eq!(after.0["feedback"], json!([]));
+    }
 }
