@@ -538,6 +538,7 @@ fn dsh_profile_bundle_install_doctor_and_uninstall_are_verified() {
     assert!(source.contains("invokeBrain(\"pre-step\""));
     assert!(source.contains("boundedToolResult(result)"));
     assert!(source.contains("parent_session_id"));
+    assert!(source.contains("Project Brain CLI launcher"));
     let syntax = Command::new("node").arg("--check").arg(&plugin).output();
     if let Ok(syntax) = syntax {
         assert_success(&syntax);

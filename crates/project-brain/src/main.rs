@@ -23,7 +23,7 @@ mod setup;
 mod source_stage;
 mod test;
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{any::Any, path::PathBuf, process::ExitCode};
 
 use app::{AgentKind, App, HookEvent, ProjectProfile};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -755,6 +755,34 @@ impl From<LineageStateArg> for brain_symbols::LineageState {
     reason = "CLI 顶层保持所有子命令到 App 的显式、可审计路由"
 )]
 fn main() -> ExitCode {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !is_stdout_broken_pipe(info.payload()) {
+            previous_hook(info);
+        }
+    }));
+
+    match std::panic::catch_unwind(run_cli) {
+        Ok(exit_code) => exit_code,
+        Err(payload) if is_stdout_broken_pipe(payload.as_ref()) => ExitCode::SUCCESS,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn is_stdout_broken_pipe(payload: &(dyn Any + Send)) -> bool {
+    payload
+        .downcast_ref::<&str>()
+        .is_some_and(|message| message.contains("failed printing to stdout"))
+        || payload
+            .downcast_ref::<String>()
+            .is_some_and(|message| message.contains("failed printing to stdout"))
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "CLI 顶层保持所有子命令到 App 的显式、可审计路由"
+)]
+fn run_cli() -> ExitCode {
     match setup::delegate_if_installed_launcher() {
         Ok(Some(exit_code)) => return exit_code,
         Ok(None) => {}

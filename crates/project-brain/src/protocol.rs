@@ -5,7 +5,7 @@ use brain_core::{
     DecisionKind, Evidence, EvidenceGrade, FeedbackItem, FeedbackSeverity, GateDecision,
     HOOK_PROTOCOL_VERSION, HookEventPayload, HookOutcomePayload, InternalHookEvent,
     InternalHookOutcome, MemoryStatus, Rule, RuleEffect, RuleEngine, StopDecision, ToolAction,
-    path_has_prefix,
+    normalize_project_path, path_has_prefix,
 };
 use brain_evidence::{EvidenceFreshness, EvidencePlane};
 use brain_store::{
@@ -134,7 +134,8 @@ pub fn process(
                 &project_context_digest(config)?,
             )?;
             if state.outstanding_kind.as_deref() == Some("repair_required")
-                && !action_addresses_repair(&tool.action, state.outstanding_json.as_deref())
+                && !repair_inspection_action(&tool.action)
+                && !action_addresses_repair(root, &tool.action, state.outstanding_json.as_deref())
             {
                 let inject = control_context_items(config, &state);
                 return Ok(InternalHookOutcome {
@@ -427,10 +428,20 @@ fn reconcile_observed_change(
         });
         return Ok(());
     };
-    let expected = proposed_action.proposed_change.as_ref().map_or_else(
-        || mutation_paths(&proposed_action),
-        |proposal| proposal.target_files.clone(),
-    );
+    let expected = proposed_action
+        .proposed_change
+        .as_ref()
+        .map_or_else(
+            || mutation_paths(&proposed_action),
+            |proposal| proposal.target_files.clone(),
+        )
+        .into_iter()
+        .map(|path| make_project_relative(root, &path))
+        .collect::<Vec<_>>();
+    let observed = observed
+        .into_iter()
+        .map(|path| make_project_relative(root, &path))
+        .collect::<Vec<_>>();
     let unexpected = observed
         .iter()
         .filter(|path| {
@@ -467,7 +478,7 @@ fn reconcile_observed_change(
             ),
         });
     } else if state.outstanding_kind.as_deref() == Some("repair_required")
-        && action_addresses_repair(&proposed_action, state.outstanding_json.as_deref())
+        && action_addresses_repair(root, &proposed_action, state.outstanding_json.as_deref())
     {
         store.clear_control_hold(&config.project_key, event.adapter.kind, &event.session_key)?;
         feedback.push(FeedbackItem {
@@ -689,7 +700,7 @@ fn delivered_replan_matches(state: &ControlSessionState, proposal_digest: &str) 
         .is_some_and(|digest| digest == proposal_digest)
 }
 
-fn action_addresses_repair(action: &ToolAction, payload: Option<&str>) -> bool {
+fn action_addresses_repair(root: &Path, action: &ToolAction, payload: Option<&str>) -> bool {
     if !explicit_mutation(action) {
         return false;
     }
@@ -698,12 +709,115 @@ fn action_addresses_repair(action: &ToolAction, payload: Option<&str>) -> bool {
         .and_then(|payload| payload.get("unexpected_paths").cloned())
         .and_then(|paths| serde_json::from_value::<Vec<String>>(paths).ok())
         .unwrap_or_default();
+    let repair_paths = repair_paths
+        .iter()
+        .map(|path| make_project_relative(root, path))
+        .collect::<Vec<_>>();
     !repair_paths.is_empty()
         && mutation_paths(action).iter().any(|target| {
+            let target = make_project_relative(root, target);
             repair_paths
                 .iter()
-                .any(|repair| path_has_prefix(target, repair) || path_has_prefix(repair, target))
+                .any(|repair| path_has_prefix(&target, repair) || path_has_prefix(repair, &target))
         })
+}
+
+fn make_project_relative(root: &Path, path: &str) -> String {
+    let candidate = normalized_root_path(path);
+    let project_root = normalized_root_path(&root.to_string_lossy());
+    let candidate_cmp = comparable_path(&candidate);
+    let root_cmp = comparable_path(&project_root);
+    if candidate_cmp == root_cmp {
+        return String::new();
+    }
+    let prefix = format!("{root_cmp}/");
+    if candidate_cmp.starts_with(&prefix) {
+        return candidate[prefix.len()..].to_owned();
+    }
+    candidate
+}
+
+fn normalized_root_path(path: &str) -> String {
+    let normalized = normalize_project_path(path);
+    normalized
+        .strip_prefix("/?/")
+        .unwrap_or(&normalized)
+        .to_owned()
+}
+
+fn comparable_path(path: &str) -> String {
+    if cfg!(windows) {
+        path.to_ascii_lowercase()
+    } else {
+        path.to_owned()
+    }
+}
+
+fn repair_inspection_action(action: &ToolAction) -> bool {
+    if action.kind == ActionKind::Read {
+        return true;
+    }
+    if !matches!(action.kind, ActionKind::Execute | ActionKind::GitOperation) {
+        return false;
+    }
+    let Some(command) = action.command.as_deref() else {
+        return false;
+    };
+    let command = command.to_ascii_lowercase();
+    let mutating_markers = [
+        "remove-item",
+        "set-content",
+        "add-content",
+        "out-file",
+        "new-item",
+        "copy-item",
+        "move-item",
+        "rename-item",
+        "clear-content",
+        "git add",
+        "git commit",
+        "git checkout",
+        "git switch",
+        "git reset",
+        "git restore",
+        "git clean",
+        "git rm",
+        " rm ",
+        " del ",
+        " erase ",
+        "mkdir",
+        "touch ",
+        "apply_patch",
+        ">",
+    ];
+    if mutating_markers
+        .iter()
+        .any(|marker| command.contains(marker))
+    {
+        return false;
+    }
+    command.split(';').all(|segment| {
+        let segment = segment.trim();
+        segment.is_empty()
+            || [
+                "git status",
+                "git diff",
+                "git log",
+                "git show",
+                "git branch",
+                "get-childitem",
+                "get-content",
+                "write-host",
+                "select-string",
+                "where.exe",
+                "rg ",
+                "rg\t",
+                "node --version",
+                "npm --version",
+            ]
+            .iter()
+            .any(|prefix| segment.starts_with(prefix))
+    })
 }
 
 fn evidence_context(
@@ -1556,10 +1670,10 @@ mod tests {
 
     use brain_core::{
         ActionDescriptor, ActionKind, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, DecisionKind,
-        EvidenceGrade, FindingEffectMapping, MemoryStatus, ProjectLanguageProfile, Rule,
-        RuleEffect, RuleStrength, RuleSymbolScope, SemanticLanguageMapping, SemanticProviderFormat,
-        SemanticProviderProfile, StopReconcileConfig, SymbolResolutionPolicy, ToolAction,
-        ToolImpact,
+        EvidenceGrade, FindingEffectMapping, MemoryStatus, ProjectLanguageProfile, ProposedChange,
+        Rule, RuleEffect, RuleStrength, RuleSymbolScope, SemanticLanguageMapping,
+        SemanticProviderFormat, SemanticProviderProfile, StopReconcileConfig,
+        SymbolResolutionPolicy, ToolAction, ToolImpact,
     };
     use brain_evidence::{
         EvidenceAuthority, EvidenceCoverage, EvidenceFinding, EvidencePlane, EvidenceProvider,
@@ -1571,7 +1685,10 @@ mod tests {
         SourceLanguage, SymbolNode, SymbolNodeInput, SymbolSnapshot,
     };
 
-    use super::{evaluate_finding_stop, evaluate_symbol_rules, evaluate_symbol_stop};
+    use super::{
+        action_addresses_repair, evaluate_finding_stop, evaluate_symbol_rules,
+        evaluate_symbol_stop, make_project_relative, repair_inspection_action,
+    };
     use crate::evidence::CurrentSourceVerification;
     use crate::git;
     use crate::provider::ProviderTrustStatus;
@@ -1998,5 +2115,62 @@ mod tests {
                 .iter()
                 .any(|item| item.text.contains("advisory"))
         );
+    }
+
+    #[test]
+    fn absolute_proposal_path_matches_relative_git_delta() {
+        let root = Path::new(r"\\?\E:\Github\Test\project-brain-dsh-game-trial");
+        assert_eq!(
+            make_project_relative(
+                root,
+                "E:/Github/Test/project-brain-dsh-game-trial/package.json"
+            ),
+            "package.json"
+        );
+        let action = ToolAction {
+            kind: ActionKind::Modify,
+            target_files: vec![
+                "E:/Github/Test/project-brain-dsh-game-trial/package.json".to_owned(),
+            ],
+            command: None,
+            deterministic_impacts: Vec::new(),
+            proposed_change: Some(ProposedChange {
+                proposal_digest: "proposal".to_owned(),
+                base_source_fingerprint: "source".to_owned(),
+                target_files: vec![
+                    "E:/Github/Test/project-brain-dsh-game-trial/package.json".to_owned(),
+                ],
+                proposed_content_digest: None,
+            }),
+        };
+        assert!(action_addresses_repair(
+            root,
+            &action,
+            Some(r#"{"unexpected_paths":["package.json"]}"#),
+        ));
+    }
+
+    #[test]
+    fn repair_hold_allows_inspection_but_not_shell_mutation() {
+        let inspection = ToolAction {
+            kind: ActionKind::GitOperation,
+            target_files: Vec::new(),
+            command: Some(
+                "git status --short; Write-Host '---DIFF---'; git diff; Get-ChildItem -Recurse"
+                    .to_owned(),
+            ),
+            deterministic_impacts: Vec::new(),
+            proposed_change: None,
+        };
+        assert!(repair_inspection_action(&inspection));
+
+        let mutation = ToolAction {
+            kind: ActionKind::Execute,
+            target_files: Vec::new(),
+            command: Some("Get-Content package.json | Set-Content copy.json".to_owned()),
+            deterministic_impacts: Vec::new(),
+            proposed_change: None,
+        };
+        assert!(!repair_inspection_action(&mutation));
     }
 }

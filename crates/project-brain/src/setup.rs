@@ -2234,10 +2234,13 @@ function deepFreeze(value) {
 }
 
 function contextMessage(text, summary = "Project Brain context") {
+  const launcherHint = text.includes("project-brain claims submit")
+    ? `\n\n本机 Project Brain CLI launcher：${LAUNCHER}（命令不在 PATH 时请直接调用此绝对路径）。`
+    : "";
   return deepFreeze({
     id: `project-brain-${randomUUID()}`,
     role: "user",
-    content: [{ type: "text", text }],
+    content: [{ type: "text", text: `${text}${launcherHint}` }],
     source: { kind: "plugin", plugin: name, form: "notice", summary },
   });
 }
