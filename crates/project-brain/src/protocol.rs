@@ -1569,7 +1569,7 @@ fn control_delivery_needed(state: &ControlSessionState) -> bool {
 
 fn control_context_items(config: &BrainConfig, state: &ControlSessionState) -> Vec<ContextItem> {
     let mut sections = vec![format!(
-        "[Project Brain active control]\n目标版本={}，项目上下文版本={}，生命周期={}。\n{}\n\n若发现值得保留的项目事实，可用 `project-brain claims submit` 追加结构化声明；声明不可删除，也不能授权规则、豁免约束或证明功能已实现。完成状态只接受实际 diff 与验证证据。",
+        "[Project Brain active control]\n目标版本={}，项目上下文版本={}，生命周期={}。\n{}\n\n若需要由 Agent 自主建立或维护开发约束，请使用 `project-brain rules upsert-agent --rule AGENT-... --message ...`；该入口固定写入 agent_inference/soft/inject_context，不能自授阻断、复核或豁免权限，具体参数以 `--help` 为准。\n\n若发现值得保留的项目事实，可用 `project-brain claims submit` 追加结构化声明；声明不可删除，也不能授权规则、豁免约束或证明功能已实现。完成状态只接受实际 diff 与验证证据。",
         state.goal_revision,
         state.context_revision,
         state.lifecycle_epoch,

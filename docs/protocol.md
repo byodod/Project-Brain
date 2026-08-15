@@ -161,6 +161,15 @@ PreTool 放行的提案；PostTool 必须使用该记录，而不是用工具执
 的命令。新 claim 会使相关会话上下文失效并在后续模型步骤最多注入有界的最近记录；实际完成仍由 Source
 delta、Evidence 和 Stop gate 裁决。
 
+当用户把项目规则的日常维护明确委托给编程 Agent 时，Agent 使用
+`project-brain rules upsert-agent --rule AGENT-... --message ...` 创建或更新规则。该入口固定 authority 为
+`agent_inference`、strength 为 `soft`、effect 为 `inject_context`，不接受自定义 authority/strength/effect，
+不能覆盖非 `agent_inference` 规则，也不能产生阻断、复核、升级或豁免权限。Active-control 上下文会主动
+提示该入口；规则内容由 Agent 提出，权限上限由 Project Brain 确定。
+
+`project-brain doctor` 必须显式指定目标 Agent（例如 `doctor dsh`），不再默认检查 Codex。这样未知当前
+适配器的调用会直接失败并展示用法，而不会返回另一适配器的健康报告。
+
 ## 7. Input Dependency Contract v1
 
 ```json

@@ -101,7 +101,8 @@ enum Command {
 
     /// 检查安装、项目注册、指定 Agent Hook 与本地存储就绪状态
     Doctor {
-        #[arg(value_enum, default_value = "codex")]
+        /// 必须显式选择 codex、pi、opencode 或 dsh，避免检查错适配器后误判就绪状态
+        #[arg(value_enum)]
         agent: AgentKind,
 
         /// 同时要求当前二进制与控制面合同已有 Qualified 证明
@@ -649,6 +650,24 @@ enum DatabaseCommand {
 
 #[derive(Debug, Subcommand)]
 enum RulesCommand {
+    /// 创建或更新一条由 Agent 自主提出的低权限提示规则；固定为 `agent_inference/soft/inject_context`
+    UpsertAgent {
+        /// 规则 ID 必须以 AGENT- 开头，不能覆盖仓库或用户规则
+        #[arg(long)]
+        rule: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long, default_value = "")]
+        rationale: String,
+        #[arg(long)]
+        include_path: Vec<String>,
+        #[arg(long)]
+        exclude_path: Vec<String>,
+        #[arg(long)]
+        operation: Vec<String>,
+        #[arg(long)]
+        operation_contains: Vec<String>,
+    },
     /// 把一条仓库规则绑定到明确的 semantic snapshot/symbol 锚点
     BindSymbol {
         #[arg(long)]
@@ -1179,6 +1198,23 @@ fn run_cli() -> ExitCode {
             ),
         },
         Command::Rules { command } => App::open(cli.project_root).and_then(|app| match command {
+            RulesCommand::UpsertAgent {
+                rule,
+                message,
+                rationale,
+                include_path,
+                exclude_path,
+                operation,
+                operation_contains,
+            } => app.upsert_agent_rule(
+                &rule,
+                &message,
+                &rationale,
+                include_path,
+                exclude_path,
+                operation,
+                operation_contains,
+            ),
             RulesCommand::BindSymbol {
                 rule,
                 provider,

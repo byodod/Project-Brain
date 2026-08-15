@@ -97,3 +97,33 @@ DSH 随后执行排除 `.git` 与 `.project-brain` 的递归查询，结果为�
 - 只向 DSH 提供非技术游戏目标，并要求它自行使用 Project Brain 管理项目；是否初始化 Project Brain、写入什么规则、何时修订规则，全部由 DSH 决定。
 - 监督方只做旁路观察、审计和事实记录；只修复 Project Brain 源码或接入缺陷，不再替 DSH 编写项目规则。
 - DSH 是否能发现、初始化并正确使用 Project Brain，本身属于能力试验结果。
+
+## 第 4 轮：基线无效，已终止
+
+监督方按“全部从零”把 `.project-brain` 也交给 DSH 初始化，但复用了第 1 至第 3 轮的机器级项目注册。Project Brain 因同一路径缺少配置而在 PreTool fail-closed，导致 DSH 连 `project-brain init` 都无法执行。DSH 明确识别出 chicken-and-egg 死锁；监督方约 46 秒时停止会话。
+
+该结果来自监督方没有清空机器注册，不计入 DSH 或 Project Brain 能力结论。后续基线改为：监督方只建立并注册 `rules=[]` 的空控制面和初始 Git 零点，DSH 负责创建所有实际开发规则。
+
+## 第 5 轮：已终止
+
+DSH session：`session-c2f1a883-4721-437c-b5b2-01bad3394ed0`
+
+### 已验证事实
+
+- 独立安装根 `ProjectBrainDevTrial4` 的 launcher、payload、项目注册和 DSH Hook 均通过，Q1 至 Q7 为 Qualified。
+- 初始提交 `2ab45e4` 只含 Project Brain 元数据，`rules=[]`，没有游戏代码或行为约束。
+- DSH 自主加载 Godot skill、建立长期目标、读取 `config.json` 与 `envelope.json`，并确认 Godot 4.6 Mono 可用。
+- DSH 创建 `docs/GAME_DESIGN.md` 和 `RULES.md`，随后提交 Project Brain claims；停止时尚未创建游戏实现。
+
+### 触发终止的问题
+
+Project Brain 的 active-control 上下文只提示 `claims submit`，没有 Agent 自主规则创建接口或 schema 指引。DSH 读取空规则后没有修改 Project Brain rules，而是把规则写到普通 `RULES.md` 并提交低权限 claims。
+
+同时，DSH 先猜测不存在的 `project-brain status` 与 `project-brain project list`；查阅 `--help` 后又运行未指定 Agent 的 `doctor`，默认检查 Codex Hook，得到与本轮 DSH 无关的 degraded 报告，却仍总结“环境就绪”。这说明当前 Project Brain CLI 对 Agent 自治规则和适配器检查的可发现性不足，DSH 的纠错也没有识别错误 doctor 的能力归属。
+
+### 第 6 轮前置修复
+
+- 新增 `project-brain rules upsert-agent`，由 Agent 自主提供规则 ID、消息和可选范围；Project Brain 固定写入 `agent_inference/soft/inject_context`，禁止覆盖更高权限规则或自授阻断能力。
+- Active-control 上下文主动提示该命令及其权限上限，使规则内容来自 DSH，而不是监督方。
+- 增加 CLI 黑盒回归测试，验证创建、更新、固定权限和拒绝覆盖仓库规则。
+- 移除 `doctor` 的 Codex 默认值，强制 Agent 显式选择适配器，避免 DSH 把无关的 Codex 健康报告当成自身状态。

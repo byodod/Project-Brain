@@ -162,6 +162,109 @@ fn capability_matrix_is_explicit_for_all_supported_agents() {
 }
 
 #[test]
+fn agent_rule_upsert_is_low_authority_and_cannot_replace_repository_rules() {
+    let root = temp_root("agent-rule-upsert");
+    let (_install_root, project) = install_and_init(&root);
+    let created = run(
+        &binary(),
+        &[
+            "rules",
+            "upsert-agent",
+            "--rule",
+            "AGENT-GAME-001",
+            "--message",
+            "先验证核心循环再扩展内容",
+            "--rationale",
+            "由开发 Agent 主动维护",
+            "--include-path",
+            "scripts",
+            "--operation",
+            "pwsh",
+        ],
+        &project,
+        None,
+        &[],
+    );
+    assert_success(&created);
+    let created: Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(created["created"], true);
+    assert_eq!(created["authority_ceiling"], "agent_inference");
+    assert_eq!(created["may_block"], false);
+
+    let updated = run(
+        &binary(),
+        &[
+            "rules",
+            "upsert-agent",
+            "--rule",
+            "AGENT-GAME-001",
+            "--message",
+            "每次提交前运行可重复验证",
+        ],
+        &project,
+        None,
+        &[],
+    );
+    assert_success(&updated);
+    let config: Value =
+        serde_json::from_slice(&fs::read(project.join(".project-brain/config.json")).unwrap())
+            .unwrap();
+    let matching = config["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|rule| rule["id"] == "AGENT-GAME-001")
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1);
+    assert_eq!(matching[0]["authority"], "agent_inference");
+    assert_eq!(matching[0]["strength"], "soft");
+    assert_eq!(matching[0]["effect"], "inject_context");
+    assert_eq!(matching[0]["message"], "每次提交前运行可重复验证");
+
+    let config_path = project.join(".project-brain/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["rules"][0]["authority"] = serde_json::json!("repository_rule");
+    fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("serialize config"),
+    )
+    .unwrap();
+
+    let refused = run(
+        &binary(),
+        &[
+            "rules",
+            "upsert-agent",
+            "--rule",
+            "AGENT-GAME-001",
+            "--message",
+            "尝试覆盖仓库规则",
+        ],
+        &project,
+        None,
+        &[],
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("不能覆盖"));
+}
+
+#[test]
+fn doctor_requires_explicit_agent_selection() {
+    let root = temp_root("doctor-agent-required");
+    let (_install_root, project) = install_and_init(&root);
+    let output = run(&binary(), &["doctor"], &project, None, &[]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("<AGENT>"), "stderr={stderr}");
+
+    let help = run(&binary(), &["doctor", "--help"], &project, None, &[]);
+    assert_success(&help);
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(stdout.contains("codex"), "stdout={stdout}");
+    assert!(stdout.contains("dsh"), "stdout={stdout}");
+}
+
+#[test]
 fn normalized_dispatch_blocks_protected_deletion_for_all_agents() {
     let root = temp_root("dispatch");
     let (install_root, project) = install_and_init(&root);

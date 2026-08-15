@@ -1773,6 +1773,82 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn upsert_agent_rule(
+        &self,
+        rule_id: &str,
+        message: &str,
+        rationale: &str,
+        mut include_paths: Vec<String>,
+        mut exclude_paths: Vec<String>,
+        mut operations: Vec<String>,
+        mut operation_contains: Vec<String>,
+    ) -> Result<(), AppError> {
+        let rule_id = rule_id.trim();
+        if !rule_id.starts_with("AGENT-") {
+            return Err(AppError::Governance(
+                "Agent 自主规则 ID 必须以 AGENT- 开头".to_owned(),
+            ));
+        }
+        for values in [
+            &mut include_paths,
+            &mut exclude_paths,
+            &mut operations,
+            &mut operation_contains,
+        ] {
+            values.retain(|value| !value.trim().is_empty());
+            values.sort();
+            values.dedup();
+        }
+        let rule = Rule {
+            id: rule_id.to_owned(),
+            status: MemoryStatus::Active,
+            authority: Authority::AgentInference,
+            strength: RuleStrength::Soft,
+            effect: RuleEffect::InjectContext,
+            include_paths,
+            exclude_paths,
+            actions: Vec::new(),
+            operations,
+            operation_contains,
+            symbol_scopes: Vec::new(),
+            message: message.trim().to_owned(),
+            rationale: rationale.trim().to_owned(),
+        };
+        rule.validate()?;
+
+        let mut config = self.config.clone();
+        let updated =
+            if let Some(existing) = config.rules.iter_mut().find(|item| item.id == rule_id) {
+                if existing.authority != Authority::AgentInference {
+                    return Err(AppError::Governance(format!(
+                        "Agent 自主规则不能覆盖 authority={:?} 的既有 rule={rule_id:?}",
+                        existing.authority
+                    )));
+                }
+                *existing = rule.clone();
+                true
+            } else {
+                config.rules.push(rule.clone());
+                false
+            };
+        config.rules.sort_by(|left, right| left.id.cmp(&right.id));
+        self.write_config(&config)?;
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "project_key": self.config.project_key,
+                "created": !updated,
+                "updated": updated,
+                "authority_ceiling": "agent_inference",
+                "may_block": false,
+                "rule": rule,
+            }))?
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_rule_symbol(
         &self,
         rule_id: &str,

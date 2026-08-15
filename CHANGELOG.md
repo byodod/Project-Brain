@@ -12,6 +12,9 @@
   `replan`、`repair_required`、`verify_required` 纠偏闭环。
 - append-only Agent claim ledger 与 `project-brain claims submit/list`；声明只有低权限，不能删除、
   豁免规则或标记已实现。
+- `project-brain rules upsert-agent`：允许编程 Agent 自主创建或更新仅限
+  `agent_inference/soft/inject_context` 的提示规则，不能覆盖高权限规则或自授阻断能力。
+- `project-brain doctor` 现在要求显式指定 Agent，避免默认检查 Codex 导致其他适配器被误判。
 
 ### Changed
 
