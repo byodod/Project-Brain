@@ -387,6 +387,7 @@ fn normalized_tool(
     let mut target_files = extract_target_files(&input.tool_input);
     if let Some(command) = command.as_deref() {
         target_files.extend(extract_destructive_command_paths(command));
+        target_files.extend(extract_project_brain_command_paths(command));
     }
     target_files.sort();
     target_files.dedup();
@@ -741,6 +742,31 @@ fn extract_destructive_command_paths(command: &str) -> Vec<String> {
     paths
 }
 
+fn extract_project_brain_command_paths(command: &str) -> Vec<String> {
+    let tokens = shell_like_tokens(command);
+    let mut paths = Vec::new();
+    for segment in tokens.split(|token| token == ";") {
+        let Some(executable_index) = segment.iter().position(|token| {
+            token.rsplit(['/', '\\']).next().is_some_and(|name| {
+                matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "project-brain" | "project-brain.exe"
+                )
+            })
+        }) else {
+            continue;
+        };
+        if segment[executable_index + 1..].windows(2).any(|pair| {
+            pair[0].eq_ignore_ascii_case("rules") && pair[1].eq_ignore_ascii_case("upsert-agent")
+        }) {
+            paths.push(".project-brain/config.json".to_owned());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 fn literal_command_path(value: &str) -> bool {
     !value.is_empty()
         && !value.contains(['*', '?', '$', '%', '`', '\n', '\r'])
@@ -946,7 +972,7 @@ mod tests {
 
     use super::{
         CodexHookInput, classify_action, deterministic_impacts, extract_destructive_command_paths,
-        extract_target_files, failure_output, handle,
+        extract_project_brain_command_paths, extract_target_files, failure_output, handle,
     };
     use crate::app::HookEvent;
 
@@ -1093,6 +1119,18 @@ mod tests {
                 Some("Remove-Item file.txt"),
             ),
             ActionKind::Delete
+        );
+    }
+
+    #[test]
+    fn agent_rule_cli_declares_its_control_plane_source_change() {
+        let command = "& 'C:\\Tools\\project-brain.exe' rules upsert-agent --rule AGENT-ONE --message one; & 'C:\\Tools\\project-brain.exe' rules upsert-agent --rule AGENT-TWO --message two";
+        assert_eq!(
+            extract_project_brain_command_paths(command),
+            vec![".project-brain/config.json".to_owned()]
+        );
+        assert!(
+            extract_project_brain_command_paths("Write-Output 'rules upsert-agent'").is_empty()
         );
     }
 
@@ -1782,6 +1820,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stop.0["decision"], "block");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_rule_cli_change_does_not_create_repair_hold() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("project-brain-agent-rule-{nonce}"));
+        fs::create_dir_all(root.join(".project-brain")).unwrap();
+        assert!(
+            Command::new("git")
+                .current_dir(&root)
+                .arg("init")
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(root.join(".project-brain/config.json"), "{\"rules\":[]}").unwrap();
+        let store = BrainStore::open_in_memory().unwrap();
+        let tool = CodexHookInput {
+            session_id: "session".to_owned(),
+            cwd: root.to_string_lossy().into_owned(),
+            turn_id: "turn".to_owned(),
+            tool_name: "Pwsh".to_owned(),
+            tool_use_id: "agent-rules-1".to_owned(),
+            tool_input: json!({
+                "command": "& 'C:\\Tools\\project-brain.exe' rules upsert-agent --rule AGENT-ONE --message one; & 'C:\\Tools\\project-brain.exe' rules upsert-agent --rule AGENT-TWO --message two"
+            }),
+            ..CodexHookInput::default()
+        };
+        let pre = handle(
+            &root,
+            &config("project_a"),
+            &store,
+            HookEvent::PreToolUse,
+            &tool,
+        )
+        .unwrap();
+        assert_ne!(pre.0["hookSpecificOutput"]["permissionDecision"], "deny");
+
+        fs::write(
+            root.join(".project-brain/config.json"),
+            "{\"rules\":[{\"id\":\"AGENT-ONE\"}]}\n",
+        )
+        .unwrap();
+        let mut post = tool;
+        post.tool_response = json!({"success":true,"output":"rules updated"});
+        handle(
+            &root,
+            &config("project_a"),
+            &store,
+            HookEvent::PostToolUse,
+            &post,
+        )
+        .unwrap();
+        let control = store
+            .control_session("project_a", brain_core::AdapterKind::Codex, "session")
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.outstanding_kind, None);
         fs::remove_dir_all(root).unwrap();
     }
 }

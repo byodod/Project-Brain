@@ -808,6 +808,7 @@ fn repair_inspection_action(action: &ToolAction) -> bool {
                 "get-childitem",
                 "get-content",
                 "write-host",
+                "write-output",
                 "select-string",
                 "where.exe",
                 "rg ",
@@ -2156,7 +2157,7 @@ mod tests {
             kind: ActionKind::GitOperation,
             target_files: Vec::new(),
             command: Some(
-                "git status --short; Write-Host '---DIFF---'; git diff; Get-ChildItem -Recurse"
+                "git status --short; Write-Output '---DIFF---'; git diff; Get-ChildItem -Recurse"
                     .to_owned(),
             ),
             deterministic_impacts: Vec::new(),

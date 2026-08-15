@@ -22,6 +22,11 @@
   pre-model context、native replan、compact rehydrate、subagent lineage 等真实宿主 seam。
 - SQLite schema 升级为 v21，加入项目隔离的控制会话、放行提案和 Agent claim 表。
 
+### Fixed
+
+- DSH/Codex 归一化会把官方 `rules upsert-agent` 对 `.project-brain/config.json` 的修改纳入变更提案，
+  避免自主建规触发错误的 `repair_required`；纠偏检查同时允许只读 `Write-Output` 分隔输出。
+
 ## [0.2.3] - 2026-08-15
 
 ### Fixed

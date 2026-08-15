@@ -127,3 +127,18 @@ Project Brain 的 active-control 上下文只提示 `claims submit`，没有 Age
 - Active-control 上下文主动提示该命令及其权限上限，使规则内容来自 DSH，而不是监督方。
 - 增加 CLI 黑盒回归测试，验证创建、更新、固定权限和拒绝覆盖仓库规则。
 - 移除 `doctor` 的 Codex 默认值，强制 Agent 显式选择适配器，避免 DSH 把无关的 Codex 健康报告当成自身状态。
+
+## 第 6 轮：已终止
+
+DSH 自主设计《虚空光轨》，并通过 `rules upsert-agent` 成功写入 7 条 `AGENT-*` 规则；规则内容全部来自
+DSH，authority/strength/effect 均保持 `agent_inference/soft/inject_context`。这证明自主建规入口与主动提示
+已被真实 Agent 正确发现和使用。
+
+随后 Project Brain 把官方命令造成的 `.project-brain/config.json` 变化误判为提案外实际变更并进入
+`repair_required`，因为通用 Pwsh 归一化没有声明该命令的已知目标路径。DSH 试图用
+`git status`、`git log`、`Get-Content` 检查，但命令中的只读 `Write-Output` 不在纠偏检查白名单，又被阻止。
+监督方立即停止会话。
+
+第 7 轮前修复：识别真实 `project-brain(.exe) rules upsert-agent` 命令段并声明
+`.project-brain/config.json` 为预期变更路径，同时允许纠偏检查使用只读 `Write-Output`；普通文本中偶然出现
+`rules upsert-agent` 不获得该路径声明。
