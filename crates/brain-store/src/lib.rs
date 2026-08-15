@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub const DATABASE_SCHEMA_VERSION: i64 = 20;
+pub const DATABASE_SCHEMA_VERSION: i64 = 21;
 const ADAPTER_BUSY_RETRY_DELAYS_MS: [u64; 3] = [20, 80, 320];
 const ALL_EVIDENCE_PLANES: [EvidencePlane; 6] = [
     EvidencePlane::Source,
@@ -270,6 +270,49 @@ pub struct SourceOperationBaseline {
     pub source_fingerprint: String,
     pub source_state_json: String,
     pub source_state_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlSessionState {
+    pub project_key: String,
+    pub adapter_kind: AdapterKind,
+    pub session_key: String,
+    pub parent_session_key: Option<String>,
+    pub session_origin: String,
+    pub delegation_depth: u16,
+    pub lifecycle_epoch: u64,
+    pub hydrated_epoch: u64,
+    pub goal_revision: u64,
+    pub context_revision: u64,
+    pub raw_goal: Option<String>,
+    pub goal_digest: Option<String>,
+    pub project_context_digest: Option<String>,
+    pub outstanding_kind: Option<String>,
+    pub outstanding_json: Option<String>,
+    pub outstanding_delivered: bool,
+    pub last_delivery_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlChangeProposal {
+    pub project_key: String,
+    pub adapter_kind: AdapterKind,
+    pub session_key: String,
+    pub operation_id: String,
+    pub proposal_digest: String,
+    pub action_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentClaimRecord {
+    pub claim_id: String,
+    pub project_key: String,
+    pub adapter_kind: AdapterKind,
+    pub session_key: String,
+    pub kind: String,
+    pub content: String,
+    pub content_hash: String,
+    pub created_at_unix_seconds: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -737,6 +780,7 @@ impl BrainStore {
         self.ensure_lineage_v17_compaction_backup()?;
         self.initialize_evidence_input_v19_schema()?;
         self.ensure_adapter_domain_v20_schema()?;
+        self.initialize_control_state_v21_schema()?;
         self.ensure_database_instance_id()?;
         self.initialize_adapter_audit_schema()?;
         self.connection.execute(
@@ -1093,6 +1137,56 @@ impl BrainStore {
              ALTER TABLE source_operation_baselines_v20
                  RENAME TO source_operation_baselines;
              COMMIT;",
+        )?;
+        Ok(())
+    }
+
+    fn initialize_control_state_v21_schema(&self) -> Result<(), StoreError> {
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS control_sessions (
+                 project_key TEXT NOT NULL,
+                 adapter_kind TEXT NOT NULL,
+                 session_key TEXT NOT NULL,
+                 parent_session_key TEXT,
+                 session_origin TEXT NOT NULL,
+                 delegation_depth INTEGER NOT NULL,
+                 lifecycle_epoch INTEGER NOT NULL,
+                 hydrated_epoch INTEGER NOT NULL,
+                 goal_revision INTEGER NOT NULL,
+                 context_revision INTEGER NOT NULL,
+                 raw_goal TEXT,
+                 goal_digest TEXT,
+                 project_context_digest TEXT,
+                 outstanding_kind TEXT,
+                 outstanding_json TEXT,
+                 outstanding_delivered INTEGER NOT NULL CHECK(outstanding_delivered IN (0, 1)),
+                 last_delivery_digest TEXT,
+                 updated_at_unix_seconds INTEGER NOT NULL,
+                 PRIMARY KEY(project_key, adapter_kind, session_key)
+             );
+             CREATE INDEX IF NOT EXISTS idx_control_sessions_parent
+                 ON control_sessions(project_key, adapter_kind, parent_session_key);
+             CREATE TABLE IF NOT EXISTS control_change_proposals (
+                 project_key TEXT NOT NULL,
+                 adapter_kind TEXT NOT NULL,
+                 session_key TEXT NOT NULL,
+                 operation_id TEXT NOT NULL,
+                 proposal_digest TEXT NOT NULL,
+                 action_json TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 PRIMARY KEY(project_key, adapter_kind, session_key, operation_id)
+             );
+             CREATE TABLE IF NOT EXISTS agent_claims (
+                 claim_id TEXT NOT NULL,
+                 project_key TEXT NOT NULL,
+                 adapter_kind TEXT NOT NULL,
+                 session_key TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 content TEXT NOT NULL,
+                 content_hash TEXT NOT NULL,
+                 created_at_unix_seconds INTEGER NOT NULL,
+                 PRIMARY KEY(project_key, claim_id)
+             );",
         )?;
         Ok(())
     }
@@ -2120,6 +2214,533 @@ impl BrainStore {
             });
         }
         Ok(records)
+    }
+
+    /// 打开或恢复一个 Agent 控制会话。每次生命周期边界都会使已有上下文交付失效。
+    ///
+    /// # Errors
+    ///
+    /// 身份非法或数据库写入失败时返回错误。
+    pub fn open_control_session(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+        parent_session_key: Option<&str>,
+        session_origin: &str,
+        delegation_depth: u16,
+    ) -> Result<ControlSessionState, StoreError> {
+        validate_control_identity(project_key, session_key, parent_session_key, session_origin)?;
+        self.connection.execute(
+            "INSERT INTO control_sessions(
+                 project_key, adapter_kind, session_key, parent_session_key, session_origin,
+                 delegation_depth, lifecycle_epoch, hydrated_epoch, goal_revision,
+                 context_revision, outstanding_delivered, updated_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, 0, 0, 0, ?7)
+             ON CONFLICT(project_key, adapter_kind, session_key) DO UPDATE SET
+                 parent_session_key = excluded.parent_session_key,
+                 session_origin = excluded.session_origin,
+                 delegation_depth = excluded.delegation_depth,
+                 lifecycle_epoch = control_sessions.lifecycle_epoch + 1,
+                 hydrated_epoch = 0,
+                 outstanding_delivered = 0,
+                 updated_at_unix_seconds = excluded.updated_at_unix_seconds",
+            params![
+                project_key,
+                adapter_kind.as_str(),
+                session_key,
+                parent_session_key,
+                session_origin,
+                delegation_depth,
+                unix_seconds()?,
+            ],
+        )?;
+        self.control_session(project_key, adapter_kind, session_key)?
+            .ok_or_else(|| StoreError::Integrity("控制会话写入后不可见".to_owned()))
+    }
+
+    /// 确保控制会话存在，但不改变已有生命周期 epoch。
+    ///
+    /// # Errors
+    ///
+    /// 身份非法或数据库写入失败时返回错误。
+    pub fn ensure_control_session(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+    ) -> Result<ControlSessionState, StoreError> {
+        validate_control_identity(project_key, session_key, None, "unknown")?;
+        self.connection.execute(
+            "INSERT INTO control_sessions(
+                 project_key, adapter_kind, session_key, session_origin, delegation_depth,
+                 lifecycle_epoch, hydrated_epoch, goal_revision, context_revision,
+                 outstanding_delivered, updated_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, 'unknown', 0, 1, 0, 0, 0, 0, ?4)
+             ON CONFLICT(project_key, adapter_kind, session_key) DO NOTHING",
+            params![
+                project_key,
+                adapter_kind.as_str(),
+                session_key,
+                unix_seconds()?
+            ],
+        )?;
+        self.control_session(project_key, adapter_kind, session_key)?
+            .ok_or_else(|| StoreError::Integrity("控制会话写入后不可见".to_owned()))
+    }
+
+    /// 更新项目上下文摘要；摘要变化会提升 revision 并要求下一模型步骤重新水合。
+    ///
+    /// # Errors
+    ///
+    /// 数据库写入失败时返回错误。
+    pub fn sync_control_context(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+        context_digest: &str,
+    ) -> Result<ControlSessionState, StoreError> {
+        let _ = self.ensure_control_session(project_key, adapter_kind, session_key)?;
+        self.connection.execute(
+            "UPDATE control_sessions
+             SET project_context_digest = ?4,
+                 context_revision = context_revision +
+                     CASE WHEN project_context_digest IS ?4 THEN 0 ELSE 1 END,
+                 hydrated_epoch = CASE WHEN project_context_digest IS ?4
+                     THEN hydrated_epoch ELSE 0 END,
+                 updated_at_unix_seconds = ?5
+             WHERE project_key = ?1 AND adapter_kind = ?2 AND session_key = ?3",
+            params![
+                project_key,
+                adapter_kind.as_str(),
+                session_key,
+                context_digest,
+                unix_seconds()?,
+            ],
+        )?;
+        self.control_session(project_key, adapter_kind, session_key)?
+            .ok_or_else(|| StoreError::Integrity("控制会话更新后不可见".to_owned()))
+    }
+
+    /// 记录来自真实意图边界的原始目标。相同目标不会重复提升 revision。
+    ///
+    /// # Errors
+    ///
+    /// 数据库写入失败时返回错误。
+    pub fn declare_control_goal(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+        raw_goal: &str,
+        goal_digest: &str,
+    ) -> Result<ControlSessionState, StoreError> {
+        let _ = self.ensure_control_session(project_key, adapter_kind, session_key)?;
+        self.connection.execute(
+            "UPDATE control_sessions
+             SET raw_goal = ?4, goal_digest = ?5,
+                 goal_revision = goal_revision + CASE WHEN goal_digest IS ?5 THEN 0 ELSE 1 END,
+                 hydrated_epoch = CASE WHEN goal_digest IS ?5 THEN hydrated_epoch ELSE 0 END,
+                 updated_at_unix_seconds = ?6
+             WHERE project_key = ?1 AND adapter_kind = ?2 AND session_key = ?3",
+            params![
+                project_key,
+                adapter_kind.as_str(),
+                session_key,
+                raw_goal,
+                goal_digest,
+                unix_seconds()?,
+            ],
+        )?;
+        self.control_session(project_key, adapter_kind, session_key)?
+            .ok_or_else(|| StoreError::Integrity("控制目标更新后不可见".to_owned()))
+    }
+
+    /// 保存必须在下一模型步骤交付的重规划、修复或验证状态。
+    ///
+    /// # Errors
+    ///
+    /// 状态非法或数据库写入失败时返回错误。
+    pub fn set_control_hold(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+        kind: &str,
+        payload_json: &str,
+    ) -> Result<(), StoreError> {
+        let _ = self.ensure_control_session(project_key, adapter_kind, session_key)?;
+        if kind.trim().is_empty() || kind.len() > 64 || payload_json.len() > 1024 * 1024 {
+            return Err(StoreError::InvalidHookEvent("控制 hold 非法".to_owned()));
+        }
+        serde_json::from_str::<serde_json::Value>(payload_json)?;
+        self.connection.execute(
+            "UPDATE control_sessions
+             SET outstanding_kind = ?4, outstanding_json = ?5,
+                 outstanding_delivered = 0, updated_at_unix_seconds = ?6
+             WHERE project_key = ?1 AND adapter_kind = ?2 AND session_key = ?3",
+            params![
+                project_key,
+                adapter_kind.as_str(),
+                session_key,
+                kind,
+                payload_json,
+                unix_seconds()?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 标记当前目标、项目上下文及待处理 hold 已在模型调用前完成交付。
+    ///
+    /// # Errors
+    ///
+    /// 数据库写入失败时返回错误。
+    pub fn mark_control_delivered(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+        delivery_digest: &str,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE control_sessions
+             SET hydrated_epoch = lifecycle_epoch, outstanding_delivered = 1,
+                 last_delivery_digest = ?4, updated_at_unix_seconds = ?5
+             WHERE project_key = ?1 AND adapter_kind = ?2 AND session_key = ?3",
+            params![
+                project_key,
+                adapter_kind.as_str(),
+                session_key,
+                delivery_digest,
+                unix_seconds()?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 清除已被实际变更证明解决的 hold。
+    ///
+    /// # Errors
+    ///
+    /// 数据库写入失败时返回错误。
+    pub fn clear_control_hold(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE control_sessions
+             SET outstanding_kind = NULL, outstanding_json = NULL,
+                 outstanding_delivered = 0, updated_at_unix_seconds = ?4
+             WHERE project_key = ?1 AND adapter_kind = ?2 AND session_key = ?3",
+            params![
+                project_key,
+                adapter_kind.as_str(),
+                session_key,
+                unix_seconds()?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// 数据库读取失败或持久化数值无效时返回错误。
+    pub fn control_session(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+    ) -> Result<Option<ControlSessionState>, StoreError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT parent_session_key, session_origin, delegation_depth, lifecycle_epoch,
+                    hydrated_epoch, goal_revision, context_revision, raw_goal, goal_digest,
+                    project_context_digest, outstanding_kind, outstanding_json,
+                    outstanding_delivered, last_delivery_digest
+             FROM control_sessions
+             WHERE project_key = ?1 AND adapter_kind = ?2 AND session_key = ?3",
+                params![project_key, adapter_kind.as_str(), session_key],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, bool>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            parent_session_key,
+            session_origin,
+            delegation_depth,
+            lifecycle_epoch,
+            hydrated_epoch,
+            goal_revision,
+            context_revision,
+            raw_goal,
+            goal_digest,
+            project_context_digest,
+            outstanding_kind,
+            outstanding_json,
+            outstanding_delivered,
+            last_delivery_digest,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ControlSessionState {
+            project_key: project_key.to_owned(),
+            adapter_kind,
+            session_key: session_key.to_owned(),
+            parent_session_key,
+            session_origin,
+            delegation_depth: checked_u16(delegation_depth, "delegation_depth")?,
+            lifecycle_epoch: checked_u64(lifecycle_epoch, "lifecycle_epoch")?,
+            hydrated_epoch: checked_u64(hydrated_epoch, "hydrated_epoch")?,
+            goal_revision: checked_u64(goal_revision, "goal_revision")?,
+            context_revision: checked_u64(context_revision, "context_revision")?,
+            raw_goal,
+            goal_digest,
+            project_context_digest,
+            outstanding_kind,
+            outstanding_json,
+            outstanding_delivered,
+            last_delivery_digest,
+        }))
+    }
+
+    /// 保存已被 `PreTool` gate 放行的结构化变更提案；同一 operation 只接受相同重放。
+    ///
+    /// # Errors
+    ///
+    /// 身份、JSON 非法或幂等内容冲突时返回错误。
+    pub fn record_control_change_proposal(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+        operation_id: &str,
+        proposal_digest: &str,
+        action_json: &str,
+    ) -> Result<(), StoreError> {
+        validate_control_identity(project_key, session_key, None, "unknown")?;
+        if operation_id.trim().is_empty()
+            || operation_id.len() > 256
+            || proposal_digest.trim().is_empty()
+            || proposal_digest.len() > 256
+            || action_json.len() > 1024 * 1024
+        {
+            return Err(StoreError::InvalidHookEvent(
+                "变更提案 identity/payload 非法".to_owned(),
+            ));
+        }
+        serde_json::from_str::<serde_json::Value>(action_json)?;
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT proposal_digest, action_json FROM control_change_proposals
+                 WHERE project_key = ?1 AND adapter_kind = ?2 AND session_key = ?3 AND operation_id = ?4",
+                params![project_key, adapter_kind.as_str(), session_key, operation_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_digest, existing_json)) = existing {
+            if existing_digest != proposal_digest || existing_json != action_json {
+                return Err(StoreError::AdapterIdempotencyConflict(
+                    operation_id.to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        self.connection.execute(
+            "INSERT INTO control_change_proposals(
+                 project_key, adapter_kind, session_key, operation_id,
+                 proposal_digest, action_json, created_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                project_key,
+                adapter_kind.as_str(),
+                session_key,
+                operation_id,
+                proposal_digest,
+                action_json,
+                unix_seconds()?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// 数据库读取失败时返回错误。
+    pub fn control_change_proposal(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+        operation_id: &str,
+    ) -> Result<Option<ControlChangeProposal>, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT proposal_digest, action_json FROM control_change_proposals
+                 WHERE project_key = ?1 AND adapter_kind = ?2 AND session_key = ?3 AND operation_id = ?4",
+                params![project_key, adapter_kind.as_str(), session_key, operation_id],
+                |row| {
+                    Ok(ControlChangeProposal {
+                        project_key: project_key.to_owned(),
+                        adapter_kind,
+                        session_key: session_key.to_owned(),
+                        operation_id: operation_id.to_owned(),
+                        proposal_digest: row.get(0)?,
+                        action_json: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// 追加一条 Agent 声明。该账本没有删除或“已实现”状态写入口；声明只作为低权限输入。
+    ///
+    /// # Errors
+    ///
+    /// 身份/内容非法，或同 `claim_id` 被不同内容复用时返回错误。
+    pub fn append_agent_claim(
+        &self,
+        project_key: &str,
+        adapter_kind: AdapterKind,
+        session_key: &str,
+        claim_id: &str,
+        kind: &str,
+        content: &str,
+    ) -> Result<AgentClaimRecord, StoreError> {
+        validate_control_identity(project_key, session_key, None, "unknown")?;
+        let invalid = |value: &str, max_len: usize| {
+            value.trim().is_empty() || value.len() > max_len || value.contains(['\0', '\r'])
+        };
+        if invalid(claim_id, 256) || invalid(kind, 64) || invalid(content, 256 * 1024) {
+            return Err(StoreError::InvalidHookEvent("Agent claim 非法".to_owned()));
+        }
+        let content_hash = fingerprint_parts(&[
+            b"project-brain/agent-claim/v1",
+            kind.as_bytes(),
+            content.as_bytes(),
+        ]);
+        let now = unix_seconds()?;
+        let inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO agent_claims(
+                 claim_id, project_key, adapter_kind, session_key, kind,
+                 content, content_hash, created_at_unix_seconds
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                claim_id,
+                project_key,
+                adapter_kind.as_str(),
+                session_key,
+                kind,
+                content,
+                content_hash,
+                now,
+            ],
+        )?;
+        let record = self.connection.query_row(
+            "SELECT adapter_kind, session_key, kind, content, content_hash,
+                        created_at_unix_seconds
+                 FROM agent_claims WHERE project_key = ?1 AND claim_id = ?2",
+            params![project_key, claim_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )?;
+        if inserted == 0
+            && (record.0 != adapter_kind.as_str()
+                || record.1 != session_key
+                || record.2 != kind
+                || record.3 != content
+                || record.4 != content_hash)
+        {
+            return Err(StoreError::AdapterIdempotencyConflict(claim_id.to_owned()));
+        }
+        if inserted == 1 {
+            self.connection.execute(
+                "UPDATE control_sessions
+                 SET context_revision = context_revision + 1, hydrated_epoch = 0,
+                     updated_at_unix_seconds = ?2
+                 WHERE project_key = ?1",
+                params![project_key, now],
+            )?;
+        }
+        Ok(AgentClaimRecord {
+            claim_id: claim_id.to_owned(),
+            project_key: project_key.to_owned(),
+            adapter_kind,
+            session_key: session_key.to_owned(),
+            kind: kind.to_owned(),
+            content: content.to_owned(),
+            content_hash,
+            created_at_unix_seconds: record.5,
+        })
+    }
+
+    /// # Errors
+    ///
+    /// 数据库读取失败时返回错误。
+    pub fn list_agent_claims(
+        &self,
+        project_key: &str,
+        limit: u32,
+    ) -> Result<Vec<AgentClaimRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT claim_id, adapter_kind, session_key, kind, content, content_hash,
+                    created_at_unix_seconds
+             FROM agent_claims WHERE project_key = ?1
+             ORDER BY created_at_unix_seconds DESC, claim_id DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![project_key, limit.min(1000)], |row| {
+            let adapter = row.get::<_, String>(1)?;
+            let adapter_kind = match adapter.as_str() {
+                "codex" => AdapterKind::Codex,
+                "pi" => AdapterKind::Pi,
+                "opencode" => AdapterKind::Opencode,
+                "dsh" => AdapterKind::Dsh,
+                _ => return Err(rusqlite::Error::InvalidQuery),
+            };
+            Ok(AgentClaimRecord {
+                claim_id: row.get(0)?,
+                project_key: project_key.to_owned(),
+                adapter_kind,
+                session_key: row.get(2)?,
+                kind: row.get(3)?,
+                content: row.get(4)?,
+                content_hash: row.get(5)?,
+                created_at_unix_seconds: row.get(6)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// 记录允许执行的 `PreTool` Source state；同一 operation 只接受逐字相同的重放。
@@ -4351,6 +4972,46 @@ impl BrainStore {
         latency_ms: u64,
     ) -> Result<AdapterRecordResult, StoreError> {
         retry_adapter_busy(|| self.record_adapter_event_once(event, outcome, latency_ms))
+    }
+
+    /// 在执行有状态协议前检查是否已有相同事件的成功结果，避免顺序重放再次改变控制状态。
+    ///
+    /// # Errors
+    ///
+    /// 事件非法、同 ID 载荷碰撞或数据库读取失败时返回错误。
+    pub fn replay_adapter_event(
+        &self,
+        event: &InternalHookEvent,
+    ) -> Result<Option<InternalHookOutcome>, StoreError> {
+        event
+            .validate()
+            .map_err(|error| StoreError::InvalidHookEvent(error.to_string()))?;
+        let event_json = serde_json::to_string(event)?;
+        let event_hash = adapter_event_hash(&event_json);
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT event_hash, outcome_json FROM adapter_audit_events
+                 WHERE project_key = ?1 AND adapter_kind = ?2 AND event_id = ?3",
+                params![
+                    event.project_key,
+                    event.adapter.kind.as_str(),
+                    event.event_id
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let Some((existing_hash, outcome_json)) = existing else {
+            return Ok(None);
+        };
+        if existing_hash != event_hash {
+            return Err(StoreError::AdapterIdempotencyConflict(
+                event.event_id.clone(),
+            ));
+        }
+        outcome_json
+            .map(|outcome| serde_json::from_str(&outcome).map_err(StoreError::from))
+            .transpose()
     }
 
     #[allow(
@@ -7557,6 +8218,35 @@ fn is_valid_project_key(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
+fn validate_control_identity(
+    project_key: &str,
+    session_key: &str,
+    parent_session_key: Option<&str>,
+    session_origin: &str,
+) -> Result<(), StoreError> {
+    let invalid = |value: &str, max_len: usize| {
+        value.trim().is_empty() || value.len() > max_len || value.contains(['\0', '\n', '\r'])
+    };
+    if !is_valid_project_key(project_key)
+        || invalid(session_key, 256)
+        || parent_session_key.is_some_and(|value| invalid(value, 256))
+        || invalid(session_origin, 64)
+    {
+        return Err(StoreError::InvalidHookEvent(
+            "控制会话 identity 非法".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn checked_u64(value: i64, field: &'static str) -> Result<u64, StoreError> {
+    u64::try_from(value).map_err(|_| StoreError::Integrity(format!("控制会话 {field} 为负数")))
+}
+
+fn checked_u16(value: i64, field: &'static str) -> Result<u16, StoreError> {
+    u16::try_from(value).map_err(|_| StoreError::Integrity(format!("控制会话 {field} 超出范围")))
+}
+
 fn is_sha256_fingerprint(value: &str) -> bool {
     value.len() == 71
         && value.starts_with("sha256_")
@@ -9090,6 +9780,9 @@ mod tests {
             payload: HookEventPayload::SessionOpened(SessionOpened {
                 reason: SessionOpenReason::Startup,
                 previous_session_key: None,
+                parent_session_key: None,
+                origin: brain_core::SessionOrigin::Interactive,
+                delegation_depth: 0,
             }),
         }
     }
@@ -9218,6 +9911,10 @@ mod tests {
         store
             .record_adapter_event(&event, &hook_outcome("event-1"), 4)
             .unwrap();
+        assert_eq!(
+            store.replay_adapter_event(&event).unwrap(),
+            Some(hook_outcome("event-1"))
+        );
 
         let records = store.recent_adapter_audit("project_a", 10).unwrap();
         assert_eq!(records.len(), 1);
@@ -9250,6 +9947,9 @@ mod tests {
         changed.payload = HookEventPayload::SessionOpened(SessionOpened {
             reason: SessionOpenReason::Resume,
             previous_session_key: None,
+            parent_session_key: None,
+            origin: brain_core::SessionOrigin::Interactive,
+            delegation_depth: 0,
         });
         assert!(matches!(
             store.record_adapter_event(&changed, &hook_outcome("event-1"), 2),
@@ -11447,5 +12147,103 @@ mod tests {
         );
         drop(store);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_control_state_is_revisioned_rehydrated_and_project_isolated() {
+        let store = BrainStore::open_in_memory().unwrap();
+        let opened = store
+            .open_control_session(
+                "project_a",
+                AdapterKind::Dsh,
+                "session-a",
+                Some("parent"),
+                "subagent",
+                1,
+            )
+            .unwrap();
+        assert_eq!(opened.lifecycle_epoch, 1);
+        assert_eq!(opened.hydrated_epoch, 0);
+        let context = store
+            .sync_control_context("project_a", AdapterKind::Dsh, "session-a", "context-1")
+            .unwrap();
+        assert_eq!(context.context_revision, 1);
+        let goal = store
+            .declare_control_goal(
+                "project_a",
+                AdapterKind::Dsh,
+                "session-a",
+                "实现动态纠偏",
+                "goal-1",
+            )
+            .unwrap();
+        assert_eq!(goal.goal_revision, 1);
+        store
+            .set_control_hold(
+                "project_a",
+                AdapterKind::Dsh,
+                "session-a",
+                "replan",
+                r#"{"proposal_digest":"p1"}"#,
+            )
+            .unwrap();
+        store
+            .mark_control_delivered("project_a", AdapterKind::Dsh, "session-a", "delivery-1")
+            .unwrap();
+        let delivered = store
+            .control_session("project_a", AdapterKind::Dsh, "session-a")
+            .unwrap()
+            .unwrap();
+        assert!(delivered.outstanding_delivered);
+        assert_eq!(delivered.hydrated_epoch, delivered.lifecycle_epoch);
+        assert!(
+            store
+                .control_session("project_b", AdapterKind::Dsh, "session-a")
+                .unwrap()
+                .is_none()
+        );
+        let claim = store
+            .append_agent_claim(
+                "project_a",
+                AdapterKind::Dsh,
+                "session-a",
+                "claim-1",
+                "compatibility_assessment",
+                "README 需要同步主动纠偏合同",
+            )
+            .unwrap();
+        assert_eq!(claim.kind, "compatibility_assessment");
+        assert_eq!(store.list_agent_claims("project_a", 10).unwrap().len(), 1);
+        let invalidated = store
+            .control_session("project_a", AdapterKind::Dsh, "session-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(invalidated.hydrated_epoch, 0);
+        assert!(
+            store
+                .append_agent_claim(
+                    "project_a",
+                    AdapterKind::Dsh,
+                    "session-a",
+                    "claim-1",
+                    "compatibility_assessment",
+                    "different",
+                )
+                .is_err()
+        );
+
+        let resumed = store
+            .open_control_session(
+                "project_a",
+                AdapterKind::Dsh,
+                "session-a",
+                Some("parent"),
+                "subagent",
+                1,
+            )
+            .unwrap();
+        assert_eq!(resumed.lifecycle_epoch, 2);
+        assert_eq!(resumed.hydrated_epoch, 0);
+        assert!(!resumed.outstanding_delivered);
     }
 }

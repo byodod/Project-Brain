@@ -15,7 +15,7 @@ Agent native lifecycle
 project-brain adapter + installer
         │
         ▼
-Internal Hook Protocol v1
+Internal Hook Protocol v2
         │
         ├── brain-core      规则、能力、纯决策
         ├── brain-store     项目级审计与证据状态
@@ -37,13 +37,13 @@ Internal Hook Protocol v1
 内核输入是规范化 `ActionDescriptor`、有效规则、符号解析与可信 Evidence。输出为：
 
 ```text
-allow < allow_with_context < escalate < block
+allow < allow_with_context < escalate < require_review < block
 ```
 
-`block` 的配置合法性由加载阶段强制：
+`require_review` 与 `block` 的配置合法性由加载阶段强制：
 
 ```text
-effect = block
+effect ∈ {require_review, block}
 strength = hard
 authority ∈ {explicit_user, repository_rule, accepted_decision}
 ```
@@ -82,7 +82,10 @@ authority ∈ {explicit_user, repository_rule, accepted_decision}
 
 ### dsh
 
-Project Brain 生成机器托管 bundle source，再通过官方 profile plugin 命令安装。插件订阅 agent pre-step、tools pre/post 与 turn-stopping；工具前返回 deny，停止时使用 agent steer。每个 profile 独立验证 package dependency、bundle 列表和目标哈希。
+Project Brain 生成机器托管 bundle source，再通过官方 profile plugin 命令安装。插件在每个
+`agent/pre-step` 请求主动控制上下文，并订阅 tools pre/post 与 turn-stopping；工具前返回 deny，停止时使用
+agent steer。compact/resume 会提升 lifecycle epoch 并强制重新水合，subagent 记录 parent session 与 delegation
+depth。每个 profile 独立验证 package dependency、bundle 列表和目标哈希。
 
 ## 6. 安装与漂移
 
@@ -98,7 +101,34 @@ Project Brain 生成机器托管 bundle source，再通过官方 profile plugin 
 
 用户级脚本不直接打开项目数据库；它们只调用稳定 launcher。升级替换版本化 payload，Hook 路径不随版本变化。
 
-## 7. Hook 因果链
+## 7. 主动纠偏状态机
+
+```text
+session/compact/subagent
+        ↓
+目标锚点 + 项目上下文 revision 水合
+        ↓
+每个 model pre-step 按需交付 ContextDeliveryReceipt
+        ↓
+PreTool 结构化 ProposedChange
+   ├─ hard block → deny
+   ├─ authorized require_review → 撤回本次工具选择，下一步重规划
+   └─ allow → 保存 proposal + Source baseline
+        ↓
+PostTool 读取完整结果并计算 ObservedChange
+   ├─ 与 proposal 一致 → 正常继续
+   └─ 出现额外路径 → repair_required，暂停无关写入
+        ↓
+Stop 同时要求规则、Evidence、Change Envelope 与 active-control hold 全部闭环
+```
+
+上下文交付回执只证明某 revision 已在模型调用前可见，不是写入许可。上游没有原生 replan seam 时，
+Adapter 以“拒绝当前 mutation + 下一 pre-step 注入”的方式模拟，能力必须报告 `emulated`。
+
+Agent 的 GoalInterpretation、CompatibilityAssessment 和 VerificationClaim 使用 append-only claim ledger；
+它们只能影响后续提示，不能删除记忆、授予 hard authority、豁免规则或将自身声明升级为“已实现”。
+
+## 8. Hook 因果链
 
 工具操作使用：
 
@@ -116,7 +146,7 @@ PostToolUse
 
 PreToolUse 在执行前保存 Source baseline。PostToolUse 对照实际工作区计算精确路径 delta；纯删除、rename、untracked 与无法验证状态都有显式结果。意图描述不能替代实际 diff。
 
-## 8. Evidence 与精准 freshness
+## 9. Evidence 与精准 freshness
 
 Evidence 分为 Source、Semantic、Engine、Build、Test、Runtime 六个中立 plane。名称表达证据层级，不表达具体框架。
 
@@ -132,7 +162,7 @@ Evidence 分为 Source、Semantic、Engine、Build、Test、Runtime 六个中立
 
 查询和 hard consumer 会实时重算输入 manifest。持久化 `fresh` 不是永久授权。
 
-## 9. 外部 Provider
+## 10. 外部 Provider
 
 ### Semantic Provider
 
@@ -165,7 +195,7 @@ Provider 私有 payload 只作为内容寻址 artifact 保存。核心不解析�
 
 独立进程优于动态库：Rust ABI、panic、allocator 和版本漂移不会进入控制面进程。WASI 可作为未来更强隔离后端，但不是 v1 必需条件。
 
-## 10. 外部执行
+## 11. 外部执行
 
 所有受治理子进程经过统一 execution layer，具备：
 
@@ -178,7 +208,7 @@ Provider 私有 payload 只作为内容寻址 artifact 保存。核心不解析�
 
 这提供进程树 containment，不等于网络隔离、文件系统虚拟化或恶意代码沙箱。仓库控制的 build/test code 和本地 Provider executable 必须显式信任。
 
-## 11. 存储
+## 12. 存储
 
 SQLite schema 采用单调前向迁移。关键数据：
 
@@ -191,11 +221,11 @@ SQLite schema 采用单调前向迁移。关键数据：
 
 快照更新事务化，消失符号变为 removed 而非物理删除。危险历史清理由显式 request、revision CAS、不可覆盖备份和重放验证保护。
 
-## 12. Production Qualification
+## 13. Production Qualification
 
 Qualification 以当前二进制哈希、数据库 schema、协议合同与目标平台形成 target hash。Q1-Q7 验证 adapter、隔离、幂等、规则权限、Provider 失败关闭、数据库恢复和安装路径。证明保存在机器级状态，不污染项目数据库。
 
-## 13. Non-goals
+## 14. Non-goals
 
 - Agent 自主决定何时读取长期记忆；
 - 通用聊天记录 RAG；

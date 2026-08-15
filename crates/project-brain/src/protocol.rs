@@ -9,9 +9,10 @@ use brain_core::{
 };
 use brain_evidence::{EvidenceFreshness, EvidencePlane};
 use brain_store::{
-    BrainStore, EvidenceHeadIdentity, EvidenceHeadTransition, EvidenceImpactPlan,
-    SemanticResolutionKind, SemanticSourceTrust,
+    BrainStore, ControlSessionState, EvidenceHeadIdentity, EvidenceHeadTransition,
+    EvidenceImpactPlan, SemanticResolutionKind, SemanticSourceTrust,
 };
+use sha2::{Digest, Sha256};
 
 use crate::evidence::{CurrentSourceVerification, effective_evidence_freshness_v2};
 use crate::provider::ProviderTrustStatus;
@@ -26,6 +27,10 @@ const SOURCE_BOUND_EVIDENCE_PLANES: [EvidencePlane; 6] = [
     EvidencePlane::Runtime,
 ];
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Hook v2 的事件状态机在单一入口保持事件到结果的可审计映射"
+)]
 pub fn process(
     root: &Path,
     config: &BrainConfig,
@@ -35,11 +40,24 @@ pub fn process(
 ) -> Result<InternalHookOutcome, AppError> {
     event.validate()?;
     let payload = match &event.payload {
-        HookEventPayload::SessionOpened(_) => {
+        HookEventPayload::SessionOpened(opened) => {
+            let _ = store.open_control_session(
+                &config.project_key,
+                event.adapter.kind,
+                &event.session_key,
+                opened.parent_session_key.as_deref(),
+                session_origin_name(opened.origin),
+                opened.delegation_depth,
+            )?;
+            let state = store.sync_control_context(
+                &config.project_key,
+                event.adapter.kind,
+                &event.session_key,
+                &project_context_digest(config)?,
+            )?;
             let current_source = CurrentSourceVerification::inspect(root);
-            let mut inject = vec![ContextItem {
-                text: session_context(config),
-            }];
+            let mut inject = control_context_items(config, &state);
+            inject.extend(agent_claim_context(store, &config.project_key)?);
             inject.extend(evidence_context(
                 root,
                 store,
@@ -47,16 +65,89 @@ pub fn process(
                 &current_source,
                 true,
             )?);
+            mark_context_delivery(store, event, &inject)?;
             HookOutcomePayload::SessionOpened { inject }
         }
-        HookEventPayload::IntentDeclared(_) => {
+        HookEventPayload::IntentDeclared(intent) => {
+            let goal_digest = digest_parts(&[b"project-brain/raw-goal/v1", intent.text.as_bytes()]);
+            let _ = store.declare_control_goal(
+                &config.project_key,
+                event.adapter.kind,
+                &event.session_key,
+                &intent.text,
+                &goal_digest,
+            )?;
+            let state = store.sync_control_context(
+                &config.project_key,
+                event.adapter.kind,
+                &event.session_key,
+                &project_context_digest(config)?,
+            )?;
             let current_source = CurrentSourceVerification::inspect(root);
+            let mut inject = control_context_items(config, &state);
+            inject.extend(agent_claim_context(store, &config.project_key)?);
+            inject.extend(evidence_context(
+                root,
+                store,
+                &config.project_key,
+                &current_source,
+                false,
+            )?);
+            mark_context_delivery(store, event, &inject)?;
             HookOutcomePayload::IntentDeclared {
                 gate: GateDecision::NoVeto,
-                inject: evidence_context(root, store, &config.project_key, &current_source, false)?,
+                inject,
             }
         }
+        HookEventPayload::ContextRequested(_) => {
+            let state = store.sync_control_context(
+                &config.project_key,
+                event.adapter.kind,
+                &event.session_key,
+                &project_context_digest(config)?,
+            )?;
+            if !control_delivery_needed(&state) {
+                return Ok(InternalHookOutcome {
+                    protocol_version: HOOK_PROTOCOL_VERSION,
+                    event_id: event.event_id.clone(),
+                    payload: HookOutcomePayload::ContextRequested { inject: Vec::new() },
+                });
+            }
+            let current_source = CurrentSourceVerification::inspect(root);
+            let mut inject = control_context_items(config, &state);
+            inject.extend(agent_claim_context(store, &config.project_key)?);
+            inject.extend(evidence_context(
+                root,
+                store,
+                &config.project_key,
+                &current_source,
+                false,
+            )?);
+            mark_context_delivery(store, event, &inject)?;
+            HookOutcomePayload::ContextRequested { inject }
+        }
         HookEventPayload::ToolAboutToRun(tool) => {
+            let state = store.sync_control_context(
+                &config.project_key,
+                event.adapter.kind,
+                &event.session_key,
+                &project_context_digest(config)?,
+            )?;
+            if state.outstanding_kind.as_deref() == Some("repair_required")
+                && !action_addresses_repair(&tool.action, state.outstanding_json.as_deref())
+            {
+                let inject = control_context_items(config, &state);
+                return Ok(InternalHookOutcome {
+                    protocol_version: HOOK_PROTOCOL_VERSION,
+                    event_id: event.event_id.clone(),
+                    payload: HookOutcomePayload::ToolAboutToRun {
+                        gate: GateDecision::Replan {
+                            reason: "存在尚未由实际 diff 证明修复的偏差；当前写入与修复范围无关，必须先纠偏".to_owned(),
+                        },
+                        inject,
+                    },
+                });
+            }
             let decision = evaluate_action(
                 root,
                 config,
@@ -75,41 +166,107 @@ pub fn process(
                 &current_source,
                 false,
             )?);
-            if matches!(
-                decision.decision,
-                DecisionKind::Allow | DecisionKind::AllowWithContext
-            ) && pre_action_may_mutate_source(&tool.action)
-                && let Ok(source_state) = git::worktree_source_state(root)
-            {
-                let source_state_json = serde_json::to_string(&source_state)?;
-                store.record_source_operation_baseline(
+            let proposal_digest = action_proposal_digest(&tool.action)?;
+            let gate = if decision.decision == DecisionKind::RequireReview {
+                if delivered_replan_matches(&state, &proposal_digest) {
+                    store.clear_control_hold(
+                        &config.project_key,
+                        event.adapter.kind,
+                        &event.session_key,
+                    )?;
+                    GateDecision::NoVeto
+                } else {
+                    let hold = serde_json::json!({
+                        "schema_version": 1,
+                        "proposal_digest": proposal_digest,
+                        "target_files": tool.action.target_files,
+                        "decision": decision,
+                        "instruction": "撤回本次写入选择；在下一模型步骤吸收约束后重新提出变更"
+                    });
+                    store.set_control_hold(
+                        &config.project_key,
+                        event.adapter.kind,
+                        &event.session_key,
+                        "replan",
+                        &serde_json::to_string(&hold)?,
+                    )?;
+                    let state = store
+                        .control_session(
+                            &config.project_key,
+                            event.adapter.kind,
+                            &event.session_key,
+                        )?
+                        .ok_or_else(|| AppError::Provider("控制会话丢失".to_owned()))?;
+                    inject = control_context_items(config, &state);
+                    if event.adapter.kind != brain_core::AdapterKind::Dsh {
+                        mark_context_delivery(store, event, &inject)?;
+                    }
+                    GateDecision::Replan {
+                        reason: decision_reason(&decision),
+                    }
+                }
+            } else {
+                gate_from_decision(&decision)
+            };
+            if matches!(gate, GateDecision::NoVeto) && pre_action_may_mutate_source(&tool.action) {
+                store.record_control_change_proposal(
                     &config.project_key,
                     event.adapter.kind,
                     &event.session_key,
                     &tool.operation_id,
-                    &event.event_id,
-                    &source_state.fingerprint,
-                    &source_state_json,
+                    &proposal_digest,
+                    &serde_json::to_string(&tool.action)?,
                 )?;
+                if let Ok(source_state) = git::worktree_source_state(root) {
+                    let source_state_json = serde_json::to_string(&source_state)?;
+                    store.record_source_operation_baseline(
+                        &config.project_key,
+                        event.adapter.kind,
+                        &event.session_key,
+                        &tool.operation_id,
+                        &event.event_id,
+                        &source_state.fingerprint,
+                        &source_state_json,
+                    )?;
+                }
             }
-            HookOutcomePayload::ToolAboutToRun {
-                gate: gate_from_decision(&decision),
-                inject,
-            }
+            HookOutcomePayload::ToolAboutToRun { gate, inject }
         }
         HookEventPayload::ToolFinished(tool) => {
             tool_finished_payload(root, config, store, provider_trust, event, tool)?
         }
         HookEventPayload::TaskStopping(stopping) => {
             let current_source = CurrentSourceVerification::inspect(root);
-            let (stop, mut feedback) = stop_decision(
-                root,
-                config,
-                store,
-                provider_trust,
-                &current_source,
-                stopping.vendor_loop_active,
-            );
+            let control = store.control_session(
+                &config.project_key,
+                event.adapter.kind,
+                &event.session_key,
+            )?;
+            let (stop, mut feedback) = if !stopping.vendor_loop_active
+                && let Some(state) = control
+                && let Some(kind) = state.outstanding_kind
+            {
+                (
+                    StopDecision::ContinueWork {
+                        reason: format!(
+                            "Project Brain active-control 尚未闭环：{kind}。必须先处理已交付的纠偏状态并用实际 diff/验证证明完成。"
+                        ),
+                    },
+                    vec![FeedbackItem {
+                        severity: FeedbackSeverity::Error,
+                        text: state.outstanding_json.unwrap_or_default(),
+                    }],
+                )
+            } else {
+                stop_decision(
+                    root,
+                    config,
+                    store,
+                    provider_trust,
+                    &current_source,
+                    stopping.vendor_loop_active,
+                )
+            };
             feedback.extend(evidence_feedback(
                 root,
                 store,
@@ -144,6 +301,7 @@ fn tool_finished_payload(
         &tool.tool_name,
     )?;
     let mut feedback = feedback_from_decision(&decision);
+    reconcile_observed_change(root, config, store, event, tool, &mut feedback)?;
     if let Some(plan) = evidence_impact_plan(root, store, &config.project_key, event, tool)? {
         let result = store.apply_evidence_impact_plan(&config.project_key, &plan)?;
         if result.heads_marked > 0 {
@@ -194,6 +352,161 @@ fn opaque_action_may_mutate_source(action: &ToolAction) -> bool {
 fn pre_action_may_mutate_source(action: &ToolAction) -> bool {
     explicit_mutation(action)
         || matches!(action.kind, ActionKind::Execute | ActionKind::GitOperation)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "ObservedChange 必须线性呈现提案、基线、hold 与反馈的完整闭环"
+)]
+fn reconcile_observed_change(
+    root: &Path,
+    config: &BrainConfig,
+    store: &BrainStore,
+    event: &InternalHookEvent,
+    tool: &brain_core::ToolFinished,
+    feedback: &mut Vec<FeedbackItem>,
+) -> Result<(), AppError> {
+    if tool.status == brain_core::ToolStatus::Failed || !pre_action_may_mutate_source(&tool.action)
+    {
+        return Ok(());
+    }
+    let state = store.ensure_control_session(
+        &config.project_key,
+        event.adapter.kind,
+        &event.session_key,
+    )?;
+    let Some(stored_proposal) = store.control_change_proposal(
+        &config.project_key,
+        event.adapter.kind,
+        &event.session_key,
+        &tool.operation_id,
+    )?
+    else {
+        let hold = serde_json::json!({
+            "schema_version": 1,
+            "operation_id": tool.operation_id,
+            "tool_name": tool.tool_name,
+            "reason": "缺少与本次 PostTool 对应的已放行 PreTool 变更提案",
+            "declared_targets": mutation_paths(&tool.action),
+            "result_digest": tool.result_digest,
+        });
+        store.set_control_hold(
+            &config.project_key,
+            event.adapter.kind,
+            &event.session_key,
+            "verify_required",
+            &serde_json::to_string(&hold)?,
+        )?;
+        feedback.push(FeedbackItem {
+            severity: FeedbackSeverity::Warning,
+            text: "Project Brain 缺少对应的 PreTool 提案；已进入 verify_required。".to_owned(),
+        });
+        return Ok(());
+    };
+    let proposed_action = serde_json::from_str::<ToolAction>(&stored_proposal.action_json)
+        .map_err(|error| AppError::Provider(format!("持久化变更提案 JSON 已损坏：{error}")))?;
+    let Some(observed) = observed_change_paths(root, store, event, tool)? else {
+        let hold = serde_json::json!({
+            "schema_version": 1,
+            "operation_id": tool.operation_id,
+            "tool_name": tool.tool_name,
+            "reason": "无法取得可靠的 PreTool Source baseline，实际影响范围需要验证",
+            "declared_targets": mutation_paths(&proposed_action),
+            "result_digest": tool.result_digest,
+        });
+        store.set_control_hold(
+            &config.project_key,
+            event.adapter.kind,
+            &event.session_key,
+            "verify_required",
+            &serde_json::to_string(&hold)?,
+        )?;
+        feedback.push(FeedbackItem {
+            severity: FeedbackSeverity::Warning,
+            text: "Project Brain 无法可靠计算本次实际 diff；已进入 verify_required，停止前必须补充验证证据。".to_owned(),
+        });
+        return Ok(());
+    };
+    let expected = proposed_action.proposed_change.as_ref().map_or_else(
+        || mutation_paths(&proposed_action),
+        |proposal| proposal.target_files.clone(),
+    );
+    let unexpected = observed
+        .iter()
+        .filter(|path| {
+            !expected
+                .iter()
+                .any(|target| path_has_prefix(path, target) || path_has_prefix(target, path))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        let hold = serde_json::json!({
+            "schema_version": 1,
+            "operation_id": tool.operation_id,
+            "tool_name": tool.tool_name,
+            "proposal_digest": stored_proposal.proposal_digest,
+            "expected_paths": expected,
+            "observed_paths": observed,
+            "unexpected_paths": unexpected,
+            "result_digest": tool.result_digest,
+            "instruction": "检查实际 diff，撤销或正式纳入超出提案范围的变更"
+        });
+        store.set_control_hold(
+            &config.project_key,
+            event.adapter.kind,
+            &event.session_key,
+            "repair_required",
+            &serde_json::to_string(&hold)?,
+        )?;
+        feedback.push(FeedbackItem {
+            severity: FeedbackSeverity::Error,
+            text: format!(
+                "Project Brain 检测到提案之外的实际变更：{}。已暂停无关写入，下一模型步骤必须先修复。",
+                unexpected.join(", ")
+            ),
+        });
+    } else if state.outstanding_kind.as_deref() == Some("repair_required")
+        && action_addresses_repair(&proposed_action, state.outstanding_json.as_deref())
+    {
+        store.clear_control_hold(&config.project_key, event.adapter.kind, &event.session_key)?;
+        feedback.push(FeedbackItem {
+            severity: FeedbackSeverity::Info,
+            text: "Project Brain 已用本次实际 diff 确认修复范围未再外溢，repair_required 已解除。"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn observed_change_paths(
+    root: &Path,
+    store: &BrainStore,
+    event: &InternalHookEvent,
+    tool: &brain_core::ToolFinished,
+) -> Result<Option<Vec<String>>, AppError> {
+    let Some(baseline) = store.source_operation_baseline(
+        &event.project_key,
+        event.adapter.kind,
+        &event.session_key,
+        &tool.operation_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    let before = serde_json::from_str::<git::WorktreeSourceState>(&baseline.source_state_json)
+        .map_err(|error| {
+            AppError::Provider(format!("Source operation baseline JSON 已损坏：{error}"))
+        })?;
+    if before.fingerprint != baseline.source_fingerprint {
+        return Err(AppError::Provider(
+            "Source operation baseline fingerprint 与状态内容不一致".to_owned(),
+        ));
+    }
+    let after = git::worktree_source_state(root)?;
+    Ok(Some(
+        git::SourceDeltaV1::between(&before, &after).changed_paths(),
+    ))
 }
 
 #[allow(
@@ -346,6 +659,51 @@ fn mutation_paths(action: &ToolAction) -> Vec<String> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn action_proposal_digest(action: &ToolAction) -> Result<String, AppError> {
+    if let Some(proposal) = &action.proposed_change {
+        return Ok(proposal.proposal_digest.clone());
+    }
+    let canonical = serde_json::to_vec(action)?;
+    Ok(digest_parts(&[
+        b"project-brain/action-proposal/v1",
+        &canonical,
+    ]))
+}
+
+fn delivered_replan_matches(state: &ControlSessionState, proposal_digest: &str) -> bool {
+    if state.outstanding_kind.as_deref() != Some("replan") || !state.outstanding_delivered {
+        return false;
+    }
+    state
+        .outstanding_json
+        .as_deref()
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .and_then(|payload| {
+            payload
+                .get("proposal_digest")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .is_some_and(|digest| digest == proposal_digest)
+}
+
+fn action_addresses_repair(action: &ToolAction, payload: Option<&str>) -> bool {
+    if !explicit_mutation(action) {
+        return false;
+    }
+    let repair_paths = payload
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .and_then(|payload| payload.get("unexpected_paths").cloned())
+        .and_then(|paths| serde_json::from_value::<Vec<String>>(paths).ok())
+        .unwrap_or_default();
+    !repair_paths.is_empty()
+        && mutation_paths(action).iter().any(|target| {
+            repair_paths
+                .iter()
+                .any(|repair| path_has_prefix(target, repair) || path_has_prefix(repair, target))
+        })
 }
 
 fn evidence_context(
@@ -610,6 +968,8 @@ fn evaluate_symbol_rules(
     }
     let decision = if hard_effects.contains(&RuleEffect::Block) {
         DecisionKind::Block
+    } else if hard_effects.contains(&RuleEffect::RequireReview) {
+        DecisionKind::RequireReview
     } else if hard_effects.contains(&RuleEffect::Escalate) {
         DecisionKind::Escalate
     } else if !context.is_empty() {
@@ -675,13 +1035,15 @@ fn merge_decisions(mut left: Decision, right: Decision) -> Decision {
             DecisionKind::Allow => 0,
             DecisionKind::AllowWithContext => 1,
             DecisionKind::Escalate => 2,
-            DecisionKind::Block => 3,
+            DecisionKind::RequireReview => 3,
+            DecisionKind::Block => 4,
         })
         .unwrap_or(DecisionKind::Allow);
     match left.decision {
         DecisionKind::Allow => "未命中需要改变行为的规则",
         DecisionKind::AllowWithContext => "允许执行，并注入相关项目约束",
         DecisionKind::Escalate => "需要显式决策后再继续",
+        DecisionKind::RequireReview => "执行前必须重新规划并显式吸收相关项目约束",
         DecisionKind::Block => "命中具备确定性证据的硬规则，拒绝执行",
     }
     .clone_into(&mut left.summary);
@@ -689,20 +1051,22 @@ fn merge_decisions(mut left: Decision, right: Decision) -> Decision {
 }
 
 fn gate_from_decision(decision: &Decision) -> GateDecision {
-    if matches!(
-        decision.decision,
-        DecisionKind::Block | DecisionKind::Escalate
-    ) {
-        GateDecision::Deny {
+    match decision.decision {
+        DecisionKind::Block | DecisionKind::Escalate => GateDecision::Deny {
             reason: decision_reason(decision),
-        }
-    } else {
-        GateDecision::NoVeto
+        },
+        DecisionKind::RequireReview => GateDecision::Replan {
+            reason: decision_reason(decision),
+        },
+        DecisionKind::Allow | DecisionKind::AllowWithContext => GateDecision::NoVeto,
     }
 }
 
 fn context_from_decision(decision: &Decision) -> Vec<ContextItem> {
-    if decision.decision == DecisionKind::AllowWithContext {
+    if matches!(
+        decision.decision,
+        DecisionKind::AllowWithContext | DecisionKind::RequireReview
+    ) {
         vec![ContextItem {
             text: decision_reason(decision),
         }]
@@ -718,13 +1082,22 @@ fn feedback_from_decision(decision: &Decision) -> Vec<FeedbackItem> {
             severity: FeedbackSeverity::Info,
             text: decision_reason(decision),
         }],
-        DecisionKind::Block | DecisionKind::Escalate => vec![FeedbackItem {
-            severity: FeedbackSeverity::Error,
+        DecisionKind::RequireReview => vec![FeedbackItem {
+            severity: FeedbackSeverity::Info,
             text: format!(
-                "操作已经执行，无法撤销其副作用；Project Brain 检测到：{}",
+                "操作已在 Project Brain 重规划交付后执行：{}",
                 decision_reason(decision)
             ),
         }],
+        DecisionKind::Block | DecisionKind::Escalate => {
+            vec![FeedbackItem {
+                severity: FeedbackSeverity::Error,
+                text: format!(
+                    "操作已经执行，无法撤销其副作用；Project Brain 检测到：{}",
+                    decision_reason(decision)
+                ),
+            }]
+        }
     }
 }
 
@@ -889,7 +1262,7 @@ fn evaluate_finding_stop(
                     severity: FeedbackSeverity::Info,
                     text: format!("{}：{}", mapping.message, finding.message),
                 }),
-                RuleEffect::Block | RuleEffect::Escalate => {
+                RuleEffect::Block | RuleEffect::RequireReview | RuleEffect::Escalate => {
                     if head
                         .snapshot
                         .finding_can_hard_block(finding, effective.freshness, true)
@@ -1056,6 +1429,119 @@ fn session_context(config: &BrainConfig) -> String {
         "Project Brain 已加载项目 {}（project_key={}）。当前有效规则：\n{}",
         config.project_name, config.project_key, active_rules
     )
+}
+
+fn project_context_digest(config: &BrainConfig) -> Result<String, AppError> {
+    let canonical = serde_json::to_vec(&(
+        &config.project_key,
+        &config.project_name,
+        config
+            .rules
+            .iter()
+            .filter(|rule| rule.status == MemoryStatus::Active)
+            .collect::<Vec<_>>(),
+        &config.stop_reconcile,
+    ))?;
+    Ok(digest_parts(&[
+        b"project-brain/project-context/v1",
+        &canonical,
+    ]))
+}
+
+fn control_delivery_needed(state: &ControlSessionState) -> bool {
+    state.hydrated_epoch != state.lifecycle_epoch
+        || (state.outstanding_kind.is_some() && !state.outstanding_delivered)
+}
+
+fn control_context_items(config: &BrainConfig, state: &ControlSessionState) -> Vec<ContextItem> {
+    let mut sections = vec![format!(
+        "[Project Brain active control]\n目标版本={}，项目上下文版本={}，生命周期={}。\n{}\n\n若发现值得保留的项目事实，可用 `project-brain claims submit` 追加结构化声明；声明不可删除，也不能授权规则、豁免约束或证明功能已实现。完成状态只接受实际 diff 与验证证据。",
+        state.goal_revision,
+        state.context_revision,
+        state.lifecycle_epoch,
+        session_context(config)
+    )];
+    if let Some(goal) = state.raw_goal.as_deref() {
+        sections.push(format!(
+            "当前原始用户目标（高权限事实，不得由 Agent 自行改写或宣称完成）：\n{goal}"
+        ));
+    }
+    if let (Some(kind), Some(payload)) = (
+        state.outstanding_kind.as_deref(),
+        state.outstanding_json.as_deref(),
+    ) {
+        sections.push(format!(
+            "当前必须处理的纠偏状态 kind={kind}。在继续无关写入或宣布完成前，必须按以下结构化事实重规划、修复并用实际 diff/验证证明已解决：\n{payload}"
+        ));
+    }
+    vec![ContextItem {
+        text: sections.join("\n\n"),
+    }]
+}
+
+fn agent_claim_context(
+    store: &BrainStore,
+    project_key: &str,
+) -> Result<Vec<ContextItem>, AppError> {
+    let claims = store.list_agent_claims(project_key, 8)?;
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
+    let text = claims
+        .iter()
+        .map(|claim| {
+            format!(
+                "- [{}] {} (claim_id={}, authority=agent_claim_only)",
+                claim.kind, claim.content, claim.claim_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(vec![ContextItem {
+        text: format!(
+            "最近的 Agent 项目声明（仅用于方向提示，不得据此阻断、豁免或判断已实现）：\n{text}"
+        ),
+    }])
+}
+
+fn mark_context_delivery(
+    store: &BrainStore,
+    event: &InternalHookEvent,
+    inject: &[ContextItem],
+) -> Result<(), AppError> {
+    if inject.is_empty() {
+        return Ok(());
+    }
+    let text = inject
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    store.mark_control_delivered(
+        &event.project_key,
+        event.adapter.kind,
+        &event.session_key,
+        &digest_parts(&[b"project-brain/context-delivery/v1", text.as_bytes()]),
+    )?;
+    Ok(())
+}
+
+const fn session_origin_name(origin: brain_core::SessionOrigin) -> &'static str {
+    match origin {
+        brain_core::SessionOrigin::Interactive => "interactive",
+        brain_core::SessionOrigin::Subagent => "subagent",
+        brain_core::SessionOrigin::RuntimeContinuation => "runtime_continuation",
+        brain_core::SessionOrigin::Unknown => "unknown",
+    }
+}
+
+fn digest_parts(parts: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part);
+    }
+    format!("sha256_{:x}", digest.finalize())
 }
 
 #[cfg(test)]
@@ -1353,6 +1839,7 @@ mod tests {
                 whole_file: true,
                 ranges: Vec::new(),
             }],
+            proposed_change: None,
         };
         let decision = evaluate_symbol_rules(
             &root,
@@ -1384,6 +1871,7 @@ mod tests {
             target_files: vec!["src/lib.rs".to_owned()],
             command: None,
             deterministic_impacts: Vec::new(),
+            proposed_change: None,
         };
         let decision = evaluate_symbol_rules(
             &root,
@@ -1412,6 +1900,7 @@ mod tests {
                 whole_file: true,
                 ranges: Vec::new(),
             }],
+            proposed_change: None,
         };
         let decision = evaluate_symbol_rules(
             &root,

@@ -199,6 +199,34 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+
+    /// 追加或查看 Agent 提交的低权限项目声明；没有删除或“标记已实现”入口
+    Claims {
+        #[command(subcommand)]
+        command: ClaimsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClaimsCommand {
+    /// 追加 `GoalInterpretation`、`CompatibilityAssessment` 或 `VerificationClaim`
+    Submit {
+        #[arg(long, value_enum)]
+        agent: AgentKind,
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        claim_id: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        content: String,
+    },
+    /// 查看最近的 append-only Agent 声明
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1166,6 +1194,16 @@ fn main() -> ExitCode {
         } => App::open(cli.project_root)
             .and_then(|app| app.symbols(path.as_deref(), include_removed, limit)),
         Command::Audit { limit } => App::open(cli.project_root).and_then(|app| app.audit(limit)),
+        Command::Claims { command } => App::open(cli.project_root).and_then(|app| match command {
+            ClaimsCommand::Submit {
+                agent,
+                session,
+                claim_id,
+                kind,
+                content,
+            } => app.submit_agent_claim(agent, &session, &claim_id, &kind, &content),
+            ClaimsCommand::List { limit } => app.agent_claims(limit),
+        }),
     };
 
     match result {

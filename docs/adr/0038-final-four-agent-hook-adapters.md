@@ -14,7 +14,7 @@ Project Brain 的价值来自强制经过的生命周期控制面，而不是不
 ## 决策
 
 1. 最终内建范围固定为 Codex、Pi、OpenCode、dsh；
-2. 四者共享 `InternalHookEvent/Outcome v1`，但保留独立 identity、版本、幂等域和原生输出；
+2. 四者共享内部 Hook 协议（最初为 v1，当前由 ADR-0040 升级为 v2），但保留独立 identity、版本、幂等域和原生输出；
 3. Codex 使用用户级 hooks 中由 Project Brain 自有并精确哈希的 groups（不是企业 managed hooks）；
    Pi/OpenCode 使用用户级 Extension/Plugin 独占文件；dsh 使用显式 profile 官方 plugin bundle 命令；
 4. Pre-tool 内部故障一律失败关闭；其它事件以 degraded feedback 暴露；

@@ -132,14 +132,15 @@ pub(crate) fn adapter_failure_output(
                 }
             }
         })),
-        HookEvent::SessionStart | HookEvent::UserPromptSubmit | HookEvent::PostToolUse => {
-            ExtensionHookOutput(json!({
-                "schema_version": 1,
-                "event": event_name(event),
-                "degraded": true,
-                "feedback": [reason]
-            }))
-        }
+        HookEvent::SessionStart
+        | HookEvent::UserPromptSubmit
+        | HookEvent::PreStep
+        | HookEvent::PostToolUse => ExtensionHookOutput(json!({
+            "schema_version": 1,
+            "event": event_name(event),
+            "degraded": true,
+            "feedback": [reason]
+        })),
     }
 }
 
@@ -148,6 +149,11 @@ fn map_outcome(outcome: &InternalHookOutcome, continuation_supported: bool) -> E
         HookOutcomePayload::SessionOpened { inject } => json!({
             "schema_version": 1,
             "event": "session_opened",
+            "context": context_text(inject)
+        }),
+        HookOutcomePayload::ContextRequested { inject } => json!({
+            "schema_version": 1,
+            "event": "context_requested",
             "context": context_text(inject)
         }),
         HookOutcomePayload::IntentDeclared { gate, inject } => {
@@ -198,6 +204,14 @@ fn gate_output(event: &str, gate: &GateDecision, context: &[&str]) -> Value {
             "reason": reason,
             "context": context
         }),
+        GateDecision::Replan { reason } => json!({
+            "schema_version": 1,
+            "event": event,
+            "block": true,
+            "replan": true,
+            "reason": reason,
+            "context": context
+        }),
     }
 }
 
@@ -209,6 +223,7 @@ const fn event_name(event: HookEvent) -> &'static str {
     match event {
         HookEvent::SessionStart => "session_opened",
         HookEvent::UserPromptSubmit => "intent_declared",
+        HookEvent::PreStep => "context_requested",
         HookEvent::PreToolUse => "tool_about_to_run",
         HookEvent::PostToolUse => "tool_finished",
         HookEvent::Stop => "task_stopping",

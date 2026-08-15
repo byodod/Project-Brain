@@ -8,11 +8,11 @@ pub use engine::RuleEngine;
 pub use error::CoreError;
 pub use hook::{
     AdapterCapabilities, AdapterIdentity, AdapterKind, CapabilitySupport, ContextItem,
-    EventIdentityQuality, FeedbackItem, FeedbackSeverity, GateDecision, HOOK_PROTOCOL_VERSION,
-    HookEventKind, HookEventPayload, HookOutcomePayload, IdempotencyMetadata, IntentDeclared,
-    IntentOrigin, InternalHookEvent, InternalHookOutcome, SessionOpenReason, SessionOpened,
-    StopDecision, TaskStopping, ToolAboutToRun, ToolAction, ToolFinished, ToolImpact,
-    ToolLineRange, ToolStatus,
+    ContextRequested, EventIdentityQuality, FeedbackItem, FeedbackSeverity, GateDecision,
+    HOOK_PROTOCOL_VERSION, HookEventKind, HookEventPayload, HookOutcomePayload,
+    IdempotencyMetadata, IntentDeclared, IntentOrigin, InternalHookEvent, InternalHookOutcome,
+    ProposedChange, SessionOpenReason, SessionOpened, SessionOrigin, StopDecision, TaskStopping,
+    ToolAboutToRun, ToolAction, ToolFinished, ToolImpact, ToolLineRange, ToolStatus,
 };
 pub use model::{
     ActionDescriptor, ActionKind, Authority, BrainConfig, CURRENT_SCHEMA_VERSION, Decision,

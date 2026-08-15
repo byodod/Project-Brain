@@ -2,7 +2,7 @@
 
 ## 状态
 
-Accepted；四适配器最终范围由 ADR-0038 固定。
+Superseded by ADR-0040；四适配器最终范围仍由 ADR-0038 固定。
 
 ## 背景
 

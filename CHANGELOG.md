@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- Internal Hook Protocol v2 与 active-control 状态机：每步按 revision/epoch 主动恢复目标上下文，
+  compact/resume 重新水合，subagent 保存 parent/delegation identity。
+- `require_review` 规则效果、持久化变更提案、PostTool 实际 Source delta 匹配，以及
+  `replan`、`repair_required`、`verify_required` 纠偏闭环。
+- append-only Agent claim ledger 与 `project-brain claims submit/list`；声明只有低权限，不能删除、
+  豁免规则或标记已实现。
+
+### Changed
+
+- dsh Plugin 在每个 `agent/pre-step` 请求按需控制上下文，工具后传递有界完整结果；能力合同细分为
+  pre-model context、native replan、compact rehydrate、subagent lineage 等真实宿主 seam。
+- SQLite schema 升级为 v21，加入项目隔离的控制会话、放行提案和 Agent claim 表。
+
 ## [0.2.3] - 2026-08-15
 
 ### Fixed

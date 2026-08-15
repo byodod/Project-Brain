@@ -10,7 +10,9 @@ Project Brain 是面向 Coding Agent 的确定性项目决策与长期记忆控�
 ## 为什么使用 Project Brain
 
 - 在 Agent 执行工具之前强制检查仓库规则，而不是依赖模型主动检索记忆；
+- 在每个可用的模型步骤恢复目标锚点与待处理纠偏状态，compact/resume/subagent 后重新水合；
 - 以实际工具输入、Git 变更和 Evidence 为准，不把 Agent 的文字意图当作事实；
+- 将结构化写入提案与工具后的真实 Source delta 对比，发现外溢后暂停无关写入并要求修复；
 - 只有明确、受信且可验证的规则可以阻断操作；
 - 所有状态按 `project_key` 隔离，可审计、可重放；
 - 核心不绑定语言、IDE、游戏引擎或应用框架，专用能力通过 Provider 扩展。
@@ -19,12 +21,12 @@ Project Brain 是面向 Coding Agent 的确定性项目决策与长期记忆控�
 
 Project Brain `v0.2.3` 正式支持四个 Agent 接入：
 
-| Agent | 接入方式 | 工具前阻断 | 工具后反馈 | Stop 续轮 |
-|---|---|---:|---:|---:|
-| Codex | 用户级 `hooks.json` | 支持 | 支持 | 支持 |
-| Pi | 用户级 Extension | 支持 | 支持 | 模拟（最多一次） |
-| OpenCode | 用户级 Plugin | 支持 | 支持 | 不支持 |
-| dsh | 显式 profile Plugin bundle | 支持 | 支持 | 支持 |
+| Agent | 接入方式 | 模型前主动上下文 | 工具前阻断 | 工具后反馈 | Stop 续轮 |
+|---|---|---:|---:|---:|---:|
+| Codex | 用户级 `hooks.json` | 不支持 | 支持 | 支持 | 支持 |
+| Pi | 用户级 Extension | 不支持 | 支持 | 支持 | 模拟（最多一次） |
+| OpenCode | 用户级 Plugin | 不支持 | 支持 | 支持 | 不支持 |
+| dsh | 显式 profile Plugin bundle | 支持 | 支持 | 支持 | 支持 |
 
 能力不对称是上游生命周期协议的事实。使用以下命令查看机器可读能力，不支持的能力不会被伪装成支持：
 
@@ -114,9 +116,19 @@ Agent。它要求 AI 只安装当前需要的接入，并保留已有 Project Br
 }
 ```
 
-决策状态为 `allow`、`allow_with_context`、`escalate`、`block`，优先级依次提高。只有
-`strength=hard` 且 authority 为 `explicit_user`、`repository_rule` 或 `accepted_decision` 的规则才有
-阻断资格。完整执行模型见 [架构说明](docs/architecture.md) 和 [协议说明](docs/protocol.md)。
+决策状态为 `allow`、`allow_with_context`、`escalate`、`require_review`、`block`。
+`require_review` 会撤回当前变更选择，在下一模型步骤交付目标相关约束后，才允许重新提出相同提案。
+只有 `strength=hard` 且 authority 为 `explicit_user`、`repository_rule` 或 `accepted_decision` 的规则
+可以配置 `require_review` 或 `block`。
+
+Agent 可以用 `project-brain claims submit` 追加 `GoalInterpretation`、`CompatibilityAssessment` 等声明；
+这些记录不可删除、只有低权限，不能豁免规则或由 Agent 自行标记“已实现”。完整执行模型见
+[架构说明](docs/architecture.md) 和 [协议说明](docs/protocol.md)。
+
+```text
+project-brain claims submit --agent dsh --session <session-id> --claim-id <unique-id> --kind compatibility_assessment --content <structured-summary>
+project-brain claims list --limit 20
+```
 
 ## 安全边界
 

@@ -143,12 +143,14 @@ impl FindingEffectMapping {
                 reason: "message 为空或过长".to_owned(),
             });
         }
-        if matches!(self.effect, RuleEffect::Block | RuleEffect::Escalate)
-            && (self.strength != RuleStrength::Hard || !self.authority.can_block())
+        if matches!(
+            self.effect,
+            RuleEffect::Block | RuleEffect::RequireReview | RuleEffect::Escalate
+        ) && (self.strength != RuleStrength::Hard || !self.authority.can_block())
         {
             return Err(CoreError::InvalidFindingEffectMapping {
                 mapping_id: self.id.clone(),
-                reason: "Block/Escalate 只允许 hard 且 authority 为 explicit_user、repository_rule 或 accepted_decision 的映射".to_owned(),
+                reason: "Block/RequireReview/Escalate 只允许 hard 且 authority 为 explicit_user、repository_rule 或 accepted_decision 的映射".to_owned(),
             });
         }
         Ok(())
@@ -465,12 +467,12 @@ impl Rule {
                 reason: "message 不能为空".to_owned(),
             });
         }
-        if self.effect == RuleEffect::Block
+        if matches!(self.effect, RuleEffect::Block | RuleEffect::RequireReview)
             && (self.strength != RuleStrength::Hard || !self.authority.can_block())
         {
             return Err(CoreError::InvalidRule {
                 rule_id: self.id.clone(),
-                reason: "Block 只允许 hard 且 authority 为 explicit_user、repository_rule 或 accepted_decision 的规则"
+                reason: "Block/RequireReview 只允许 hard 且 authority 为 explicit_user、repository_rule 或 accepted_decision 的规则"
                     .to_owned(),
             });
         }
@@ -572,6 +574,7 @@ pub enum RuleStrength {
 #[serde(rename_all = "snake_case")]
 pub enum RuleEffect {
     Block,
+    RequireReview,
     InjectContext,
     Escalate,
 }
@@ -609,6 +612,7 @@ pub enum DecisionKind {
     Allow,
     AllowWithContext,
     Block,
+    RequireReview,
     Escalate,
 }
 

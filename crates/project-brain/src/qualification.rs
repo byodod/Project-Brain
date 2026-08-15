@@ -924,6 +924,7 @@ fn case_concurrent_interleaving(root: &Path) -> Result<Value, String> {
                 target_files: vec![format!("src/session-{session:02}.rs")],
                 command: None,
                 deterministic_impacts: Vec::new(),
+                proposed_change: None,
             };
             let pre_event_id = format!("pre-{operation_id}");
             deliveries.push((
@@ -958,6 +959,8 @@ fn case_concurrent_interleaving(root: &Path) -> Result<Value, String> {
                         action,
                         status: ToolStatus::Succeeded,
                         duration_ms: Some(1),
+                        result_digest: None,
+                        result_excerpt: None,
                     }),
                 ),
                 InternalHookOutcome {
@@ -1204,6 +1207,9 @@ fn fixture_session_event(project: &str, event_id: &str, session: &str) -> Intern
         HookEventPayload::SessionOpened(SessionOpened {
             reason: SessionOpenReason::Resume,
             previous_session_key: None,
+            parent_session_key: None,
+            origin: brain_core::SessionOrigin::Interactive,
+            delegation_depth: 0,
         }),
     )
 }

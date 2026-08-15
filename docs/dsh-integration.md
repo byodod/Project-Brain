@@ -62,12 +62,28 @@ dsh 接入至少需要同时证明：
 3. `capabilities dsh` 只声明已经实现的能力；
 4. 真实或隔离 fixture 覆盖 `agent/pre-step`、`tools/pre-execute`、`tools/post-execute`、
    `agent/turn-stopping` 四个治理边界；
-5. 工具前 deny、工具后 context 和 Stop continuation 的实际返回值符合协议。
+5. 连续两个没有新 USER 消息的 `agent/pre-step` 仍会请求 active-control，其中无 revision 变化时不得
+   重复膨胀上下文；
+6. `require_review` 首次撤回 mutation、下一 pre-step 交付纠偏、相同提案重试放行；
+7. 工具后实际 diff 外溢会形成 `repair_required`，无关写入与 Stop 都被拒绝；
+8. compact/resume 与 subagent 分别证明重新水合和 parent/delegation identity；
+9. 工具前 deny、工具后 context 和 Stop continuation 的实际返回值符合协议。
 
 其中至少应有一次真实会话验收：不要直接运行 `project-brain dispatch`，而是让 Agent 正常调用其工具，
 确认界面出现 Project Brain 上下文或拒绝反馈，并在 `project-brain audit` 中出现该真实 session 的
-`session_opened`、`intent_declared` 和工具事件。手工调用 `dispatch dsh` 只能证明适配协议，不能证明正在
+`session_opened`、`intent_declared`、`context_requested` 和工具事件。手工调用 `dispatch dsh` 只能证明适配协议，不能证明正在
 运行的 DSH profile 已加载 Plugin。
+
+## 主动注入不是重复 USER 消息
+
+DSH Plugin 只把真实 `source.kind=user` 文本登记为原始目标；ASSISTANT、CONTEXT、TOOL、COMPACTED、
+SUBAGENT 不会冒充用户意图。与此同时，每个 `agent/pre-step` 都会触发 `context_requested`：Project Brain
+根据 goal/context revision、lifecycle epoch 和 outstanding hold 决定是否真正注入。这样既覆盖 Agent 自运行，
+又避免每步重复塞入相同提示。
+
+DSH 没有“让模型带着新上下文重新选择当前工具”的原生 seam，因此 `native_replan=emulated`：受授权的
+`require_review` 规则会 deny 当前 mutation，把结构化纠偏状态持久化，并在下一 pre-step 注入；只有重新提出
+同一 proposal digest 时才放行。这个 deny 不是普通 `block`，也不会让 Agent 自己声称“我看过了”即解锁。
 
 `codex-probe`、Codex app-server 会话或 Codex Hook 审计都不能充当上述 dsh 证据。若项目另有 Codex
 验收，应单独标记并设置确定性超时，避免它阻塞 dsh 安装判断。

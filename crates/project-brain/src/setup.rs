@@ -26,7 +26,7 @@ const REGISTRY_SCHEMA_VERSION: u32 = 1;
 const CODEX_INTEGRATION_VERSION: u32 = 1;
 const PI_INTEGRATION_VERSION: u32 = 1;
 const OPENCODE_INTEGRATION_VERSION: u32 = 1;
-const DSH_INTEGRATION_VERSION: u32 = 1;
+const DSH_INTEGRATION_VERSION: u32 = 2;
 const INSTALL_ROOT_ENV: &str = "PROJECT_BRAIN_INSTALL_ROOT";
 const LAUNCHED_ENV: &str = "PROJECT_BRAIN_LAUNCHED";
 const REQUIRED_CODEX_EVENTS: [&str; 5] = [
@@ -2261,44 +2261,106 @@ function cwdFor(agent) {
   return agent?.session?.header?.cwd || process.cwd();
 }
 
+function sessionMetadata(agent, source = "unknown") {
+  const parent = agent?.parent?.id
+    || agent?.session?.header?.parentSessionId
+    || agent?.session?.header?.parent_session_id
+    || "";
+  const normalizedSource = String(source || "unknown").toLowerCase();
+  const origin = parent || normalizedSource.includes("subagent") ? "subagent"
+    : normalizedSource.includes("continu") ? "runtime_continuation"
+    : "interactive";
+  const inheritedDepth = Number(agent?.session?.header?.delegationDepth
+    ?? agent?.session?.header?.delegation_depth ?? 0);
+  return {
+    parent_session_id: String(parent),
+    origin,
+    delegation_depth: Number.isSafeInteger(inheritedDepth) && inheritedDepth > 0
+      ? inheritedDepth
+      : (parent ? 1 : 0),
+  };
+}
+
+function boundedToolResult(result) {
+  const value = {
+    success: !result?.isError,
+    is_error: Boolean(result?.isError),
+    content: result?.content,
+    output: result?.output,
+    error: result?.error,
+  };
+  let encoded;
+  try { encoded = JSON.stringify(value); }
+  catch (error) {
+    return {
+      success: !result?.isError,
+      is_error: Boolean(result?.isError),
+      serialization_error: String(error),
+    };
+  }
+  if (Buffer.byteLength(encoded, "utf8") <= 256 * 1024) return value;
+  return {
+    success: !result?.isError,
+    is_error: Boolean(result?.isError),
+    truncated: true,
+    excerpt: encoded.slice(0, 64 * 1024),
+  };
+}
+
 export function apply(ctx) {
   const states = new WeakMap();
   function state(agent) {
     let current = states.get(agent);
     if (!current) {
-      current = { source: "startup", started: false, continuation: false };
+      current = { source: "startup", started: false, continuation: false, lastIntentKey: "" };
       states.set(agent, current);
     }
     return current;
   }
 
   ctx.on("agent/session-start", ({ agent, source }) => {
-    state(agent).source = source;
+    const current = state(agent);
+    current.source = source;
+    current.started = false;
+    current.lastIntentKey = "";
   });
 
   ctx.on("agent/pre-step", async ({ agent, messages, turn, step }, next) => {
     const current = state(agent);
     const cwd = cwdFor(agent);
-    const context = [];
+    let context = [];
     if (!current.started) {
       current.started = true;
       const session = await invokeBrain("session-start", {
         session_id: String(agent.id),
         cwd,
-        source: current.source,
+        source: String(current.source || "startup"),
+        ...sessionMetadata(agent, current.source),
       }, cwd).catch((error) => ({ context: [`Project Brain session check degraded: ${String(error)}`] }));
       context.push(...texts(session, "context"));
     }
     const prompt = messageText(messages);
-    if (prompt.length > 0) {
+    const intentKey = `${turn}:${prompt}`;
+    if (prompt.length > 0 && current.lastIntentKey !== intentKey) {
+      current.lastIntentKey = intentKey;
       const intent = await invokeBrain("user-prompt-submit", {
         session_id: String(agent.id),
         cwd,
         turn_id: `dsh-turn-${turn}`,
         prompt,
+        ...sessionMetadata(agent, current.source),
       }, cwd).catch((error) => ({ context: [`Project Brain intent check degraded: ${String(error)}`] }));
-      context.push(...texts(intent, "context"));
+      const intentContext = texts(intent, "context");
+      if (intentContext.length > 0) context = intentContext;
     }
+    const active = await invokeBrain("pre-step", {
+      session_id: String(agent.id),
+      cwd,
+      turn_id: `dsh-turn-${turn}`,
+      step_id: `dsh-turn-${turn}-step-${step}`,
+      ...sessionMetadata(agent, current.source),
+    }, cwd).catch((error) => ({ context: [`Project Brain active-control check degraded: ${String(error)}`] }));
+    context.push(...texts(active, "context"));
     const decision = await next();
     if (decision.kind === "reject" || context.length === 0) return decision;
     return {
@@ -2324,7 +2386,9 @@ export function apply(ctx) {
       return { kind: "deny", reason: `Project Brain governance failed closed: ${String(error)}` };
     }
     if (decision?.block === true) {
-      return { kind: "deny", reason: decision.reason || "Blocked by Project Brain" };
+      const context = texts(decision, "context");
+      const reason = [decision.reason || "Blocked by Project Brain", ...context].join("\n\n");
+      return { kind: "deny", reason };
     }
     return next();
   });
@@ -2342,7 +2406,7 @@ export function apply(ctx) {
         tool_name: exec.name,
         tool_use_id: String(exec.callId),
         tool_input: exec.arguments,
-        tool_response: { success: !result.isError },
+        tool_response: boundedToolResult(result),
       }, cwd);
       feedback = texts(output, "feedback");
     } catch (error) {

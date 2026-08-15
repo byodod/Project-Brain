@@ -52,6 +52,7 @@ pub enum AgentKind {
 pub enum HookEvent {
     SessionStart,
     UserPromptSubmit,
+    PreStep,
     PreToolUse,
     PostToolUse,
     Stop,
@@ -1925,6 +1926,52 @@ impl App {
                     .store
                     .recent_adapter_audit(&self.config.project_key, limit)?,
                 "legacy_actions": self.store.recent_audit(limit)?,
+            }))?
+        );
+        Ok(())
+    }
+
+    pub fn submit_agent_claim(
+        &self,
+        agent: AgentKind,
+        session_key: &str,
+        claim_id: &str,
+        kind: &str,
+        content: &str,
+    ) -> Result<(), AppError> {
+        let adapter_kind = match agent {
+            AgentKind::Codex => brain_core::AdapterKind::Codex,
+            AgentKind::Pi => brain_core::AdapterKind::Pi,
+            AgentKind::Opencode => brain_core::AdapterKind::Opencode,
+            AgentKind::Dsh => brain_core::AdapterKind::Dsh,
+        };
+        let record = self.store.append_agent_claim(
+            &self.config.project_key,
+            adapter_kind,
+            session_key,
+            claim_id,
+            kind,
+            content,
+        )?;
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "accepted_as": "untrusted_agent_claim",
+                "may_delete": false,
+                "may_mark_implemented": false,
+                "record": record,
+            }))?
+        );
+        Ok(())
+    }
+
+    pub fn agent_claims(&self, limit: u32) -> Result<(), AppError> {
+        println!(
+            "{}",
+            pretty_json(&serde_json::json!({
+                "project_key": self.config.project_key,
+                "authority": "agent_claim_only",
+                "claims": self.store.list_agent_claims(&self.config.project_key, limit)?,
             }))?
         );
         Ok(())

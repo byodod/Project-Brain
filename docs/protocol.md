@@ -2,13 +2,13 @@
 
 本文固定当前跨进程与持久化合同。未知版本、未知必填语义或身份不一致必须拒绝，不能静默降级。
 
-## 1. Internal Hook Protocol v1
+## 1. Internal Hook Protocol v2
 
 规范事件：
 
 ```json
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "project_key": "project-a",
   "event_id": "adapter_event_identity",
   "idempotency": { "identity_quality": "vendor_stable" },
@@ -26,6 +26,7 @@
 
 - `session_opened`：进入原因；
 - `intent_declared`：用户输入和可用元数据；
+- `context_requested`：模型调用前按 revision/epoch 请求主动上下文；
 - `tool_about_to_run`：`operation_id`、tool name、规范化 action；
 - `tool_finished`：同一 `operation_id`、tool name、结果摘要；
 - `task_stopping`：本轮完成声明与 stop state。
@@ -38,17 +39,24 @@
 - `derived_stable`：由稳定字段规范哈希得到；
 - `per_delivery`：只能去重当前投递，不能声称跨重试稳定。
 
-## 2. Internal Hook Outcome v1
+`session_opened` 还携带 `parent_session_key`、`origin` 和 `delegation_depth`。`ToolAction` 可携带
+`proposed_change { proposal_digest, base_source_fingerprint, target_files,
+proposed_content_digest }`；`tool_finished` 携带有界 `result_excerpt` 与完整结果摘要 hash。
+
+## 2. Internal Hook Outcome v2
 
 内部输出 payload：
 
 - `session_opened { inject[] }`
 - `intent_declared { gate, inject[] }`
+- `context_requested { inject[] }`
 - `tool_about_to_run { gate, inject[] }`
 - `tool_finished { feedback[] }`
 - `task_stopping { stop, feedback[] }`
 
-`gate` 为 `no_veto` 或 `deny { reason }`。`stop` 为 `allow_stop` 或 `continue_work { reason }`。
+`gate` 为 `no_veto`、`deny { reason }` 或 `replan { reason }`。`replan` 表示当前 mutation 选择不得执行；
+在没有原生 replan 的宿主上，Adapter 必须 deny 当前工具并在下一模型步骤交付持久化纠偏状态。
+`stop` 为 `allow_stop` 或 `continue_work { reason }`。
 
 Adapter 必须根据能力映射；无法表达的能力保持 unsupported，不能通过不可靠消息伪造。
 
@@ -60,18 +68,24 @@ Adapter 必须根据能力映射；无法表达的能力保持 unsupported，不
   "deny_tool": "supported|unsupported",
   "inject_context": "supported|unsupported",
   "post_feedback": "supported|unsupported",
-  "continue_after_stop": "supported|emulated|unsupported"
+  "continue_after_stop": "supported|emulated|unsupported",
+  "pre_model_context": "supported|emulated|unsupported",
+  "pre_tool_context": "supported|emulated|unsupported",
+  "post_tool_full_result": "supported|emulated|unsupported",
+  "native_replan": "supported|emulated|unsupported",
+  "compact_rehydrate": "supported|emulated|unsupported",
+  "subagent_lineage": "supported|emulated|unsupported"
 }
 ```
 
 当前矩阵：
 
-| adapter | deny_intent | deny_tool | inject_context | post_feedback | continue_after_stop |
-|---|---|---|---|---|---|
-| codex | unsupported | supported | supported | supported | supported |
-| pi | supported | supported | supported | supported | emulated |
-| opencode | unsupported | supported | supported | supported | unsupported |
-| dsh | unsupported | supported | supported | supported | supported |
+| adapter | pre_model_context | deny_tool | native_replan | compact_rehydrate | subagent_lineage | continue_after_stop |
+|---|---|---|---|---|---|---|
+| codex | unsupported | supported | emulated | emulated | unsupported | supported |
+| pi | unsupported | supported | emulated | emulated | unsupported | emulated |
+| opencode | unsupported | supported | emulated | emulated | unsupported | unsupported |
+| dsh | supported | supported | emulated | supported | supported | supported |
 
 能力查询本身不访问项目：`project-brain capabilities <adapter>`。
 
@@ -119,13 +133,15 @@ Pi 没有正式的停止前 veto 事件；`agent_end` 触发的 follow-up 只能
 
 | dsh event | Internal event | 控制语义 |
 |---|---|---|
-| agent/session-start | session_opened | 初始化 session state |
-| agent/pre-step | intent_declared/context | 注入 UserMessage |
-| tools/pre-execute | tool_about_to_run | `{ kind: "deny", reason }` |
-| tools/post-execute | tool_finished | feedback message |
+| agent/session-start | session_opened | 初始化/恢复 epoch、parent 与 origin |
+| agent/pre-step（新 USER） | intent_declared | 提升目标 revision |
+| agent/pre-step（每个 step） | context_requested | 按需注入目标锚点、hold 与项目上下文 |
+| tools/pre-execute | tool_about_to_run | deny/block；replan 用 deny 当前选择模拟 |
+| tools/post-execute | tool_finished | 完整有界结果、ObservedChange 与 feedback |
 | agent/turn-stopping | task_stopping | `agent.steer(...)` |
 
-`exec.callId` 是 operation ID，`exec.agent.id` 与 session header 形成会话域。安装必须显式指定 profile。
+`exec.callId` 是 operation ID，`exec.agent.id` 与 session header 形成会话域。compact/resume 使已有交付
+回执失效；subagent 继承 parent identity，但拥有独立 session。安装必须显式指定 profile。
 
 ## 5. Adapter 输出失败语义
 
@@ -135,7 +151,17 @@ Pi 没有正式的停止前 veto 事件；`agent_end` 触发的 follow-up 只能
 - Pi 的 continuation 明确为 emulated 且最多一次；OpenCode 不支持；dsh 的失败重入最多一次；
 - 重复 event ID 返回首次已提交结果；同 ID 不同 payload hash 视为碰撞并拒绝。
 
-## 6. Input Dependency Contract v1
+## 6. Active-control 与 Agent claim
+
+`control_sessions` 持久化 lifecycle/goal/context revision、最近交付摘要以及唯一 outstanding hold。
+hold 类型当前包括 `replan`、`repair_required`、`verify_required`。`control_change_proposals` 保存已被
+PreTool 放行的提案；PostTool 必须使用该记录，而不是用工具执行后的输入重新推导“之前打算改什么”。
+
+`project-brain claims submit` 只追加低权限 Agent claim。不存在删除、修改 authority、接受决策或标记已实现
+的命令。新 claim 会使相关会话上下文失效并在后续模型步骤最多注入有界的最近记录；实际完成仍由 Source
+delta、Evidence 和 Stop gate 裁决。
+
+## 7. Input Dependency Contract v1
 
 ```json
 {
@@ -186,7 +212,7 @@ Selector：
 - `conservative`：有意扩大到安全超集；
 - `incomplete`：仅观测，永不参与 hard authority。
 
-## 7. Evidence Input Manifest v1
+## 8. Evidence Input Manifest v1
 
 Manifest 固定合同解析结果：
 
@@ -212,7 +238,7 @@ presence-sensitive 文件缺失时记录 `state=absent` 且无 hash/size，因�
 
 Manifest 必须在 Source fingerprint 前后相同的窗口内解析。实时 freshness 重新解析同一合同并比较 manifest hash；解析失败返回 unknown，而不是 fresh。
 
-## 8. Provider Process Protocol v1
+## 9. Provider Process Protocol v1
 
 Provider 支持两个进程入口：
 
@@ -296,7 +322,7 @@ Provider finding 只含 `deterministic_violation_claim: bool`，不含最终 aut
 
 核心在提交前再次验证 executable SHA-256、当前 Source fingerprint、request/response 全部身份、payload hash、ArtifactGraph 边界和 upstream。任一失败都不写 trusted Evidence head。
 
-## 9. Source delta 与 Evidence impact
+## 10. Source delta 与 Evidence impact
 
 Post-tool impact 结果：
 
@@ -313,9 +339,10 @@ Post-tool impact 结果：
 
 `verification_unknown` 时不得保留未经证明的 hard freshness；审计记录 unknown reason、transition plan 和保留/影响 head 集合。
 
-## 10. 数据库版本与迁移
+## 11. 数据库版本与迁移
 
-当前数据库 schema 为 v20。v20 移除 Source operation baseline 对固定 adapter 列表的旧 SQL CHECK，由 Rust `AdapterKind` 和协议验证控制当前写入，并允许四适配器迁移后正常审计。
+当前数据库 schema 为 v21。v21 增加项目隔离的 active-control session、结构化变更提案与 append-only
+Agent claim ledger；v20 的 adapter-domain Source baseline 迁移仍完整保留。
 
 迁移规则：
 
@@ -325,7 +352,7 @@ Post-tool impact 结果：
 - 项目级记录不得跨 `project_key`；
 - append-only 审计不得通过普通更新重写。
 
-## 11. 版本演进
+## 12. 版本演进
 
 下列版本独立演进：
 

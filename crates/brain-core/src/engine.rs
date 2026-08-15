@@ -61,6 +61,11 @@ impl<'a> RuleEngine<'a> {
             DecisionKind::Block
         } else if matching
             .iter()
+            .any(|rule| rule.effect == RuleEffect::RequireReview)
+        {
+            DecisionKind::RequireReview
+        } else if matching
+            .iter()
             .any(|rule| rule.effect == RuleEffect::Escalate)
         {
             DecisionKind::Escalate
@@ -77,6 +82,7 @@ impl<'a> RuleEngine<'a> {
             DecisionKind::Allow => "未命中需要改变行为的规则".to_owned(),
             DecisionKind::AllowWithContext => "允许执行，并注入相关项目约束".to_owned(),
             DecisionKind::Block => "命中确定性硬规则，拒绝执行".to_owned(),
+            DecisionKind::RequireReview => "执行前必须重新规划并显式吸收相关项目约束".to_owned(),
             DecisionKind::Escalate => "需要显式决策后再继续".to_owned(),
         };
 
@@ -206,6 +212,31 @@ mod tests {
     }
 
     #[test]
+    fn authorized_review_rule_requests_replan_without_becoming_a_block() {
+        let config = BrainConfig {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: "project_test".to_owned(),
+            project_name: "test".to_owned(),
+            language_profiles: Vec::new(),
+            semantic_providers: Vec::new(),
+            finding_effect_mappings: Vec::new(),
+            stop_reconcile: StopReconcileConfig::default(),
+            rules: vec![rule(
+                "review",
+                RuleEffect::RequireReview,
+                RuleStrength::Hard,
+            )],
+        };
+        let decision = RuleEngine::new(&config)
+            .unwrap()
+            .evaluate(&action(ActionKind::Modify, "src/domain/model.rs"))
+            .unwrap();
+
+        assert_eq!(decision.decision, DecisionKind::RequireReview);
+        assert_eq!(decision.context, vec!["message for review"]);
+    }
+
+    #[test]
     fn unrelated_paths_are_allowed() {
         let config = BrainConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
@@ -240,6 +271,30 @@ mod tests {
             rules: vec![invalid],
         };
 
+        assert!(matches!(
+            RuleEngine::new(&config),
+            Err(CoreError::InvalidRule { .. })
+        ));
+    }
+
+    #[test]
+    fn inferred_rules_cannot_require_review() {
+        let mut invalid = rule(
+            "inferred-review",
+            RuleEffect::RequireReview,
+            RuleStrength::Hard,
+        );
+        invalid.authority = Authority::AgentInference;
+        let config = BrainConfig {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            project_key: "project_test".to_owned(),
+            project_name: "test".to_owned(),
+            language_profiles: Vec::new(),
+            semantic_providers: Vec::new(),
+            finding_effect_mappings: Vec::new(),
+            stop_reconcile: StopReconcileConfig::default(),
+            rules: vec![invalid],
+        };
         assert!(matches!(
             RuleEngine::new(&config),
             Err(CoreError::InvalidRule { .. })

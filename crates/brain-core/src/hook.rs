@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ActionKind, CoreError};
 
-pub const HOOK_PROTOCOL_VERSION: u16 = 1;
+pub const HOOK_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InternalHookEvent {
@@ -47,6 +47,7 @@ impl InternalHookEvent {
             }
             HookEventPayload::SessionOpened(_)
             | HookEventPayload::IntentDeclared(_)
+            | HookEventPayload::ContextRequested(_)
             | HookEventPayload::TaskStopping(_) => Ok(()),
         }
     }
@@ -55,6 +56,7 @@ impl InternalHookEvent {
         match self.payload {
             HookEventPayload::SessionOpened(_) => HookEventKind::SessionOpened,
             HookEventPayload::IntentDeclared(_) => HookEventKind::IntentDeclared,
+            HookEventPayload::ContextRequested(_) => HookEventKind::ContextRequested,
             HookEventPayload::ToolAboutToRun(_) => HookEventKind::ToolAboutToRun,
             HookEventPayload::ToolFinished(_) => HookEventKind::ToolFinished,
             HookEventPayload::TaskStopping(_) => HookEventKind::TaskStopping,
@@ -76,6 +78,7 @@ fn validate_identity(field: &'static str, value: &str) -> Result<(), CoreError> 
 pub enum HookEventKind {
     SessionOpened,
     IntentDeclared,
+    ContextRequested,
     ToolAboutToRun,
     ToolFinished,
     TaskStopping,
@@ -99,6 +102,7 @@ impl HookEventKind {
         match self {
             Self::SessionOpened => "session_opened",
             Self::IntentDeclared => "intent_declared",
+            Self::ContextRequested => "context_requested",
             Self::ToolAboutToRun => "tool_about_to_run",
             Self::ToolFinished => "tool_finished",
             Self::TaskStopping => "task_stopping",
@@ -147,6 +151,12 @@ pub struct AdapterCapabilities {
     pub inject_context: CapabilitySupport,
     pub post_feedback: CapabilitySupport,
     pub continue_after_stop: CapabilitySupport,
+    pub pre_model_context: CapabilitySupport,
+    pub pre_tool_context: CapabilitySupport,
+    pub post_tool_full_result: CapabilitySupport,
+    pub native_replan: CapabilitySupport,
+    pub compact_rehydrate: CapabilitySupport,
+    pub subagent_lineage: CapabilitySupport,
 }
 
 impl AdapterCapabilities {
@@ -157,6 +167,12 @@ impl AdapterCapabilities {
             inject_context: CapabilitySupport::Supported,
             post_feedback: CapabilitySupport::Supported,
             continue_after_stop: CapabilitySupport::Supported,
+            pre_model_context: CapabilitySupport::Unsupported,
+            pre_tool_context: CapabilitySupport::Supported,
+            post_tool_full_result: CapabilitySupport::Supported,
+            native_replan: CapabilitySupport::Emulated,
+            compact_rehydrate: CapabilitySupport::Emulated,
+            subagent_lineage: CapabilitySupport::Unsupported,
         }
     }
 
@@ -167,6 +183,12 @@ impl AdapterCapabilities {
             inject_context: CapabilitySupport::Supported,
             post_feedback: CapabilitySupport::Supported,
             continue_after_stop: CapabilitySupport::Emulated,
+            pre_model_context: CapabilitySupport::Unsupported,
+            pre_tool_context: CapabilitySupport::Supported,
+            post_tool_full_result: CapabilitySupport::Supported,
+            native_replan: CapabilitySupport::Emulated,
+            compact_rehydrate: CapabilitySupport::Emulated,
+            subagent_lineage: CapabilitySupport::Unsupported,
         }
     }
 
@@ -177,6 +199,12 @@ impl AdapterCapabilities {
             inject_context: CapabilitySupport::Supported,
             post_feedback: CapabilitySupport::Supported,
             continue_after_stop: CapabilitySupport::Unsupported,
+            pre_model_context: CapabilitySupport::Unsupported,
+            pre_tool_context: CapabilitySupport::Supported,
+            post_tool_full_result: CapabilitySupport::Supported,
+            native_replan: CapabilitySupport::Emulated,
+            compact_rehydrate: CapabilitySupport::Emulated,
+            subagent_lineage: CapabilitySupport::Unsupported,
         }
     }
 
@@ -187,6 +215,12 @@ impl AdapterCapabilities {
             inject_context: CapabilitySupport::Supported,
             post_feedback: CapabilitySupport::Supported,
             continue_after_stop: CapabilitySupport::Supported,
+            pre_model_context: CapabilitySupport::Supported,
+            pre_tool_context: CapabilitySupport::Supported,
+            post_tool_full_result: CapabilitySupport::Supported,
+            native_replan: CapabilitySupport::Emulated,
+            compact_rehydrate: CapabilitySupport::Supported,
+            subagent_lineage: CapabilitySupport::Supported,
         }
     }
 }
@@ -196,6 +230,7 @@ impl AdapterCapabilities {
 pub enum HookEventPayload {
     SessionOpened(SessionOpened),
     IntentDeclared(IntentDeclared),
+    ContextRequested(ContextRequested),
     ToolAboutToRun(ToolAboutToRun),
     ToolFinished(ToolFinished),
     TaskStopping(TaskStopping),
@@ -206,6 +241,22 @@ pub struct SessionOpened {
     pub reason: SessionOpenReason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_session_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_key: Option<String>,
+    #[serde(default)]
+    pub origin: SessionOrigin,
+    #[serde(default)]
+    pub delegation_depth: u16,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOrigin {
+    Interactive,
+    Subagent,
+    RuntimeContinuation,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -227,6 +278,12 @@ pub struct IntentDeclared {
     pub origin: IntentOrigin,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextRequested {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_key: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentOrigin {
@@ -234,6 +291,7 @@ pub enum IntentOrigin {
     Rpc,
     Extension,
     RuntimeContinuation,
+    Subagent,
     Unknown,
 }
 
@@ -248,6 +306,18 @@ pub struct ToolAction {
     /// 唯一定位的 patch/edit 保持为空，因此不得获得符号级硬门控资格。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deterministic_impacts: Vec<ToolImpact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_change: Option<ProposedChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProposedChange {
+    pub proposal_digest: String,
+    pub base_source_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_content_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -287,6 +357,10 @@ pub struct ToolFinished {
     pub status: ToolStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_excerpt: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -322,6 +396,9 @@ pub enum HookOutcomePayload {
         gate: GateDecision,
         inject: Vec<ContextItem>,
     },
+    ContextRequested {
+        inject: Vec<ContextItem>,
+    },
     ToolAboutToRun {
         gate: GateDecision,
         inject: Vec<ContextItem>,
@@ -340,6 +417,7 @@ pub enum HookOutcomePayload {
 pub enum GateDecision {
     NoVeto,
     Deny { reason: String },
+    Replan { reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -395,6 +473,9 @@ mod tests {
             payload: HookEventPayload::SessionOpened(SessionOpened {
                 reason: SessionOpenReason::Startup,
                 previous_session_key: None,
+                parent_session_key: None,
+                origin: super::SessionOrigin::Interactive,
+                delegation_depth: 0,
             }),
         };
         assert!(event.validate().is_err());

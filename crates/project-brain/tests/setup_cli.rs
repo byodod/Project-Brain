@@ -535,6 +535,9 @@ fn dsh_profile_bundle_install_doctor_and_uninstall_are_verified() {
     }
     assert!(source.contains("kind: \"deny\""));
     assert!(source.contains("agent.steer"));
+    assert!(source.contains("invokeBrain(\"pre-step\""));
+    assert!(source.contains("boundedToolResult(result)"));
+    assert!(source.contains("parent_session_id"));
     let syntax = Command::new("node").arg("--check").arg(&plugin).output();
     if let Ok(syntax) = syntax {
         assert_success(&syntax);
@@ -681,5 +684,17 @@ fn generated_extensions_execute_real_lifecycle_and_tool_veto_roundtrips() {
             "profiles/project-brain-runtime/node_modules/@project-brain/dsh-plugin/lib/index.js",
         ),
         &project,
+    );
+    let audit = run(&binary(), &["audit", "--limit", "100"], &project, None, &[]);
+    assert_success(&audit);
+    let audit: Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert!(
+        audit["adapter_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event["adapter_kind"] == "dsh" && event["event_kind"] == "context_requested"
+            })
     );
 }

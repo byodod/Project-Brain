@@ -6,11 +6,12 @@ use std::{
 };
 
 use brain_core::{
-    AdapterCapabilities, AdapterIdentity, AdapterKind, BrainConfig, ContextItem,
+    AdapterCapabilities, AdapterIdentity, AdapterKind, BrainConfig, ContextItem, ContextRequested,
     EventIdentityQuality, FeedbackItem, GateDecision, HOOK_PROTOCOL_VERSION, HookEventPayload,
     HookOutcomePayload, IdempotencyMetadata, IntentDeclared, IntentOrigin, InternalHookEvent,
-    InternalHookOutcome, SessionOpenReason, SessionOpened, StopDecision, TaskStopping,
-    ToolAboutToRun, ToolAction, ToolFinished, ToolStatus, normalize_project_path,
+    InternalHookOutcome, ProposedChange, SessionOpenReason, SessionOpened, SessionOrigin,
+    StopDecision, TaskStopping, ToolAboutToRun, ToolAction, ToolFinished, ToolStatus,
+    normalize_project_path,
 };
 use brain_store::{AdapterRecordResult, BrainStore};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,14 @@ pub struct CodexHookInput {
     source: String,
     #[serde(default)]
     turn_id: String,
+    #[serde(default)]
+    step_id: String,
+    #[serde(default)]
+    parent_session_id: String,
+    #[serde(default)]
+    origin: String,
+    #[serde(default)]
+    delegation_depth: u16,
     #[serde(default)]
     prompt: String,
     #[serde(default)]
@@ -158,6 +167,9 @@ pub(crate) fn process_vendor_with_provider_trust(
         adapter_version,
         identity_namespace,
     )?;
+    if let Some(outcome) = store.replay_adapter_event(&internal_event)? {
+        return Ok(outcome);
+    }
     let outcome = match protocol::process(root, config, store, provider_trust, &internal_event) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -213,10 +225,17 @@ fn to_internal_event(
         HookEvent::SessionStart => HookEventPayload::SessionOpened(SessionOpened {
             reason: session_reason(&input.source),
             previous_session_key: None,
+            parent_session_key: (!input.parent_session_id.trim().is_empty())
+                .then(|| input.parent_session_id.clone()),
+            origin: session_origin(&input.origin),
+            delegation_depth: input.delegation_depth,
         }),
         HookEvent::UserPromptSubmit => HookEventPayload::IntentDeclared(IntentDeclared {
             text: input.prompt.clone(),
-            origin: IntentOrigin::Interactive,
+            origin: intent_origin(&input.origin),
+        }),
+        HookEvent::PreStep => HookEventPayload::ContextRequested(ContextRequested {
+            step_key: (!input.step_id.trim().is_empty()).then(|| input.step_id.clone()),
         }),
         HookEvent::PreToolUse => {
             let (operation_id, tool_name, action) = normalized_tool(
@@ -246,6 +265,8 @@ fn to_internal_event(
                 action,
                 status: tool_status(&input.tool_response),
                 duration_ms: None,
+                result_digest: tool_result_digest(&input.tool_response),
+                result_excerpt: tool_result_excerpt(&input.tool_response),
             })
         }
         HookEvent::Stop => HookEventPayload::TaskStopping(TaskStopping {
@@ -288,6 +309,7 @@ fn event_identity(
     let event_name = match event {
         HookEvent::SessionStart => "session_opened",
         HookEvent::UserPromptSubmit => "intent_declared",
+        HookEvent::PreStep => "context_requested",
         HookEvent::PreToolUse => "tool_about_to_run",
         HookEvent::PostToolUse => "tool_finished",
         HookEvent::Stop => "task_stopping",
@@ -299,11 +321,15 @@ fn event_identity(
                 EventIdentityQuality::VendorStable,
             ))
         }
+        HookEvent::PreStep if !input.step_id.trim().is_empty() => {
+            Some((input.step_id.as_str(), EventIdentityQuality::DerivedStable))
+        }
         HookEvent::UserPromptSubmit if !input.turn_id.trim().is_empty() => {
             Some((input.turn_id.as_str(), EventIdentityQuality::DerivedStable))
         }
         HookEvent::SessionStart
         | HookEvent::UserPromptSubmit
+        | HookEvent::PreStep
         | HookEvent::PreToolUse
         | HookEvent::PostToolUse
         | HookEvent::Stop => None,
@@ -368,11 +394,44 @@ fn normalized_tool(
         .into_iter()
         .map(|target| make_project_relative(root, &target))
         .collect::<Vec<_>>();
+    let deterministic_impacts = deterministic_impacts(root, input);
+    let proposed_change = matches!(
+        kind,
+        brain_core::ActionKind::Create
+            | brain_core::ActionKind::Modify
+            | brain_core::ActionKind::Delete
+    )
+    .then(|| {
+        let base_source_fingerprint = crate::git::worktree_source_state(root)
+            .map_or_else(|_| "unavailable".to_owned(), |state| state.fingerprint);
+        let input_json = serde_json::to_vec(&input.tool_input).unwrap_or_default();
+        let proposal_digest = hash_id_bytes(
+            "project_brain_proposed_change",
+            &[
+                project_key.as_bytes(),
+                session_key.as_bytes(),
+                input.tool_name.as_bytes(),
+                base_source_fingerprint.as_bytes(),
+                &input_json,
+            ],
+        );
+        let proposed_content_digest = ["content", "new_string", "patch", "newText", "text"]
+            .iter()
+            .find_map(|key| input.tool_input.get(*key).and_then(Value::as_str))
+            .map(|content| hash_id_bytes("project_brain_proposed_content", &[content.as_bytes()]));
+        ProposedChange {
+            proposal_digest,
+            base_source_fingerprint,
+            target_files: target_files.clone(),
+            proposed_content_digest,
+        }
+    });
     let action = ToolAction {
         kind,
         target_files,
         command,
-        deterministic_impacts: deterministic_impacts(root, input),
+        deterministic_impacts,
+        proposed_change,
     };
     let operation_id = if input.tool_use_id.trim().is_empty() {
         let action_json = serde_json::to_vec(&action).unwrap_or_default();
@@ -404,6 +463,43 @@ fn session_reason(source: &str) -> SessionOpenReason {
         "compact" => SessionOpenReason::Compact,
         _ => SessionOpenReason::Unknown,
     }
+}
+
+fn session_origin(origin: &str) -> SessionOrigin {
+    match origin.to_ascii_lowercase().as_str() {
+        "interactive" | "user" => SessionOrigin::Interactive,
+        "subagent" => SessionOrigin::Subagent,
+        "runtime_continuation" | "continuation" => SessionOrigin::RuntimeContinuation,
+        _ => SessionOrigin::Unknown,
+    }
+}
+
+fn intent_origin(origin: &str) -> IntentOrigin {
+    match origin.to_ascii_lowercase().as_str() {
+        "subagent" => IntentOrigin::Subagent,
+        "runtime_continuation" | "continuation" => IntentOrigin::RuntimeContinuation,
+        "extension" | "plugin" => IntentOrigin::Extension,
+        "rpc" => IntentOrigin::Rpc,
+        "interactive" | "user" | "" => IntentOrigin::Interactive,
+        _ => IntentOrigin::Unknown,
+    }
+}
+
+fn tool_result_digest(response: &Value) -> Option<String> {
+    (!response.is_null()).then(|| {
+        let bytes = serde_json::to_vec(response).unwrap_or_default();
+        hash_id_bytes("project_brain_tool_result", &[&bytes])
+    })
+}
+
+fn tool_result_excerpt(response: &Value) -> Option<String> {
+    if response.is_null() {
+        return None;
+    }
+    let text = response
+        .as_str()
+        .map_or_else(|| response.to_string(), ToOwned::to_owned);
+    Some(text.chars().take(4096).collect())
 }
 
 fn tool_status(response: &Value) -> ToolStatus {
@@ -442,8 +538,9 @@ fn tool_status(response: &Value) -> ToolStatus {
 fn map_outcome(outcome: &InternalHookOutcome) -> CodexHookOutput {
     let output = match &outcome.payload {
         HookOutcomePayload::SessionOpened { inject } => context_output("SessionStart", inject),
+        HookOutcomePayload::ContextRequested { inject } => context_output("PreStep", inject),
         HookOutcomePayload::IntentDeclared { gate, inject } => match gate {
-            GateDecision::Deny { reason } => json!({
+            GateDecision::Deny { reason } | GateDecision::Replan { reason } => json!({
                 "decision": "block",
                 "reason": reason
             }),
@@ -451,7 +548,7 @@ fn map_outcome(outcome: &InternalHookOutcome) -> CodexHookOutput {
             GateDecision::NoVeto => context_output("UserPromptSubmit", inject),
         },
         HookOutcomePayload::ToolAboutToRun { gate, inject } => match gate {
-            GateDecision::Deny { reason } => json!({
+            GateDecision::Deny { reason } | GateDecision::Replan { reason } => json!({
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
@@ -500,7 +597,10 @@ pub fn failure_output(
             "decision": "block",
             "reason": reason
         }))),
-        HookEvent::SessionStart | HookEvent::UserPromptSubmit | HookEvent::PostToolUse => None,
+        HookEvent::SessionStart
+        | HookEvent::UserPromptSubmit
+        | HookEvent::PreStep
+        | HookEvent::PostToolUse => None,
     }
 }
 
@@ -1319,13 +1419,88 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(intent.0, json!({}));
+        assert_eq!(
+            intent.0["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert!(
+            intent.0["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("当前原始用户目标")
+        );
         assert!(
             store
                 .recent_adapter_audit("project_a", 10)
                 .unwrap()
                 .iter()
                 .any(|record| record.event_kind == "intent_declared")
+        );
+    }
+
+    #[test]
+    fn require_review_denies_once_then_codex_emulation_allows_same_proposal() {
+        let mut config = config("project_a");
+        config.rules.push(Rule {
+            id: "REVIEW".to_owned(),
+            status: MemoryStatus::Active,
+            authority: Authority::RepositoryRule,
+            strength: RuleStrength::Hard,
+            effect: RuleEffect::RequireReview,
+            include_paths: vec!["README.md".to_owned()],
+            exclude_paths: Vec::new(),
+            actions: vec![ActionKind::Create, ActionKind::Modify],
+            operations: Vec::new(),
+            operation_contains: Vec::new(),
+            symbol_scopes: Vec::new(),
+            message: "修改 README 前重新确认公开安装合同".to_owned(),
+            rationale: String::new(),
+        });
+        let store = BrainStore::open_in_memory().unwrap();
+        let input = |tool_use_id: &str| CodexHookInput {
+            session_id: "session".to_owned(),
+            cwd: "C:/repo".to_owned(),
+            turn_id: "turn".to_owned(),
+            tool_name: "Write".to_owned(),
+            tool_use_id: tool_use_id.to_owned(),
+            tool_input: json!({"file_path":"README.md", "content":"updated"}),
+            ..CodexHookInput::default()
+        };
+
+        let first = handle(
+            Path::new("C:/repo"),
+            &config,
+            &store,
+            HookEvent::PreToolUse,
+            &input("tool-1"),
+        )
+        .unwrap();
+        assert_eq!(first.0["hookSpecificOutput"]["permissionDecision"], "deny");
+        let retry = handle(
+            Path::new("C:/repo"),
+            &config,
+            &store,
+            HookEvent::PreToolUse,
+            &input("tool-2"),
+        )
+        .unwrap();
+        assert!(retry.0["hookSpecificOutput"]["permissionDecision"].is_null());
+        let duplicate_retry = handle(
+            Path::new("C:/repo"),
+            &config,
+            &store,
+            HookEvent::PreToolUse,
+            &input("tool-2"),
+        )
+        .unwrap();
+        assert_eq!(duplicate_retry.0, retry.0);
+        assert!(
+            store
+                .control_session("project_a", brain_core::AdapterKind::Codex, "session")
+                .unwrap()
+                .unwrap()
+                .outstanding_kind
+                .is_none()
         );
     }
 
@@ -1533,6 +1708,80 @@ mod tests {
 
         fs::write(root.join("src/lib.rs"), "target\ntarget\n").unwrap();
         assert!(deterministic_impacts(&root, &unique).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn post_tool_actual_diff_outside_proposal_creates_repair_hold_and_stop_gate() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("project-brain-diff-repair-{nonce}"));
+        fs::create_dir_all(root.join("src")).unwrap();
+        assert!(
+            Command::new("git")
+                .current_dir(&root)
+                .arg("init")
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(root.join("src/expected.rs"), "old\n").unwrap();
+        let store = BrainStore::open_in_memory().unwrap();
+        let tool = CodexHookInput {
+            session_id: "session".to_owned(),
+            cwd: root.to_string_lossy().into_owned(),
+            turn_id: "turn".to_owned(),
+            tool_name: "Write".to_owned(),
+            tool_use_id: "write-1".to_owned(),
+            tool_input: json!({"file_path":"src/expected.rs", "content":"new\n"}),
+            ..CodexHookInput::default()
+        };
+        handle(
+            &root,
+            &config("project_a"),
+            &store,
+            HookEvent::PreToolUse,
+            &tool,
+        )
+        .unwrap();
+        fs::write(root.join("src/expected.rs"), "new\n").unwrap();
+        fs::write(root.join("src/unexpected.rs"), "drift\n").unwrap();
+        let mut post = tool;
+        post.tool_response = json!({"success":true,"output":"written"});
+        let output = handle(
+            &root,
+            &config("project_a"),
+            &store,
+            HookEvent::PostToolUse,
+            &post,
+        )
+        .unwrap();
+        assert!(
+            output.0["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap()
+                .contains("src/unexpected.rs")
+        );
+        let control = store
+            .control_session("project_a", brain_core::AdapterKind::Codex, "session")
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.outstanding_kind.as_deref(), Some("repair_required"));
+        let stop = handle(
+            &root,
+            &config("project_a"),
+            &store,
+            HookEvent::Stop,
+            &CodexHookInput {
+                session_id: "session".to_owned(),
+                cwd: root.to_string_lossy().into_owned(),
+                ..CodexHookInput::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(stop.0["decision"], "block");
         fs::remove_dir_all(root).unwrap();
     }
 }
