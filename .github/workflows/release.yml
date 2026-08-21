@@ -27,7 +27,7 @@ jobs:
       - name: Select pinned Rust toolchain
         run: rustup default 1.92.0
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           package-manager-cache: false
@@ -132,7 +132,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           package-manager-cache: false
@@ -214,7 +214,7 @@ jobs:
       id-token: write
     steps:
       - name: Set up Node.js for trusted publishing
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
